@@ -43,16 +43,38 @@ async def get_ecwid_products():
 @app.get("/odoo/test")
 async def test_odoo():
 
-    url = os.getenv("ODOO_URL")
-    db = os.getenv("ODOO_DB")
-    username = os.getenv("ODOO_LOGIN")
-    password = os.getenv("ODOO_PASSWORD")
+    try:
 
-    common = xmlrpc.client.ServerProxy(f"{url}/xmlrpc/2/common")
+        url = os.getenv("ODOO_URL")
+        db = os.getenv("ODOO_DB")
+        username = os.getenv("ODOO_LOGIN")
+        password = os.getenv("ODOO_PASSWORD")
 
-    uid = common.authenticate(db, username, password, {})
+        if not url or not db or not username or not password:
+            return {
+                "status": "missing_variables",
+                "url": bool(url),
+                "db": bool(db),
+                "username": bool(username),
+                "password": bool(password),
+            }
 
-    if uid:
-        return {"status": "connected", "uid": uid}
+        common = xmlrpc.client.ServerProxy(f"{url}/xmlrpc/2/common")
 
-    return {"status": "failed"}
+        uid = common.authenticate(db, username, password, {})
+
+        return {
+            "status": "connected" if uid else "failed",
+            "uid": uid,
+            "url": url,
+            "db": db,
+            "username": username,
+        }
+
+    except Exception as e:
+
+        return {
+            "status": "error",
+            "error": str(e),
+            "type": type(e).__name__,
+        }
