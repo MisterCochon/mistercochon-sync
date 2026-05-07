@@ -55,3 +55,5 @@ async def test_odoo():
         return {"status": "connected", "uid": uid}
 
     return {"status": "failed"}
+@app.get("/odoo/test")
+async def test_odoo():
