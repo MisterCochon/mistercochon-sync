@@ -77,4 +77,121 @@ async def test_odoo():
             "status": "error",
             "error": str(e),
             "type": type(e).__name__,
+        }@app.get("/ecwid/import-products-to-odoo")
+async def import_products_to_odoo():
+
+    try:
+
+        # -----------------------------
+        # ECWID
+        # -----------------------------
+
+        ecwid_url = f"https://app.ecwid.com/api/v3/{ECWID_STORE_ID}/products"
+
+        ecwid_headers = {
+            "Authorization": f"Bearer {ECWID_TOKEN}"
+        }
+
+        ecwid_response = requests.get(
+            ecwid_url,
+            headers=ecwid_headers
+        )
+
+        ecwid_products = ecwid_response.json().get("items", [])
+
+        # -----------------------------
+        # ODOO CONNECTION
+        # -----------------------------
+
+        url = os.getenv("ODOO_URL")
+        db = os.getenv("ODOO_DB")
+        username = os.getenv("ODOO_LOGIN")
+        password = os.getenv("ODOO_PASSWORD")
+
+        common = xmlrpc.client.ServerProxy(
+            f"{url}/xmlrpc/2/common"
+        )
+
+        uid = common.authenticate(
+            db,
+            username,
+            password,
+            {}
+        )
+
+        models = xmlrpc.client.ServerProxy(
+            f"{url}/xmlrpc/2/object"
+        )
+
+        imported = []
+
+        # -----------------------------
+        # IMPORT PRODUCTS
+        # -----------------------------
+
+        for product in ecwid_products:
+
+            name = product.get("name")
+            sku = product.get("sku")
+            price = product.get("price", 0)
+
+            existing = models.execute_kw(
+                db,
+                uid,
+                password,
+                'product.template',
+                'search',
+                [[['default_code', '=', sku]]]
+            )
+
+            values = {
+                'name': name,
+                'default_code': sku,
+                'list_price': price,
+            }
+
+            if existing:
+
+                models.execute_kw(
+                    db,
+                    uid,
+                    password,
+                    'product.template',
+                    'write',
+                    [existing, values]
+                )
+
+                imported.append({
+                    "sku": sku,
+                    "status": "updated"
+                })
+
+            else:
+
+                new_id = models.execute_kw(
+                    db,
+                    uid,
+                    password,
+                    'product.template',
+                    'create',
+                    [values]
+                )
+
+                imported.append({
+                    "sku": sku,
+                    "status": "created",
+                    "id": new_id
+                })
+
+        return {
+            "status": "success",
+            "products": imported
+        }
+
+    except Exception as e:
+
+        return {
+            "status": "error",
+            "error": str(e),
+            "type": type(e).__name__,
         }
