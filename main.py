@@ -44,7 +44,6 @@ async def get_ecwid_products():
 async def test_odoo():
 
     try:
-
         url = os.getenv("ODOO_URL")
         db = os.getenv("ODOO_DB")
         username = os.getenv("ODOO_LOGIN")
@@ -60,7 +59,6 @@ async def test_odoo():
             }
 
         common = xmlrpc.client.ServerProxy(f"{url}/xmlrpc/2/common")
-
         uid = common.authenticate(db, username, password, {})
 
         return {
@@ -72,7 +70,6 @@ async def test_odoo():
         }
 
     except Exception as e:
-
         return {
             "status": "error",
             "error": str(e),
@@ -84,56 +81,28 @@ async def test_odoo():
 async def import_products_to_odoo():
 
     try:
-
-        # -----------------------------
-        # ECWID
-        # -----------------------------
-
         ecwid_url = f"https://app.ecwid.com/api/v3/{ECWID_STORE_ID}/products"
 
         ecwid_headers = {
             "Authorization": f"Bearer {ECWID_TOKEN}"
         }
 
-        ecwid_response = requests.get(
-            ecwid_url,
-            headers=ecwid_headers
-        )
-
+        ecwid_response = requests.get(ecwid_url, headers=ecwid_headers)
         ecwid_products = ecwid_response.json().get("items", [])
-
-        # -----------------------------
-        # ODOO CONNECTION
-        # -----------------------------
 
         url = os.getenv("ODOO_URL")
         db = os.getenv("ODOO_DB")
         username = os.getenv("ODOO_LOGIN")
         password = os.getenv("ODOO_PASSWORD")
 
-        common = xmlrpc.client.ServerProxy(
-            f"{url}/xmlrpc/2/common"
-        )
+        common = xmlrpc.client.ServerProxy(f"{url}/xmlrpc/2/common")
+        uid = common.authenticate(db, username, password, {})
 
-        uid = common.authenticate(
-            db,
-            username,
-            password,
-            {}
-        )
-
-        models = xmlrpc.client.ServerProxy(
-            f"{url}/xmlrpc/2/object"
-        )
+        models = xmlrpc.client.ServerProxy(f"{url}/xmlrpc/2/object")
 
         imported = []
 
-        # -----------------------------
-        # IMPORT PRODUCTS
-        # -----------------------------
-
         for product in ecwid_products:
-
             name = product.get("name")
             sku = product.get("sku")
             price = product.get("price", 0)
@@ -142,25 +111,24 @@ async def import_products_to_odoo():
                 db,
                 uid,
                 password,
-                'product.template',
-                'search',
-                [[['default_code', '=', sku]]]
+                "product.template",
+                "search",
+                [[["default_code", "=", sku]]]
             )
 
             values = {
-                'name': name,
-                'default_code': sku,
-                'list_price': price,
+                "name": name,
+                "default_code": sku,
+                "list_price": price,
             }
 
             if existing:
-
                 models.execute_kw(
                     db,
                     uid,
                     password,
-                    'product.template',
-                    'write',
+                    "product.template",
+                    "write",
                     [existing, values]
                 )
 
@@ -170,13 +138,12 @@ async def import_products_to_odoo():
                 })
 
             else:
-
                 new_id = models.execute_kw(
                     db,
                     uid,
                     password,
-                    'product.template',
-                    'create',
+                    "product.template",
+                    "create",
                     [values]
                 )
 
@@ -192,7 +159,147 @@ async def import_products_to_odoo():
         }
 
     except Exception as e:
+        return {
+            "status": "error",
+            "error": str(e),
+            "type": type(e).__name__,
+        }
 
+
+@app.get("/ecwid/import-orders-to-odoo")
+async def import_orders_to_odoo():
+
+    try:
+        ecwid_url = f"https://app.ecwid.com/api/v3/{ECWID_STORE_ID}/orders"
+
+        ecwid_headers = {
+            "Authorization": f"Bearer {ECWID_TOKEN}"
+        }
+
+        ecwid_response = requests.get(ecwid_url, headers=ecwid_headers)
+        orders = ecwid_response.json().get("items", [])
+
+        url = os.getenv("ODOO_URL")
+        db = os.getenv("ODOO_DB")
+        username = os.getenv("ODOO_LOGIN")
+        password = os.getenv("ODOO_PASSWORD")
+
+        common = xmlrpc.client.ServerProxy(f"{url}/xmlrpc/2/common")
+        uid = common.authenticate(db, username, password, {})
+
+        models = xmlrpc.client.ServerProxy(f"{url}/xmlrpc/2/object")
+
+        imported_orders = []
+
+        for order in orders:
+            ecwid_order_id = str(order.get("id"))
+
+            customer_name = order.get("billingPerson", {}).get(
+                "name",
+                "Ecwid Customer"
+            )
+
+            email = order.get("email", "")
+
+            partner_ids = models.execute_kw(
+                db,
+                uid,
+                password,
+                "res.partner",
+                "search",
+                [[["email", "=", email]]]
+            )
+
+            if partner_ids:
+                partner_id = partner_ids[0]
+            else:
+                partner_id = models.execute_kw(
+                    db,
+                    uid,
+                    password,
+                    "res.partner",
+                    "create",
+                    [{
+                        "name": customer_name,
+                        "email": email,
+                    }]
+                )
+
+            existing_order = models.execute_kw(
+                db,
+                uid,
+                password,
+                "sale.order",
+                "search",
+                [[["client_order_ref", "=", ecwid_order_id]]]
+            )
+
+            if existing_order:
+                imported_orders.append({
+                    "order": ecwid_order_id,
+                    "status": "already_exists"
+                })
+                continue
+
+            order_lines = []
+
+            for item in order.get("items", []):
+                sku = item.get("sku")
+                quantity = item.get("quantity", 1)
+
+                product_ids = models.execute_kw(
+                    db,
+                    uid,
+                    password,
+                    "product.product",
+                    "search",
+                    [[["default_code", "=", sku]]]
+                )
+
+                if not product_ids:
+                    continue
+
+                product_id = product_ids[0]
+
+                order_lines.append(
+                    (0, 0, {
+                        "product_id": product_id,
+                        "product_uom_qty": quantity,
+                    })
+                )
+
+            if not order_lines:
+                imported_orders.append({
+                    "order": ecwid_order_id,
+                    "status": "skipped_no_matching_products"
+                })
+                continue
+
+            sale_order_id = models.execute_kw(
+                db,
+                uid,
+                password,
+                "sale.order",
+                "create",
+                [{
+                    "partner_id": partner_id,
+                    "client_order_ref": ecwid_order_id,
+                    "order_line": order_lines,
+                }]
+            )
+
+            imported_orders.append({
+                "order": ecwid_order_id,
+                "status": "created",
+                "id": sale_order_id
+            })
+
+        return {
+            "status": "success",
+            "orders": imported_orders
+        }
+
+    except Exception as e:
         return {
             "status": "error",
             "error": str(e),
