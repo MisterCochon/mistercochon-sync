@@ -77,7 +77,10 @@ async def test_odoo():
             "status": "error",
             "error": str(e),
             "type": type(e).__name__,
-        }@app.get("/ecwid/import-products-to-odoo")
+        }
+
+
+@app.get("/ecwid/import-products-to-odoo")
 async def import_products_to_odoo():
 
     try:
