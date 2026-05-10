@@ -69,43 +69,30 @@ def find_product_by_sku(models, db, uid, password, sku):
     )
 
 
-def find_product_by_name(models, db, uid, password, name):
-    if not name:
-        return []
-
-    return models.execute_kw(
-        db,
-        uid,
-        password,
-        "product.product",
-        "search",
-        [[["name", "ilike", name]]],
-        {"limit": 1},
-    )
-
-
 def resolve_ecwid_item(models, db, uid, password, item):
     sku = clean_sku(item.get("sku"))
-    name = item.get("name", "")
-    product_id = item.get("productId")
-    variation_id = item.get("variationId")
 
-    # 1. Match SKU exact
+    if not sku:
+        return None, {
+            "reason": "missing_sku",
+            "sku": "",
+            "name": item.get("name", ""),
+            "ecwid_product_id": item.get("productId"),
+            "ecwid_variation_id": item.get("variationId"),
+            "quantity": item.get("quantity", 1),
+        }
+
     product_ids = find_product_by_sku(models, db, uid, password, sku)
+
     if product_ids:
         return product_ids[0], "sku"
 
-    # 2. Fallback nom produit
-    product_ids = find_product_by_name(models, db, uid, password, name)
-    if product_ids:
-        return product_ids[0], "name_fallback"
-
-    # 3. Rien trouvé
     return None, {
+        "reason": "sku_not_found_in_odoo",
         "sku": sku,
-        "name": name,
-        "ecwid_product_id": product_id,
-        "ecwid_variation_id": variation_id,
+        "name": item.get("name", ""),
+        "ecwid_product_id": item.get("productId"),
+        "ecwid_variation_id": item.get("variationId"),
         "quantity": item.get("quantity", 1),
     }
 
@@ -113,11 +100,6 @@ def resolve_ecwid_item(models, db, uid, password, item):
 @app.get("/")
 async def root():
     return {"message": "MisterCochon API running"}
-
-
-@app.get("/ecwid/products")
-async def get_ecwid_products():
-    return ecwid_get("products")
 
 
 @app.get("/odoo/test")
@@ -137,11 +119,24 @@ async def test_odoo():
         }
 
 
+@app.get("/ecwid/products")
+async def get_ecwid_products():
+    return ecwid_get("products")
+
+
 @app.get("/ecwid/import-products-to-odoo")
 async def import_products_to_odoo():
+    """
+    Import simple des produits Ecwid vers Odoo.
+
+    IMPORTANT :
+    - Les produits simples Ecwid sont créés/mis à jour dans Odoo.
+    - Le SKU est écrit sur product.product, pas seulement product.template.
+    - Les produits sans SKU sont ignorés.
+    """
+
     try:
         ecwid_products = ecwid_get("products").get("items", [])
-
         db, uid, password, models = get_odoo()
 
         imported = []
@@ -161,55 +156,103 @@ async def import_products_to_odoo():
                 })
                 continue
 
-            existing = models.execute_kw(
-                db,
-                uid,
-                password,
-                "product.template",
-                "search",
-                [[["default_code", "=", sku]]],
-                {"limit": 1},
-            )
+            product_ids = find_product_by_sku(models, db, uid, password, sku)
 
-            values = {
+            values_template = {
                 "name": name,
-                "default_code": sku,
                 "list_price": price,
                 "sale_ok": True,
                 "purchase_ok": True,
             }
 
-            if existing:
+            if product_ids:
+                product_product_id = product_ids[0]
+
+                product_data = models.execute_kw(
+                    db,
+                    uid,
+                    password,
+                    "product.product",
+                    "read",
+                    [product_product_id],
+                    {"fields": ["product_tmpl_id"]},
+                )[0]
+
+                template_id = product_data["product_tmpl_id"][0]
+
                 models.execute_kw(
                     db,
                     uid,
                     password,
                     "product.template",
                     "write",
-                    [existing, values],
+                    [[template_id], values_template],
+                )
+
+                models.execute_kw(
+                    db,
+                    uid,
+                    password,
+                    "product.product",
+                    "write",
+                    [[product_product_id], {
+                        "default_code": sku,
+                    }],
                 )
 
                 imported.append({
                     "sku": sku,
                     "name": name,
                     "status": "updated",
+                    "product_product_id": product_product_id,
+                    "product_template_id": template_id,
                 })
 
             else:
-                new_id = models.execute_kw(
+                template_id = models.execute_kw(
                     db,
                     uid,
                     password,
                     "product.template",
                     "create",
-                    [values],
+                    [{
+                        **values_template,
+                        "default_code": sku,
+                    }],
                 )
+
+                product_product_ids = models.execute_kw(
+                    db,
+                    uid,
+                    password,
+                    "product.product",
+                    "search",
+                    [[["product_tmpl_id", "=", template_id]]],
+                    {"limit": 1},
+                )
+
+                if product_product_ids:
+                    product_product_id = product_product_ids[0]
+
+                    models.execute_kw(
+                        db,
+                        uid,
+                        password,
+                        "product.product",
+                        "write",
+                        [[product_product_id], {
+                            "default_code": sku,
+                        }],
+                    )
+                else:
+                    product_product_id = None
 
                 imported.append({
                     "sku": sku,
                     "name": name,
                     "status": "created",
-                    "id": new_id,
+                    "product_template_id": template_id,
+                    "product_product_id": product_product_id,
                 })
 
         return {
@@ -297,7 +340,7 @@ async def import_orders_to_odoo():
                 quantity = item.get("quantity", 1)
                 price = item.get("price", 0)
 
-                resolved, method_or_error = resolve_ecwid_item(
+                product_id, method_or_error = resolve_ecwid_item(
                     models,
                     db,
                     uid,
@@ -305,15 +348,12 @@ async def import_orders_to_odoo():
                     item,
                 )
 
-                if not resolved:
+                if not product_id:
                     error = method_or_error
                     error["order"] = ecwid_order_id
                     order_unresolved.append(error)
                     unresolved_items.append(error)
                     continue
-
-                product_id = resolved
-                match_method = method_or_error
 
                 order_lines.append(
                     (0, 0, {
