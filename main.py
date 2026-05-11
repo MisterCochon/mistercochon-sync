@@ -5,6 +5,32 @@ from fastapi import FastAPI
 app = FastAPI()
 
 
+def get_odoo():
+    url = os.getenv("ODOO_URL")
+    db = os.getenv("ODOO_DB")
+    username = os.getenv("ODOO_LOGIN")
+    password = os.getenv("ODOO_PASSWORD")
+
+    common = xmlrpc.client.ServerProxy(
+        f"{url}/xmlrpc/2/common",
+        allow_none=True
+    )
+
+    uid = common.authenticate(
+        db,
+        username,
+        password,
+        {}
+    )
+
+    models = xmlrpc.client.ServerProxy(
+        f"{url}/xmlrpc/2/object",
+        allow_none=True
+    )
+
+    return db, uid, password, models
+
+
 @app.get("/")
 async def root():
     return {
@@ -16,32 +42,10 @@ async def root():
 @app.get("/odoo/test")
 async def test_odoo():
     try:
-        url = os.getenv("ODOO_URL")
-        db = os.getenv("ODOO_DB")
-        username = os.getenv("ODOO_LOGIN")
-        password = os.getenv("ODOO_PASSWORD")
-
-        common = xmlrpc.client.ServerProxy(
-            f"{url}/xmlrpc/2/common",
-            allow_none=True
-        )
-
-        version = common.version()
-
-        uid = common.authenticate(
-            db,
-            username,
-            password,
-            {}
-        )
+        db, uid, password, models = get_odoo()
 
         return {
             "status": "connected" if uid else "auth_failed",
-            "url": url,
-            "db": db,
-            "login": username,
-            "password_present": bool(password),
-            "odoo_version": version,
             "uid": uid,
         }
 
@@ -56,27 +60,7 @@ async def test_odoo():
 @app.get("/odoo/products/check-sku")
 async def check_sku():
     try:
-        url = os.getenv("ODOO_URL")
-        db = os.getenv("ODOO_DB")
-        username = os.getenv("ODOO_LOGIN")
-        password = os.getenv("ODOO_PASSWORD")
-
-        common = xmlrpc.client.ServerProxy(
-            f"{url}/xmlrpc/2/common",
-            allow_none=True
-        )
-
-        uid = common.authenticate(
-            db,
-            username,
-            password,
-            {}
-        )
-
-        models = xmlrpc.client.ServerProxy(
-            f"{url}/xmlrpc/2/object",
-            allow_none=True
-        )
+        db, uid, password, models = get_odoo()
 
         products = models.execute_kw(
             db,
@@ -118,27 +102,7 @@ async def check_sku():
 @app.get("/odoo/product/by-sku/{sku}")
 async def get_product_by_sku(sku: str):
     try:
-        url = os.getenv("ODOO_URL")
-        db = os.getenv("ODOO_DB")
-        username = os.getenv("ODOO_LOGIN")
-        password = os.getenv("ODOO_PASSWORD")
-
-        common = xmlrpc.client.ServerProxy(
-            f"{url}/xmlrpc/2/common",
-            allow_none=True
-        )
-
-        uid = common.authenticate(
-            db,
-            username,
-            password,
-            {}
-        )
-
-        models = xmlrpc.client.ServerProxy(
-            f"{url}/xmlrpc/2/object",
-            allow_none=True
-        )
+        db, uid, password, models = get_odoo()
 
         product_ids = models.execute_kw(
             db,
@@ -176,6 +140,46 @@ async def get_product_by_sku(sku: str):
         return {
             "status": "found",
             "product": product
+        }
+
+    except Exception as e:
+        return {
+            "status": "error",
+            "error": str(e),
+            "type": type(e).__name__,
+        }
+
+
+@app.get("/odoo/product/search/{term}")
+async def search_product(term: str):
+    try:
+        db, uid, password, models = get_odoo()
+
+        products = models.execute_kw(
+            db,
+            uid,
+            password,
+            "product.product",
+            "search_read",
+            [[
+                "|",
+                ["name", "ilike", term],
+                ["default_code", "ilike", term]
+            ]],
+            {
+                "fields": [
+                    "id",
+                    "name",
+                    "default_code"
+                ],
+                "limit": 20
+            }
+        )
+
+        return {
+            "status": "ok",
+            "count": len(products),
+            "products": products
         }
 
     except Exception as e:
