@@ -113,3 +113,74 @@ async def check_sku():
             "error": str(e),
             "type": type(e).__name__,
         }
+
+
+@app.get("/odoo/product/by-sku/{sku}")
+async def get_product_by_sku(sku: str):
+    try:
+        url = os.getenv("ODOO_URL")
+        db = os.getenv("ODOO_DB")
+        username = os.getenv("ODOO_LOGIN")
+        password = os.getenv("ODOO_PASSWORD")
+
+        common = xmlrpc.client.ServerProxy(
+            f"{url}/xmlrpc/2/common",
+            allow_none=True
+        )
+
+        uid = common.authenticate(
+            db,
+            username,
+            password,
+            {}
+        )
+
+        models = xmlrpc.client.ServerProxy(
+            f"{url}/xmlrpc/2/object",
+            allow_none=True
+        )
+
+        product_ids = models.execute_kw(
+            db,
+            uid,
+            password,
+            "product.product",
+            "search",
+            [[["default_code", "=", sku]]],
+            {"limit": 1}
+        )
+
+        if not product_ids:
+            return {
+                "status": "not_found",
+                "sku": sku
+            }
+
+        product = models.execute_kw(
+            db,
+            uid,
+            password,
+            "product.product",
+            "read",
+            [product_ids],
+            {
+                "fields": [
+                    "id",
+                    "name",
+                    "default_code",
+                    "list_price"
+                ]
+            }
+        )[0]
+
+        return {
+            "status": "found",
+            "product": product
+        }
+
+    except Exception as e:
+        return {
+            "status": "error",
+            "error": str(e),
+            "type": type(e).__name__,
+        }
