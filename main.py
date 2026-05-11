@@ -1,3 +1,15 @@
+import os
+import xmlrpc.client
+from fastapi import FastAPI
+
+app = FastAPI()
+
+
+@app.get("/")
+async def root():
+    return {"status": "ok", "service": "mistercochon-backend"}
+
+
 @app.get("/odoo/test")
 async def test_odoo():
     try:
@@ -9,7 +21,6 @@ async def test_odoo():
         common = xmlrpc.client.ServerProxy(f"{url}/xmlrpc/2/common", allow_none=True)
 
         version = common.version()
-
         uid = common.authenticate(db, username, password, {})
 
         return {
