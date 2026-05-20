@@ -5,6 +5,10 @@ import xmlrpc.client
 
 app = FastAPI()
 
+# =====================
+# ENV VARIABLES
+# =====================
+
 ECWID_STORE_ID = os.getenv("ECWID_STORE_ID")
 ECWID_TOKEN = os.getenv("ECWID_TOKEN")
 
@@ -14,8 +18,18 @@ ODOO_LOGIN = os.getenv("ODOO_LOGIN")
 ODOO_PASSWORD = os.getenv("ODOO_PASSWORD")
 
 
+# =====================
+# ODOO CONNECTION
+# =====================
+
 def get_odoo():
-    if not ODOO_URL or not ODOO_DB or not ODOO_LOGIN or not ODOO_PASSWORD:
+
+    if not all([
+        ODOO_URL,
+        ODOO_DB,
+        ODOO_LOGIN,
+        ODOO_PASSWORD
+    ]):
         raise Exception("Variables Odoo manquantes")
 
     common = xmlrpc.client.ServerProxy(
@@ -41,7 +55,12 @@ def get_odoo():
     return ODOO_DB, uid, ODOO_PASSWORD, models
 
 
+# =====================
+# ECWID
+# =====================
+
 def ecwid_get(endpoint):
+
     if not ECWID_STORE_ID or not ECWID_TOKEN:
         raise HTTPException(
             status_code=500,
@@ -49,9 +68,15 @@ def ecwid_get(endpoint):
         )
 
     url = f"https://app.ecwid.com/api/v3/{ECWID_STORE_ID}/{endpoint}"
-    headers = {"Authorization": f"Bearer {ECWID_TOKEN}"}
 
-    response = requests.get(url, headers=headers)
+    headers = {
+        "Authorization": f"Bearer {ECWID_TOKEN}"
+    }
+
+    response = requests.get(
+        url,
+        headers=headers
+    )
 
     if response.status_code != 200:
         raise HTTPException(
@@ -62,61 +87,67 @@ def ecwid_get(endpoint):
     return response.json()
 
 
+# =====================
+# SKU HELPERS
+# =====================
+
 def clean_sku(sku):
+
     if not sku:
         return ""
+
     return str(sku).strip().upper()
 
 
-def find_product_by_sku(models, db, uid, password, sku):
+def find_product_by_sku(
+    models,
+    db,
+    uid,
+    password,
+    sku
+):
+
     sku = clean_sku(sku)
 
-    if not sku:
-        return []
-
     return models.execute_kw(
         db,
         uid,
         password,
         "product.product",
         "search_read",
-        [[["default_code", "=", sku]]],
+        [[
+            ["default_code", "=", sku]
+        ]],
         {
-            "fields": ["id", "name", "default_code"],
+            "fields": [
+                "id",
+                "name",
+                "default_code"
+            ],
             "limit": 1
         }
     )
 
 
-def find_product_by_name(models, db, uid, password, name):
-    if not name:
-        return []
-
-    return models.execute_kw(
-        db,
-        uid,
-        password,
-        "product.product",
-        "search_read",
-        [[["name", "ilike", name]]],
-        {
-            "fields": ["id", "name", "default_code"],
-            "limit": 1
-        }
-    )
-
+# =====================
+# ROUTES
+# =====================
 
 @app.get("/")
 async def root():
+
     return {
         "status": "ok",
-        "service": "mistercochon-backend"
+        "service": "mistercochon-backend",
+        "version": "2026-05-20-v2"
     }
 
 
 @app.get("/odoo-test")
 async def odoo_test():
+
     try:
+
         db, uid, password, models = get_odoo()
 
         user = models.execute_kw(
@@ -126,7 +157,13 @@ async def odoo_test():
             "res.users",
             "read",
             [[uid]],
-            {"fields": ["id", "name", "login"]}
+            {
+                "fields": [
+                    "id",
+                    "name",
+                    "login"
+                ]
+            }
         )
 
         return {
@@ -136,6 +173,7 @@ async def odoo_test():
         }
 
     except Exception as e:
+
         return {
             "status": "error",
             "error": str(e),
@@ -145,7 +183,9 @@ async def odoo_test():
 
 @app.get("/check-sku")
 async def check_sku():
+
     try:
+
         db, uid, password, models = get_odoo()
 
         products = models.execute_kw(
@@ -154,9 +194,14 @@ async def check_sku():
             password,
             "product.product",
             "search_read",
-            [[["default_code", "=", False]]],
+            [[
+                ["default_code", "=", False]
+            ]],
             {
-                "fields": ["id", "name", "default_code"],
+                "fields": [
+                    "id",
+                    "name"
+                ],
                 "limit": 100
             }
         )
@@ -168,6 +213,7 @@ async def check_sku():
         }
 
     except Exception as e:
+
         return {
             "status": "error",
             "error": str(e),
@@ -177,7 +223,9 @@ async def check_sku():
 
 @app.get("/find-product/{sku}")
 async def find_product(sku: str):
+
     try:
+
         db, uid, password, models = get_odoo()
 
         product = find_product_by_sku(
@@ -188,40 +236,15 @@ async def find_product(sku: str):
             sku
         )
 
-        if not product:
-            return {
-                "status": "not_found",
-                "sku": sku
-            }
-
         return {
             "status": "ok",
             "product": product
         }
 
     except Exception as e:
+
         return {
             "status": "error",
             "error": str(e),
             "type": type(e).__name__
-        }
-
-
-@app.get("/ecwid-test")
-async def ecwid_test():
-    try:
-        data = ecwid_get("profile")
-
-        return {
-            "status": "connected",
-            "store": data.get("generalInfo", {}).get("storeName"),
-            "store_id": ECWID_STORE_ID
-        }
-
-    except Exception as e:
-        return {
-            "status": "error",
-            "error": str(e),
-            "type": type(e).__name__
-        }            "type": type(e).__name__
         }
