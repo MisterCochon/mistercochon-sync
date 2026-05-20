@@ -311,3 +311,25 @@ async def ecwid_sku(sku: str):
             "status": "error",
             "error": str(e)
         }
+@app.get("/ecwid-raw/{product_id}")
+async def ecwid_raw(product_id: int):
+    try:
+        data = ecwid_get(f"products/{product_id}")
+
+        return {
+            "status": "ok",
+            "id": data.get("id"),
+            "name": data.get("name"),
+            "sku": data.get("sku"),
+            "keys": list(data.keys()),
+            "options": data.get("options"),
+            "combinations": data.get("combinations"),
+            "variations": data.get("variations")
+        }
+
+    except Exception as e:
+        return {
+            "status": "error",
+            "error": str(e),
+            "type": type(e).__name__
+        }
