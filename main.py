@@ -242,6 +242,66 @@ async def find_product(sku: str):
         }
 
     except Exception as e:
+        @app.get("/product-variants/{product_id}")
+async def product_variants(product_id: int):
+    try:
+        db, uid, password, models = get_odoo()
+
+        template = models.execute_kw(
+            db,
+            uid,
+            password,
+            "product.template",
+            "read",
+            [[product_id]],
+            {
+                "fields": [
+                    "id",
+                    "name",
+                    "default_code",
+                    "product_variant_ids"
+                ]
+            }
+        )
+
+        if not template:
+            return {
+                "status": "not_found",
+                "product_id": product_id
+            }
+
+        variant_ids = template[0].get("product_variant_ids", [])
+
+        variants = models.execute_kw(
+            db,
+            uid,
+            password,
+            "product.product",
+            "read",
+            [variant_ids],
+            {
+                "fields": [
+                    "id",
+                    "name",
+                    "default_code",
+                    "barcode",
+                    "lst_price"
+                ]
+            }
+        )
+
+        return {
+            "status": "ok",
+            "template": template[0],
+            "variants": variants
+        }
+
+    except Exception as e:
+        return {
+            "status": "error",
+            "error": str(e),
+            "type": type(e).__name__
+        }
 
         return {
             "status": "error",
