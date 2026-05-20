@@ -272,3 +272,42 @@ async def ecwid_product(product_id: int):
             "error": str(e),
             "type": type(e).__name__
         }
+@app.get("/ecwid-sku/{sku}")
+async def ecwid_sku(sku: str):
+
+    try:
+        data = ecwid_get("products")
+
+        products = data.get("items", [])
+
+        matches = []
+
+        for p in products:
+
+            if p.get("sku") == sku:
+                matches.append({
+                    "id": p.get("id"),
+                    "name": p.get("name"),
+                    "sku": p.get("sku")
+                })
+
+            for c in p.get("combinations", []):
+                if c.get("sku") == sku:
+                    matches.append({
+                        "id": p.get("id"),
+                        "name": p.get("name"),
+                        "variant_sku": c.get("sku"),
+                        "options": c.get("options")
+                    })
+
+        return {
+            "status": "ok",
+            "count": len(matches),
+            "results": matches
+        }
+
+    except Exception as e:
+        return {
+            "status": "error",
+            "error": str(e)
+        }
