@@ -180,6 +180,29 @@ async def search_product(term: str):
             "status": "ok",
             "count": len(products),
             "products": products
+        }@app.get("/odoo-test")
+async def odoo_test():
+    try:
+        db, uid, password, models = get_odoo()
+        version = models.execute_kw(
+            db,
+            uid,
+            password,
+            "res.users",
+            "read",
+            [[uid]],
+            {"fields": ["id", "name", "login"]}
+        )
+        return {
+            "status": "connected",
+            "uid": uid,
+            "user": version
+        }
+    except Exception as e:
+        return {
+            "status": "error",
+            "error": str(e),
+            "type": type(e).__name__
         }
 
     except Exception as e:
