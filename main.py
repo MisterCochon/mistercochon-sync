@@ -236,3 +236,39 @@ async def ecwid_test():
             "error": str(e),
             "type": type(e).__name__
         }
+@app.get("/ecwid-product/{product_id}")
+async def ecwid_product(product_id: int):
+
+    try:
+
+        data = ecwid_get(f"products/{product_id}")
+
+        variants = data.get("combinations", [])
+
+        result = []
+
+        for v in variants:
+
+            result.append({
+                "sku": v.get("sku"),
+                "price": v.get("price"),
+                "quantity": v.get("quantity"),
+                "options": v.get("options")
+            })
+
+        return {
+            "status": "ok",
+            "id": data.get("id"),
+            "name": data.get("name"),
+            "base_sku": data.get("sku"),
+            "variant_count": len(result),
+            "variants": result
+        }
+
+    except Exception as e:
+
+        return {
+            "status": "error",
+            "error": str(e),
+            "type": type(e).__name__
+        }
