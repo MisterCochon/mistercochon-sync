@@ -333,3 +333,62 @@ async def ecwid_raw(product_id: int):
             "error": str(e),
             "type": type(e).__name__
         }
+@app.get("/sync-product/{product_id}")
+async def sync_product(product_id: int):
+
+    try:
+        db, uid, password, models = get_odoo()
+
+        ecwid = ecwid_get(f"products/{product_id}")
+
+        product_name = ecwid["name"]
+        combinations = ecwid.get("combinations", [])
+
+        # Recherche produit modèle Odoo
+        template = models.execute_kw(
+            db,
+            uid,
+            password,
+            "product.template",
+            "search_read",
+            [[["name", "=", product_name]]],
+            {
+                "fields": ["id", "name"],
+                "limit": 1
+            }
+        )
+
+        if not template:
+            return {
+                "status": "error",
+                "error": f"Produit {product_name} non trouvé dans Odoo"
+            }
+
+        template_id = template[0]["id"]
+
+        results = []
+
+        for combo in combinations:
+
+            variant_name = combo["options"][0]["value"]
+            sku = combo["sku"]
+
+            results.append({
+                "variant": variant_name,
+                "sku": sku
+            })
+
+        return {
+            "status": "ok",
+            "product": product_name,
+            "template_id": template_id,
+            "variants_found": len(results),
+            "variants": results
+        }
+
+    except Exception as e:
+        return {
+            "status": "error",
+            "error": str(e),
+            "type": type(e).__name__
+        }
