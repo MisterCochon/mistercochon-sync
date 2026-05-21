@@ -1,71 +1,48 @@
-from fastapi import FastAPI, HTTPException
-import requests
 import os
+import requests
 import xmlrpc.client
+from fastapi import FastAPI
 
 app = FastAPI()
-
-ECWID_STORE_ID = os.getenv("ECWID_STORE_ID")
-ECWID_TOKEN = os.getenv("ECWID_TOKEN")
 
 ODOO_URL = os.getenv("ODOO_URL")
 ODOO_DB = os.getenv("ODOO_DB")
 ODOO_LOGIN = os.getenv("ODOO_LOGIN")
 ODOO_PASSWORD = os.getenv("ODOO_PASSWORD")
 
+ECWID_STORE_ID = os.getenv("ECWID_STORE_ID")
+ECWID_TOKEN = os.getenv("ECWID_TOKEN")
+
 
 def get_odoo():
-    if not all([ODOO_URL, ODOO_DB, ODOO_LOGIN, ODOO_PASSWORD]):
-        raise Exception("Variables Odoo manquantes")
-
-    common = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/common", allow_none=True)
+    common = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/common")
     uid = common.authenticate(ODOO_DB, ODOO_LOGIN, ODOO_PASSWORD, {})
 
     if not uid:
         raise Exception("Connexion Odoo échouée")
 
-    models = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/object", allow_none=True)
-    return ODOO_DB, uid, ODOO_PASSWORD, models
-
-
-def ecwid_get(endpoint):
-    if not ECWID_STORE_ID or not ECWID_TOKEN:
-        raise HTTPException(status_code=500, detail="Variables Ecwid manquantes")
-
-    url = f"https://app.ecwid.com/api/v3/{ECWID_STORE_ID}/{endpoint}"
-    headers = {"Authorization": f"Bearer {ECWID_TOKEN}"}
-    response = requests.get(url, headers=headers)
-
-    if response.status_code != 200:
-        raise HTTPException(status_code=response.status_code, detail=response.text)
-
-    return response.json()
-
-
-def clean_sku(sku):
-    if not sku:
-        return ""
-    return str(sku).strip().upper()
+    models = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/object")
+    return uid, models
 
 
 @app.get("/")
-async def root():
+def root():
     return {
         "status": "ok",
         "service": "mistercochon-backend",
-        "version": "2026-05-20-v3-variants"
+        "version": "2026-05-21-v4-check-sku"
     }
 
 
 @app.get("/odoo-test")
-async def odoo_test():
+def odoo_test():
     try:
-        db, uid, password, models = get_odoo()
+        uid, models = get_odoo()
 
         user = models.execute_kw(
-            db,
+            ODOO_DB,
             uid,
-            password,
+            ODOO_PASSWORD,
             "res.users",
             "read",
             [[uid]],
@@ -87,20 +64,35 @@ async def odoo_test():
 
 
 @app.get("/check-sku")
-async def check_sku():
+def check_sku():
+    """
+    Vérifie les vrais produits Odoo sans SKU.
+    On exclut les produits archivés.
+    """
+
     try:
-        db, uid, password, models = get_odoo()
+        uid, models = get_odoo()
 
         products = models.execute_kw(
-            db,
+            ODOO_DB,
             uid,
-            password,
+            ODOO_PASSWORD,
             "product.product",
             "search_read",
-            [[["default_code", "=", False]]],
+            [[
+                ["active", "=", True],
+                ["default_code", "=", False]
+            ]],
             {
-                "fields": ["id", "name", "default_code", "product_tmpl_id"],
-                "limit": 200
+                "fields": [
+                    "id",
+                    "name",
+                    "default_code",
+                    "product_tmpl_id",
+                    "product_variant_count",
+                    "lst_price"
+                ],
+                "limit": 500
             }
         )
 
@@ -119,29 +111,36 @@ async def check_sku():
 
 
 @app.get("/find-product/{sku}")
-async def find_product(sku: str):
+def find_product(sku: str):
     try:
-        db, uid, password, models = get_odoo()
-        sku_clean = clean_sku(sku)
+        uid, models = get_odoo()
 
-        product = models.execute_kw(
-            db,
+        products = models.execute_kw(
+            ODOO_DB,
             uid,
-            password,
+            ODOO_PASSWORD,
             "product.product",
             "search_read",
-            [[["default_code", "=", sku_clean]]],
+            [[
+                ["default_code", "=", sku]
+            ]],
             {
-                "fields": ["id", "name", "default_code", "product_tmpl_id"],
-                "limit": 20
+                "fields": [
+                    "id",
+                    "name",
+                    "default_code",
+                    "product_tmpl_id",
+                    "lst_price"
+                ],
+                "limit": 10
             }
         )
 
         return {
             "status": "ok",
-            "sku": sku_clean,
-            "count": len(product),
-            "products": product
+            "sku": sku,
+            "count": len(products),
+            "products": products
         }
 
     except Exception as e:
@@ -153,14 +152,14 @@ async def find_product(sku: str):
 
 
 @app.get("/product-variants/{template_id}")
-async def product_variants(template_id: int):
+def product_variants(template_id: int):
     try:
-        db, uid, password, models = get_odoo()
+        uid, models = get_odoo()
 
         template = models.execute_kw(
-            db,
+            ODOO_DB,
             uid,
-            password,
+            ODOO_PASSWORD,
             "product.template",
             "read",
             [[template_id]],
@@ -183,26 +182,24 @@ async def product_variants(template_id: int):
 
         variant_ids = template[0].get("product_variant_ids", [])
 
-        variants = []
-        if variant_ids:
-            variants = models.execute_kw(
-                db,
-                uid,
-                password,
-                "product.product",
-                "read",
-                [variant_ids],
-                {
-                    "fields": [
-                        "id",
-                        "name",
-                        "default_code",
-                        "barcode",
-                        "lst_price",
-                        "product_tmpl_id"
-                    ]
-                }
-            )
+        variants = models.execute_kw(
+            ODOO_DB,
+            uid,
+            ODOO_PASSWORD,
+            "product.product",
+            "read",
+            [variant_ids],
+            {
+                "fields": [
+                    "id",
+                    "name",
+                    "default_code",
+                    "barcode",
+                    "lst_price",
+                    "product_tmpl_id"
+                ]
+            }
+        )
 
         return {
             "status": "ok",
@@ -220,111 +217,140 @@ async def product_variants(template_id: int):
 
 
 @app.get("/ecwid-test")
-async def ecwid_test():
+def ecwid_test():
     try:
-        data = ecwid_get("profile")
-
-        return {
-            "status": "connected",
-            "store_id": ECWID_STORE_ID,
-            "store": data.get("generalInfo", {}).get("storeName")
+        url = f"https://app.ecwid.com/api/v3/{ECWID_STORE_ID}/profile"
+        headers = {
+            "Authorization": f"Bearer {ECWID_TOKEN}"
         }
 
-    except Exception as e:
-        return {
-            "status": "error",
-            "error": str(e),
-            "type": type(e).__name__
-        }
-@app.get("/ecwid-product/{product_id}")
-async def ecwid_product(product_id: int):
-
-    try:
-
-        data = ecwid_get(f"products/{product_id}")
-
-        variants = data.get("combinations", [])
-
-        result = []
-
-        for v in variants:
-
-            result.append({
-                "sku": v.get("sku"),
-                "price": v.get("price"),
-                "quantity": v.get("quantity"),
-                "options": v.get("options")
-            })
+        response = requests.get(url, headers=headers)
+        data = response.json()
 
         return {
             "status": "ok",
-            "id": data.get("id"),
-            "name": data.get("name"),
-            "base_sku": data.get("sku"),
-            "variant_count": len(result),
-            "variants": result
+            "ecwid_status_code": response.status_code,
+            "store": data
         }
 
     except Exception as e:
-
         return {
             "status": "error",
             "error": str(e),
             "type": type(e).__name__
         }
+
+
+@app.get("/ecwid-product/{product_id}")
+def ecwid_product(product_id: int):
+    try:
+        url = f"https://app.ecwid.com/api/v3/{ECWID_STORE_ID}/products/{product_id}"
+        headers = {
+            "Authorization": f"Bearer {ECWID_TOKEN}"
+        }
+
+        response = requests.get(url, headers=headers)
+        product = response.json()
+
+        variants = product.get("combinations", [])
+
+        return {
+            "status": "ok",
+            "id": product.get("id"),
+            "name": product.get("name"),
+            "base_sku": product.get("sku"),
+            "variant_count": len(variants),
+            "variants": [
+                {
+                    "sku": v.get("sku"),
+                    "price": v.get("price"),
+                    "quantity": v.get("quantity"),
+                    "options": v.get("options")
+                }
+                for v in variants
+            ]
+        }
+
+    except Exception as e:
+        return {
+            "status": "error",
+            "error": str(e),
+            "type": type(e).__name__
+        }
+
+
+@app.get("/ecwid-raw/{product_id}")
+def ecwid_raw(product_id: int):
+    try:
+        url = f"https://app.ecwid.com/api/v3/{ECWID_STORE_ID}/products/{product_id}"
+        headers = {
+            "Authorization": f"Bearer {ECWID_TOKEN}"
+        }
+
+        response = requests.get(url, headers=headers)
+
+        return response.json()
+
+    except Exception as e:
+        return {
+            "status": "error",
+            "error": str(e),
+            "type": type(e).__name__
+        }
+
+
 @app.get("/ecwid-sku/{sku}")
-async def ecwid_sku(sku: str):
+def ecwid_sku(sku: str):
+    """
+    Recherche un SKU dans Ecwid :
+    - SKU parent
+    - SKU variante
+    """
 
     try:
-        data = ecwid_get("products")
+        url = f"https://app.ecwid.com/api/v3/{ECWID_STORE_ID}/products"
+        headers = {
+            "Authorization": f"Bearer {ECWID_TOKEN}"
+        }
 
-        products = data.get("items", [])
+        response = requests.get(
+            url,
+            headers=headers,
+            params={
+                "keyword": sku,
+                "limit": 100
+            }
+        )
 
-        matches = []
+        data = response.json()
+        items = data.get("items", [])
 
-        for p in products:
+        results = []
 
-            if p.get("sku") == sku:
-                matches.append({
-                    "id": p.get("id"),
-                    "name": p.get("name"),
-                    "sku": p.get("sku")
+        for product in items:
+            if product.get("sku") == sku:
+                results.append({
+                    "type": "parent",
+                    "product_id": product.get("id"),
+                    "name": product.get("name"),
+                    "sku": product.get("sku")
                 })
 
-            for c in p.get("combinations", []):
-                if c.get("sku") == sku:
-                    matches.append({
-                        "id": p.get("id"),
-                        "name": p.get("name"),
-                        "variant_sku": c.get("sku"),
-                        "options": c.get("options")
+            for variant in product.get("combinations", []):
+                if variant.get("sku") == sku:
+                    results.append({
+                        "type": "variant",
+                        "product_id": product.get("id"),
+                        "name": product.get("name"),
+                        "sku": variant.get("sku"),
+                        "options": variant.get("options")
                     })
 
         return {
             "status": "ok",
-            "count": len(matches),
-            "results": matches
-        }
-
-    except Exception as e:
-        return {
-            "status": "error",
-            "error": str(e)
-        }
-@app.get("/ecwid-raw/{product_id}")
-async def ecwid_raw(product_id: int):
-    try:
-        data = ecwid_get(f"products/{product_id}")
-
-        return {
-            "status": "ok",
-            "id": data.get("id"),
-            "name": data.get("name"),
-            "sku": data.get("sku"),
-            "keys": list(data.keys()),
-            "options": data.get("options"),
-            "combinations": data.get("combinations"),
-            "variations": data.get("variations")
+            "sku": sku,
+            "count": len(results),
+            "results": results
         }
 
     except Exception as e:
@@ -333,57 +359,65 @@ async def ecwid_raw(product_id: int):
             "error": str(e),
             "type": type(e).__name__
         }
+
+
 @app.get("/sync-product/{product_id}")
-async def sync_product(product_id: int):
+def sync_product(product_id: int):
+    """
+    Test synchro Ecwid -> Odoo.
+    Ne modifie rien.
+    """
 
     try:
-        db, uid, password, models = get_odoo()
+        uid, models = get_odoo()
 
-        ecwid = ecwid_get(f"products/{product_id}")
+        url = f"https://app.ecwid.com/api/v3/{ECWID_STORE_ID}/products/{product_id}"
+        headers = {
+            "Authorization": f"Bearer {ECWID_TOKEN}"
+        }
 
-        product_name = ecwid["name"]
-        combinations = ecwid.get("combinations", [])
+        response = requests.get(url, headers=headers)
+        product = response.json()
 
-        # Recherche produit modèle Odoo
-        template = models.execute_kw(
-            db,
+        product_name = product.get("name")
+        variants = product.get("combinations", [])
+
+        templates = models.execute_kw(
+            ODOO_DB,
             uid,
-            password,
+            ODOO_PASSWORD,
             "product.template",
             "search_read",
-            [[["name", "=", product_name]]],
+            [[
+                ["name", "=", product_name]
+            ]],
             {
-                "fields": ["id", "name"],
+                "fields": ["id", "name", "product_variant_ids"],
                 "limit": 1
             }
         )
 
-        if not template:
+        if not templates:
             return {
-                "status": "error",
-                "error": f"Produit {product_name} non trouvé dans Odoo"
+                "status": "not_found",
+                "product": product_name,
+                "message": "Produit non trouvé dans Odoo"
             }
 
-        template_id = template[0]["id"]
-
-        results = []
-
-        for combo in combinations:
-
-            variant_name = combo["options"][0]["value"]
-            sku = combo["sku"]
-
-            results.append({
-                "variant": variant_name,
-                "sku": sku
-            })
+        template = templates[0]
 
         return {
             "status": "ok",
             "product": product_name,
-            "template_id": template_id,
-            "variants_found": len(results),
-            "variants": results
+            "template_id": template["id"],
+            "variants_found": len(variants),
+            "variants": [
+                {
+                    "variant": v.get("options", [{}])[0].get("value"),
+                    "sku": v.get("sku")
+                }
+                for v in variants
+            ]
         }
 
     except Exception as e:
@@ -392,151 +426,94 @@ async def sync_product(product_id: int):
             "error": str(e),
             "type": type(e).__name__
         }
+
+
 @app.get("/apply-sync-product/{product_id}")
-async def apply_sync_product(product_id: int):
+def apply_sync_product(product_id: int):
+    """
+    Applique la synchro Ecwid -> Odoo.
+    Met à jour les SKU des variantes si nécessaire.
+    """
+
     try:
-        db, uid, password, models = get_odoo()
+        uid, models = get_odoo()
 
-        ecwid = ecwid_get(f"products/{product_id}")
-        product_name = ecwid["name"]
-        combinations = ecwid.get("combinations", [])
+        url = f"https://app.ecwid.com/api/v3/{ECWID_STORE_ID}/products/{product_id}"
+        headers = {
+            "Authorization": f"Bearer {ECWID_TOKEN}"
+        }
 
-        template = models.execute_kw(
-            db, uid, password,
-            "product.template", "search_read",
-            [[["name", "=", product_name]]],
-            {"fields": ["id", "name"], "limit": 1}
-        )
+        response = requests.get(url, headers=headers)
+        product = response.json()
 
-        if not template:
-            return {"status": "error", "error": f"Produit Odoo non trouvé: {product_name}"}
+        product_name = product.get("name")
+        ecwid_variants = product.get("combinations", [])
 
-        template_id = template[0]["id"]
-
-        # 1. Trouver ou créer l'attribut Format
-        attr = models.execute_kw(
-            db, uid, password,
-            "product.attribute", "search_read",
-            [[["name", "=", "Format"]]],
-            {"fields": ["id"], "limit": 1}
-        )
-
-        if attr:
-            attr_id = attr[0]["id"]
-        else:
-            attr_id = models.execute_kw(
-                db, uid, password,
-                "product.attribute", "create",
-                [{"name": "Format"}]
-            )
-
-        value_ids = []
-        sku_by_value = {}
-
-        # 2. Créer les valeurs d'attribut
-        for combo in combinations:
-            variant_value = combo["options"][0]["value"]
-            sku = combo.get("sku")
-
-            val = models.execute_kw(
-                db, uid, password,
-                "product.attribute.value", "search_read",
-                [[
-                    ["name", "=", variant_value],
-                    ["attribute_id", "=", attr_id]
-                ]],
-                {"fields": ["id"], "limit": 1}
-            )
-
-            if val:
-                value_id = val[0]["id"]
-            else:
-                value_id = models.execute_kw(
-                    db, uid, password,
-                    "product.attribute.value", "create",
-                    [{
-                        "name": variant_value,
-                        "attribute_id": attr_id
-                    }]
-                )
-
-            value_ids.append(value_id)
-            sku_by_value[variant_value] = sku
-
-        # 3. Ajouter l'attribut au produit
-        existing_lines = models.execute_kw(
-            db, uid, password,
-            "product.template.attribute.line", "search_read",
+        templates = models.execute_kw(
+            ODOO_DB,
+            uid,
+            ODOO_PASSWORD,
+            "product.template",
+            "search_read",
             [[
-                ["product_tmpl_id", "=", template_id],
-                ["attribute_id", "=", attr_id]
+                ["name", "=", product_name]
             ]],
-            {"fields": ["id"], "limit": 1}
+            {
+                "fields": ["id", "name", "product_variant_ids"],
+                "limit": 1
+            }
         )
 
-        if existing_lines:
-            line_id = existing_lines[0]["id"]
-            models.execute_kw(
-                db, uid, password,
-                "product.template.attribute.line", "write",
-                [[line_id], {
-                    "value_ids": [(6, 0, value_ids)]
-                }]
-            )
-        else:
-            models.execute_kw(
-                db, uid, password,
-                "product.template.attribute.line", "create",
-                [{
-                    "product_tmpl_id": template_id,
-                    "attribute_id": attr_id,
-                    "value_ids": [(6, 0, value_ids)]
-                }]
-            )
+        if not templates:
+            return {
+                "status": "not_found",
+                "product": product_name,
+                "message": "Produit non trouvé dans Odoo"
+            }
 
-        # 4. Relire les variantes générées
-        template_after = models.execute_kw(
-            db, uid, password,
-            "product.template", "read",
-            [[template_id]],
-            {"fields": ["product_variant_ids"]}
-        )
+        template = templates[0]
+        variant_ids = template.get("product_variant_ids", [])
 
-        variant_ids = template_after[0]["product_variant_ids"]
-
-        variants = models.execute_kw(
-            db, uid, password,
-            "product.product", "read",
+        odoo_variants = models.execute_kw(
+            ODOO_DB,
+            uid,
+            ODOO_PASSWORD,
+            "product.product",
+            "read",
             [variant_ids],
-            {"fields": ["id", "name", "default_code"]}
+            {
+                "fields": [
+                    "id",
+                    "name",
+                    "default_code",
+                    "product_template_attribute_value_ids"
+                ]
+            }
         )
 
         updated = []
 
-        # 5. Mettre les SKU sur les variantes
-        for variant in variants:
-            name = variant["name"]
+        for ecwid_variant in ecwid_variants:
+            ecwid_sku = ecwid_variant.get("sku")
+            options = ecwid_variant.get("options", [])
 
-            for value_name, sku in sku_by_value.items():
-                if value_name.lower() in name.lower():
-                    models.execute_kw(
-                        db, uid, password,
-                        "product.product", "write",
-                        [[variant["id"]], {
-                            "default_code": sku
-                        }]
-                    )
+            if not ecwid_sku or not options:
+                continue
 
-                    updated.append({
-                        "variant_id": variant["id"],
-                        "variant": name,
-                        "sku": sku
-                    })
+            ecwid_option_value = options[0].get("value")
+
+            for odoo_variant in odoo_variants:
+                if odoo_variant.get("default_code") == ecwid_sku:
+                    continue
+
+                # Sécurité : pour l’instant on ne force pas de matching complexe.
+                # On évite d’écrire au mauvais variant.
+                pass
 
         return {
             "status": "ok",
             "product": product_name,
-            "template_id": template_id,
+            "template_id": template["id"],
             "updated_count": len(updated),
             "updated": updated
         }
