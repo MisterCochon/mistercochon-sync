@@ -5,7 +5,7 @@ from fastapi import FastAPI
 
 app = FastAPI()
 
-VERSION = "2026-05-23-v6-variant-option-names"
+VERSION = "2026-05-23-v7-bacon-sku-apply"
 
 ODOO_URL = os.getenv("ODOO_URL")
 ODOO_DB = os.getenv("ODOO_DB")
@@ -246,7 +246,6 @@ def product_variants(template_id: int):
                 values_map.get(option_id, str(option_id))
                 for option_id in option_ids
             ]
-
             variant["option_label"] = " | ".join(variant["options"])
 
         return {
@@ -301,6 +300,14 @@ def ecwid_raw(product_id: int):
 def ecwid_sku(sku: str):
     try:
         data = ecwid_get("/products", {"keyword": sku})
+
+        if not data:
+            return {
+                "status": "error",
+                "message": "Aucune réponse Ecwid",
+                "sku": sku
+            }
+
         results = []
 
         for product in data.get("items", []):
@@ -432,3 +439,59 @@ def apply_sync_product(product_id: int):
 
     except Exception as e:
         return {"status": "error", "error": str(e), "type": type(e).__name__}
+
+
+@app.get("/apply-bacon-sku")
+def apply_bacon_sku():
+    try:
+        mapping = [
+            {
+                "odoo_variant_id": 464,
+                "sku": "BOCF1262",
+                "label": "Format: Smoked 250 Gr | TYPE: whole 250 gr"
+            },
+            {
+                "odoo_variant_id": 468,
+                "sku": "LARF1262",
+                "label": "Format: Smoked lardons 250 gr | TYPE: Lardons"
+            },
+            {
+                "odoo_variant_id": 472,
+                "sku": "BOWF1232",
+                "label": "Format: whole 1Kg | TYPE: entiere"
+            }
+        ]
+
+        updated = []
+
+        for item in mapping:
+            odoo_execute(
+                "product.product",
+                "write",
+                [
+                    [item["odoo_variant_id"]],
+                    {
+                        "default_code": item["sku"]
+                    }
+                ]
+            )
+
+            updated.append({
+                "variant_id": item["odoo_variant_id"],
+                "label": item["label"],
+                "sku": item["sku"]
+            })
+
+        return {
+            "status": "ok",
+            "product": "Bacon natural and smoked",
+            "updated_count": len(updated),
+            "updated": updated
+        }
+
+    except Exception as e:
+        return {
+            "status": "error",
+            "error": str(e),
+            "type": type(e).__name__
+        }
