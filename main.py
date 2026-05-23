@@ -495,3 +495,40 @@ def apply_bacon_sku():
             "error": str(e),
             "type": type(e).__name__
         }
+@app.get("/disable-bacon-unused")
+def disable_bacon_unused():
+    try:
+
+        keep_ids = [464,468,472]
+
+        all_ids = [464,465,466,467,468,469,470,471,472]
+
+        disable_ids = [
+            x for x in all_ids
+            if x not in keep_ids
+        ]
+
+        odoo_execute(
+            "product.product",
+            "write",
+            [
+                disable_ids,
+                {
+                    "active": False
+                }
+            ]
+        )
+
+        return {
+            "status": "ok",
+            "kept": keep_ids,
+            "disabled": disable_ids,
+            "disabled_count": len(disable_ids)
+        }
+
+    except Exception as e:
+        return {
+            "status": "error",
+            "error": str(e),
+            "type": type(e).__name__
+        }
