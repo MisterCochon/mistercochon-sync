@@ -5,7 +5,7 @@ from fastapi import FastAPI
 
 app = FastAPI()
 
-VERSION = "2026-05-23-v7-bacon-sku-apply"
+VERSION = "2026-06-10-v8-stock-sync"
 
 ODOO_URL = os.getenv("ODOO_URL")
 ODOO_DB = os.getenv("ODOO_DB")
@@ -52,6 +52,44 @@ def ecwid_get(endpoint, params=None):
         return None
 
     return response.json()
+
+
+def ecwid_put(endpoint, data):
+    url = f"https://app.ecwid.com/api/v3/{ECWID_STORE_ID}{endpoint}"
+    response = requests.put(
+        url,
+        headers={"Authorization": f"Bearer {ECWID_TOKEN}", "Content-Type": "application/json"},
+        json=data
+    )
+    return response.status_code, response.json() if response.content else {}
+
+
+def ecwid_get_all_products():
+    all_products = []
+    offset = 0
+    limit = 100
+    while True:
+        data = ecwid_get("/products", {"offset": offset, "limit": limit})
+        if not data:
+            break
+        items = data.get("items", [])
+        all_products.extend(items)
+        if len(items) < limit:
+            break
+        offset += limit
+    return all_products
+
+
+def get_odoo_stock_by_skus(skus):
+    if not skus:
+        return {}
+    variants = odoo_execute(
+        "product.product",
+        "search_read",
+        [[["default_code", "in", skus], ["active", "=", True]]],
+        {"fields": ["default_code", "qty_available"]}
+    )
+    return {v["default_code"]: v["qty_available"] for v in variants if v.get("default_code")}
 
 
 def variant_label(combination):
@@ -495,6 +533,198 @@ def apply_bacon_sku():
             "error": str(e),
             "type": type(e).__name__
         }
+@app.get("/stock-status")
+def stock_status():
+    """Dry run : compare stock Odoo vs Ecwid pour tous les produits. Aucune modification."""
+    try:
+        products = ecwid_get_all_products()
+
+        all_skus = []
+        for product in products:
+            if product.get("sku"):
+                all_skus.append(product["sku"])
+            for combo in product.get("combinations", []):
+                if combo.get("sku"):
+                    all_skus.append(combo["sku"])
+
+        odoo_stock = get_odoo_stock_by_skus(list(set(all_skus)))
+
+        results, no_sku, not_in_odoo = [], [], []
+
+        for product in products:
+            ecwid_id = product.get("id")
+            name = product.get("name")
+            combinations = product.get("combinations", [])
+
+            if not combinations:
+                sku = product.get("sku")
+                if not sku:
+                    no_sku.append({"id": ecwid_id, "name": name})
+                    continue
+                odoo_qty = odoo_stock.get(sku)
+                if odoo_qty is None:
+                    not_in_odoo.append({"id": ecwid_id, "name": name, "sku": sku})
+                    continue
+                results.append({
+                    "id": ecwid_id, "name": name, "sku": sku,
+                    "odoo_qty": odoo_qty, "ecwid_qty": product.get("quantity", 0),
+                    "in_sync": odoo_qty == product.get("quantity", 0)
+                })
+            else:
+                for combo in combinations:
+                    csku = combo.get("sku")
+                    if not csku:
+                        no_sku.append({"id": ecwid_id, "name": name, "variant": variant_label(combo)})
+                        continue
+                    odoo_qty = odoo_stock.get(csku)
+                    if odoo_qty is None:
+                        not_in_odoo.append({"id": ecwid_id, "name": name, "sku": csku, "variant": variant_label(combo)})
+                        continue
+                    results.append({
+                        "id": ecwid_id, "name": name, "variant": variant_label(combo), "sku": csku,
+                        "odoo_qty": odoo_qty, "ecwid_qty": combo.get("quantity", 0),
+                        "in_sync": odoo_qty == combo.get("quantity", 0)
+                    })
+
+        out_of_sync = [r for r in results if not r["in_sync"]]
+
+        return {
+            "status": "ok",
+            "total_products": len(products),
+            "total_checked": len(results),
+            "out_of_sync_count": len(out_of_sync),
+            "no_sku_count": len(no_sku),
+            "not_in_odoo_count": len(not_in_odoo),
+            "out_of_sync": out_of_sync,
+            "no_sku": no_sku,
+            "not_in_odoo": not_in_odoo
+        }
+
+    except Exception as e:
+        return {"status": "error", "error": str(e), "type": type(e).__name__}
+
+
+@app.get("/sync-stock")
+def sync_stock():
+    """Pousse les quantités Odoo vers Ecwid pour tous les produits."""
+    try:
+        products = ecwid_get_all_products()
+
+        all_skus = []
+        for product in products:
+            if product.get("sku"):
+                all_skus.append(product["sku"])
+            for combo in product.get("combinations", []):
+                if combo.get("sku"):
+                    all_skus.append(combo["sku"])
+
+        odoo_stock = get_odoo_stock_by_skus(list(set(all_skus)))
+
+        updated, skipped, errors = [], [], []
+
+        for product in products:
+            ecwid_id = product.get("id")
+            name = product.get("name")
+            combinations = product.get("combinations", [])
+
+            if not combinations:
+                sku = product.get("sku")
+                if not sku or sku not in odoo_stock:
+                    skipped.append({"id": ecwid_id, "name": name, "sku": sku})
+                    continue
+                qty = int(max(0, odoo_stock[sku]))
+                code, _ = ecwid_put(f"/products/{ecwid_id}", {"quantity": qty, "unlimited": False})
+                if code == 200:
+                    updated.append({"id": ecwid_id, "name": name, "sku": sku, "qty": qty})
+                else:
+                    errors.append({"id": ecwid_id, "name": name, "sku": sku, "http_status": code})
+            else:
+                for combo in combinations:
+                    csku = combo.get("sku")
+                    combo_id = combo.get("id")
+                    if not csku or csku not in odoo_stock:
+                        skipped.append({"id": ecwid_id, "name": name, "sku": csku, "variant": variant_label(combo)})
+                        continue
+                    qty = int(max(0, odoo_stock[csku]))
+                    code, _ = ecwid_put(f"/products/{ecwid_id}/combinations/{combo_id}", {"quantity": qty})
+                    if code == 200:
+                        updated.append({"id": ecwid_id, "name": name, "variant": variant_label(combo), "sku": csku, "qty": qty})
+                    else:
+                        errors.append({"id": ecwid_id, "name": name, "sku": csku, "variant": variant_label(combo), "http_status": code})
+
+        return {
+            "status": "ok",
+            "updated_count": len(updated),
+            "skipped_count": len(skipped),
+            "error_count": len(errors),
+            "updated": updated,
+            "skipped": skipped,
+            "errors": errors
+        }
+
+    except Exception as e:
+        return {"status": "error", "error": str(e), "type": type(e).__name__}
+
+
+@app.get("/sync-stock/{ecwid_product_id}")
+def sync_stock_one(ecwid_product_id: int):
+    """Pousse le stock Odoo vers Ecwid pour un seul produit."""
+    try:
+        product = ecwid_get(f"/products/{ecwid_product_id}")
+        if not product:
+            return {"status": "ecwid_not_found", "product_id": ecwid_product_id}
+
+        name = product.get("name")
+        combinations = product.get("combinations", [])
+
+        all_skus = [product["sku"]] if product.get("sku") else []
+        for combo in combinations:
+            if combo.get("sku"):
+                all_skus.append(combo["sku"])
+
+        odoo_stock = get_odoo_stock_by_skus(all_skus)
+
+        updated, skipped, errors = [], [], []
+
+        if not combinations:
+            sku = product.get("sku")
+            if not sku or sku not in odoo_stock:
+                return {"status": "skipped", "reason": "no_sku_or_not_in_odoo", "sku": sku}
+            qty = int(max(0, odoo_stock[sku]))
+            code, _ = ecwid_put(f"/products/{ecwid_product_id}", {"quantity": qty, "unlimited": False})
+            if code == 200:
+                updated.append({"sku": sku, "qty": qty})
+            else:
+                errors.append({"sku": sku, "http_status": code})
+        else:
+            for combo in combinations:
+                csku = combo.get("sku")
+                combo_id = combo.get("id")
+                if not csku or csku not in odoo_stock:
+                    skipped.append({"sku": csku, "variant": variant_label(combo)})
+                    continue
+                qty = int(max(0, odoo_stock[csku]))
+                code, _ = ecwid_put(f"/products/{ecwid_product_id}/combinations/{combo_id}", {"quantity": qty})
+                if code == 200:
+                    updated.append({"variant": variant_label(combo), "sku": csku, "qty": qty})
+                else:
+                    errors.append({"variant": variant_label(combo), "sku": csku, "http_status": code})
+
+        return {
+            "status": "ok",
+            "product": name,
+            "updated_count": len(updated),
+            "skipped_count": len(skipped),
+            "error_count": len(errors),
+            "updated": updated,
+            "skipped": skipped,
+            "errors": errors
+        }
+
+    except Exception as e:
+        return {"status": "error", "error": str(e), "type": type(e).__name__}
+
+
 @app.get("/disable-bacon-unused")
 def disable_bacon_unused():
     try:
