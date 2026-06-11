@@ -1,11 +1,13 @@
 import os
+import csv
+import io
 import requests
 import xmlrpc.client
-from fastapi import FastAPI
+from fastapi import FastAPI, UploadFile, File
 
 app = FastAPI()
 
-VERSION = "2026-06-11-v9-apply-sync-all"
+VERSION = "2026-06-11-v10-import-sku-csv"
 
 ODOO_URL = os.getenv("ODOO_URL")
 ODOO_DB = os.getenv("ODOO_DB")
@@ -550,6 +552,99 @@ def apply_sync_all():
             "skipped_count": len(results["skipped"]),
             "error_count": len(results["errors"]),
             **results
+        }
+
+    except Exception as e:
+        return {"status": "error", "error": str(e), "type": type(e).__name__}
+
+
+@app.post("/import-sku-csv")
+async def import_sku_csv(file: UploadFile = File(...)):
+    """Importe les SKUs depuis un export CSV Ecwid directement dans Odoo."""
+    try:
+        content = await file.read()
+        text = content.decode("utf-8")
+        reader = csv.reader(io.StringIO(text))
+        next(reader)  # skip header
+
+        # Parser le CSV
+        products = []
+        current = None
+        for row in reader:
+            if not row or len(row) < 3:
+                continue
+            row_type = row[0].strip()
+            if row_type == "product":
+                current = {
+                    "name": row[3].strip() if len(row) > 3 else "",
+                    "sku": row[2].strip(),
+                    "variations": []
+                }
+                products.append(current)
+            elif row_type == "product_variation" and current:
+                var_sku = row[5].strip() if len(row) > 5 else ""
+                if var_sku:
+                    current["variations"].append(var_sku)
+
+        def is_numeric_sku(sku):
+            return not sku or sku.replace(".", "").replace("E+", "").replace("+", "").isdigit()
+
+        stats = {"updated": 0, "skipped": 0, "errors": [], "not_found": []}
+
+        for product in products:
+            name = product["name"]
+            sku = product["sku"]
+            variations = product["variations"]
+
+            if is_numeric_sku(sku):
+                stats["skipped"] += 1
+                continue
+
+            templates = odoo_execute("product.template", "search_read",
+                [[["name", "=", name]]],
+                {"fields": ["id", "name", "product_variant_ids"], "limit": 1}
+            )
+
+            if not templates:
+                stats["not_found"].append(name)
+                continue
+
+            template = templates[0]
+            odoo_variant_ids = template["product_variant_ids"]
+
+            if not variations:
+                odoo_execute("product.product", "write",
+                    [[odoo_variant_ids[0]], {"default_code": sku}]
+                ) if len(odoo_variant_ids) == 1 else odoo_execute(
+                    "product.template", "write", [[template["id"]], {"default_code": sku}]
+                )
+                stats["updated"] += 1
+                continue
+
+            if len(odoo_variant_ids) != len(variations):
+                stats["errors"].append({
+                    "name": name,
+                    "odoo_variants": len(odoo_variant_ids),
+                    "csv_variants": len(variations)
+                })
+                continue
+
+            for odoo_id, var_sku in zip(odoo_variant_ids, variations):
+                if not is_numeric_sku(var_sku):
+                    odoo_execute("product.product", "write",
+                        [[odoo_id], {"default_code": var_sku}]
+                    )
+            stats["updated"] += 1
+
+        return {
+            "status": "ok",
+            "total_products": len(products),
+            "updated": stats["updated"],
+            "skipped_no_sku": stats["skipped"],
+            "not_found_in_odoo": len(stats["not_found"]),
+            "variant_mismatch": len(stats["errors"]),
+            "not_found": stats["not_found"][:20],
+            "errors": stats["errors"][:20]
         }
 
     except Exception as e:
