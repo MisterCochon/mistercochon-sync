@@ -21,7 +21,7 @@ def odoo_connect():
     uid = common.authenticate(ODOO_DB, ODOO_LOGIN, ODOO_PASSWORD, {})
 
     if not uid:
-        raise Exception("Connexion Odoo échouée")
+        raise Exception(f"Connexion Odoo échouée — URL={ODOO_URL} DB={ODOO_DB} LOGIN={ODOO_LOGIN} uid={uid}")
 
     models = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/object")
     return uid, models
