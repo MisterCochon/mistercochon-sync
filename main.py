@@ -7,7 +7,7 @@ from fastapi import FastAPI, UploadFile, File
 
 app = FastAPI()
 
-VERSION = "2026-06-11-v13-chunk-sync"
+VERSION = "2026-06-11-v14-delete-assign"
 
 ODOO_URL = os.getenv("ODOO_URL")
 ODOO_DB = os.getenv("ODOO_DB")
@@ -921,6 +921,164 @@ def sync_stock_one(ecwid_product_id: int):
 
     except Exception as e:
         return {"status": "error", "error": str(e), "type": type(e).__name__}
+
+
+def ecwid_delete(endpoint):
+    url = f"https://app.ecwid.com/api/v3/{ECWID_STORE_ID}{endpoint}"
+    response = requests.delete(url, headers={"Authorization": f"Bearer {ECWID_TOKEN}"})
+    return response.status_code, response.json() if response.content else {}
+
+
+# Odoo variant ID → nom du produit (via template)
+TO_DELETE_ODOO_VARIANT_IDS = [
+    27, 31, 48, 55, 85, 90, 129, 137, 148, 166, 171,
+    190, 191, 212, 213, 219, 226, 229, 236, 250, 259,
+    266, 271, 278, 283, 285, 297, 307, 308, 313, 315,
+    318, 322, 327, 329, 343, 344
+]
+
+TO_ASSIGN_SKUS = {
+    35: "BLPGR1200",
+    54: "SHBM1120",
+    67: "3295890237019",
+    75: "CHIP11XX",
+    83: "8856141004672",
+    93: "CORDB12XX",
+    117: "CHOX1200",
+    118: "CHOR2200",
+    119: "CHOR2300",
+    124: "DRYX1200",
+    135: "FOIE11XX",
+    145: "MOUFVXXXX",
+    156: "SAUC2200",
+    157: "CHOF110X",
+    174: "JAMB2160",
+    179: "SMOKTXXX",
+    181: "JAMP12XX",
+    206: "COLC111X",
+    220: "PANC1280",
+    231: "PAVS1200",
+    234: "BOCF1263",
+    235: "PIEDS1200",
+    238: "PINKP1200",
+    252: "RILLEXXXX",
+    260: "SALPR2200",
+    264: "RABB1000",
+    267: "RACLT1200",
+    280: "SALAM1200",
+    288: "SAUCL12XX",
+    290: "SAUC12XXX",
+    304: "SALM1200",
+    309: "SAUST1200",
+    319: "SAUT1130",
+    324: "SAUVA1200",
+    326: "COTV1110",
+    331: "VEALN2100",
+    341: "BBMA1200",
+}
+
+
+@app.get("/apply-skus-from-file")
+def apply_skus_from_file():
+    """Assigne les SKUs définis dans TO_ASSIGN_SKUS vers Odoo."""
+    try:
+        updated, errors = [], []
+        for variant_id, sku in TO_ASSIGN_SKUS.items():
+            try:
+                odoo_execute("product.product", "write", [[variant_id], {"default_code": sku}])
+                updated.append({"variant_id": variant_id, "sku": sku})
+            except Exception as e:
+                errors.append({"variant_id": variant_id, "sku": sku, "error": str(e)})
+        return {"status": "ok", "updated_count": len(updated), "error_count": len(errors), "updated": updated, "errors": errors}
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+
+
+@app.get("/delete-products-preview")
+def delete_products_preview():
+    """Aperçu des produits qui seront supprimés (sans modifier quoi que ce soit)."""
+    try:
+        variants = odoo_execute("product.product", "read",
+            [TO_DELETE_ODOO_VARIANT_IDS],
+            {"fields": ["id", "name", "product_tmpl_id"]}
+        )
+        ecwid_products = ecwid_get_all_products()
+        ecwid_by_name = {p["name"]: p["id"] for p in ecwid_products if p.get("name")}
+
+        preview = []
+        for v in variants:
+            name = v["name"]
+            tmpl_id = v["product_tmpl_id"][0] if v.get("product_tmpl_id") else None
+            ecwid_id = ecwid_by_name.get(name)
+            preview.append({
+                "odoo_variant_id": v["id"],
+                "odoo_template_id": tmpl_id,
+                "name": name,
+                "ecwid_id": ecwid_id,
+                "ecwid_found": ecwid_id is not None
+            })
+
+        return {
+            "status": "ok",
+            "count": len(preview),
+            "ecwid_found_count": sum(1 for p in preview if p["ecwid_found"]),
+            "preview": preview
+        }
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+
+
+@app.get("/delete-products")
+def delete_products():
+    """Supprime les produits marqués A SUPPRIMER : archive dans Odoo + supprime dans Ecwid."""
+    try:
+        variants = odoo_execute("product.product", "read",
+            [TO_DELETE_ODOO_VARIANT_IDS],
+            {"fields": ["id", "name", "product_tmpl_id"]}
+        )
+
+        # Récupérer les template IDs uniques
+        template_ids = list(set(
+            v["product_tmpl_id"][0] for v in variants if v.get("product_tmpl_id")
+        ))
+
+        # Archiver les templates Odoo (désactive aussi toutes leurs variantes)
+        odoo_execute("product.template", "write", [template_ids, {"active": False}])
+
+        # Supprimer dans Ecwid
+        ecwid_products = ecwid_get_all_products()
+        ecwid_by_name = {p["name"]: p["id"] for p in ecwid_products if p.get("name")}
+
+        deleted_ecwid, not_found_ecwid, ecwid_errors = [], [], []
+        processed_names = set()
+
+        for v in variants:
+            name = v["name"]
+            if name in processed_names:
+                continue
+            processed_names.add(name)
+            ecwid_id = ecwid_by_name.get(name)
+            if not ecwid_id:
+                not_found_ecwid.append(name)
+                continue
+            code, _ = ecwid_delete(f"/products/{ecwid_id}")
+            if code in (200, 204):
+                deleted_ecwid.append({"name": name, "ecwid_id": ecwid_id})
+            else:
+                ecwid_errors.append({"name": name, "ecwid_id": ecwid_id, "http_status": code})
+
+        return {
+            "status": "ok",
+            "odoo_archived_templates": len(template_ids),
+            "ecwid_deleted": len(deleted_ecwid),
+            "ecwid_not_found": len(not_found_ecwid),
+            "ecwid_errors": len(ecwid_errors),
+            "deleted_ecwid": deleted_ecwid,
+            "not_found_ecwid": not_found_ecwid,
+            "errors_ecwid": ecwid_errors
+        }
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
 
 
 @app.get("/disable-bacon-unused")
