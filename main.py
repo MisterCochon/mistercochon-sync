@@ -5,7 +5,7 @@ from fastapi import FastAPI
 
 app = FastAPI()
 
-VERSION = "2026-06-10-v8-stock-sync"
+VERSION = "2026-06-11-v9-apply-sync-all"
 
 ODOO_URL = os.getenv("ODOO_URL")
 ODOO_DB = os.getenv("ODOO_DB")
@@ -477,6 +477,79 @@ def apply_sync_product(product_id: int):
             "template_id": template["id"],
             "updated_count": len(updated),
             "updated": updated
+        }
+
+    except Exception as e:
+        return {"status": "error", "error": str(e), "type": type(e).__name__}
+
+
+@app.get("/apply-sync-all")
+def apply_sync_all():
+    """Applique les SKUs Ecwid vers Odoo pour tous les produits en masse."""
+    try:
+        products = ecwid_get_all_products()
+
+        results = {"updated": [], "skipped": [], "errors": []}
+
+        for product in products:
+            ecwid_id = product.get("id")
+            product_name = product.get("name")
+            combinations = product.get("combinations", [])
+
+            # Produit sans variantes
+            if not combinations:
+                sku = product.get("sku")
+                if not sku:
+                    results["skipped"].append({"id": ecwid_id, "name": product_name, "reason": "pas de SKU Ecwid"})
+                    continue
+                template = find_odoo_template_by_name(product_name)
+                if not template:
+                    results["skipped"].append({"id": ecwid_id, "name": product_name, "reason": "produit introuvable dans Odoo"})
+                    continue
+                variant_ids = template["product_variant_ids"]
+                if len(variant_ids) != 1:
+                    results["skipped"].append({"id": ecwid_id, "name": product_name, "reason": f"{len(variant_ids)} variantes Odoo vs 1 Ecwid"})
+                    continue
+                odoo_execute("product.product", "write", [[variant_ids[0]], {"default_code": sku}])
+                results["updated"].append({"id": ecwid_id, "name": product_name, "sku": sku})
+                continue
+
+            # Produit avec variantes
+            variants = ecwid_variants(product)
+            skus = [v.get("sku") for v in variants]
+            if not any(skus):
+                results["skipped"].append({"id": ecwid_id, "name": product_name, "reason": "aucun SKU sur les variantes Ecwid"})
+                continue
+
+            template = find_odoo_template_by_name(product_name)
+            if not template:
+                results["skipped"].append({"id": ecwid_id, "name": product_name, "reason": "produit introuvable dans Odoo"})
+                continue
+
+            odoo_variant_ids = template["product_variant_ids"]
+            if len(odoo_variant_ids) != len(variants):
+                results["errors"].append({
+                    "id": ecwid_id, "name": product_name,
+                    "reason": f"variantes Odoo ({len(odoo_variant_ids)}) ≠ Ecwid ({len(variants)})"
+                })
+                continue
+
+            updated_variants = []
+            for odoo_variant_id, variant in zip(odoo_variant_ids, variants):
+                sku = variant.get("sku")
+                if not sku:
+                    continue
+                odoo_execute("product.product", "write", [[odoo_variant_id], {"default_code": sku}])
+                updated_variants.append({"odoo_id": odoo_variant_id, "sku": sku})
+
+            results["updated"].append({"id": ecwid_id, "name": product_name, "variants": updated_variants})
+
+        return {
+            "status": "ok",
+            "updated_count": len(results["updated"]),
+            "skipped_count": len(results["skipped"]),
+            "error_count": len(results["errors"]),
+            **results
         }
 
     except Exception as e:
