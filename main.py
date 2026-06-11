@@ -17,11 +17,15 @@ ECWID_TOKEN = os.getenv("ECWID_TOKEN")
 
 
 def odoo_connect():
-    common = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/common")
-    uid = common.authenticate(ODOO_DB, ODOO_LOGIN, ODOO_PASSWORD, {})
+    try:
+        common = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/common")
+        version = common.version()
+        uid = common.authenticate(ODOO_DB, ODOO_LOGIN, ODOO_PASSWORD, {})
+    except Exception as e:
+        raise Exception(f"XML-RPC erreur: {e} — URL={ODOO_URL} DB={ODOO_DB} LOGIN={ODOO_LOGIN}")
 
     if not uid:
-        raise Exception(f"Connexion Odoo échouée — URL={ODOO_URL} DB={ODOO_DB} LOGIN={ODOO_LOGIN} uid={uid}")
+        raise Exception(f"Auth échouée (uid=False) — URL={ODOO_URL} DB={ODOO_DB} LOGIN={ODOO_LOGIN} version={version}")
 
     models = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/object")
     return uid, models
