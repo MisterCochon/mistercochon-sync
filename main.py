@@ -7,7 +7,7 @@ from fastapi import FastAPI, UploadFile, File
 
 app = FastAPI()
 
-VERSION = "2026-06-11-v12-batch-sync"
+VERSION = "2026-06-11-v13-chunk-sync"
 
 ODOO_URL = os.getenv("ODOO_URL")
 ODOO_DB = os.getenv("ODOO_DB")
@@ -18,7 +18,12 @@ ECWID_STORE_ID = os.getenv("ECWID_STORE_ID")
 ECWID_TOKEN = os.getenv("ECWID_TOKEN")
 
 
+_odoo_cache = {"uid": None, "models": None}
+
+
 def odoo_connect():
+    if _odoo_cache["uid"]:
+        return _odoo_cache["uid"], _odoo_cache["models"]
     try:
         common = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/common")
         version = common.version()
@@ -30,20 +35,19 @@ def odoo_connect():
         raise Exception(f"Auth échouée (uid=False) — URL={ODOO_URL} DB={ODOO_DB} LOGIN={ODOO_LOGIN} version={version}")
 
     models = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/object")
+    _odoo_cache["uid"] = uid
+    _odoo_cache["models"] = models
     return uid, models
 
 
 def odoo_execute(model, method, args=None, kwargs=None):
     uid, models = odoo_connect()
-    return models.execute_kw(
-        ODOO_DB,
-        uid,
-        ODOO_PASSWORD,
-        model,
-        method,
-        args or [],
-        kwargs or {}
-    )
+    try:
+        return models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, model, method, args or [], kwargs or {})
+    except Exception:
+        _odoo_cache["uid"] = None
+        uid, models = odoo_connect()
+        return models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, model, method, args or [], kwargs or {})
 
 
 def ecwid_get(endpoint, params=None):
@@ -486,19 +490,21 @@ def apply_sync_product(product_id: int):
 
 
 @app.get("/apply-sync-all")
-def apply_sync_all():
-    """Applique les SKUs Ecwid vers Odoo pour tous les produits en masse (batch optimisé)."""
+def apply_sync_all(offset: int = 0, limit: int = 50):
+    """Applique les SKUs Ecwid vers Odoo. Utiliser offset/limit pour paginer (ex: ?offset=0&limit=50)."""
     try:
-        products = ecwid_get_all_products()
+        all_products = ecwid_get_all_products()
+        total = len(all_products)
+        products = all_products[offset:offset + limit]
 
-        # Collecter tous les noms de produits
+        if not products:
+            return {"status": "ok", "message": "Aucun produit dans cette plage", "total": total, "offset": offset, "limit": limit}
+
         names = list(set(p.get("name") for p in products if p.get("name")))
-
-        # Récupérer tous les templates Odoo en une seule requête
         templates = odoo_execute(
             "product.template", "search_read",
             [[["name", "in", names]]],
-            {"fields": ["id", "name", "product_variant_ids"], "limit": 2000}
+            {"fields": ["id", "name", "product_variant_ids"], "limit": 500}
         )
         template_map = {t["name"]: t for t in templates}
 
@@ -544,14 +550,23 @@ def apply_sync_all():
 
             results["updated"].append({"name": product_name, "variants": len(variants)})
 
+        next_offset = offset + limit
+        has_more = next_offset < total
+
         return {
             "status": "ok",
+            "total_products": total,
+            "offset": offset,
+            "limit": limit,
+            "processed": len(products),
+            "has_more": has_more,
+            "next_offset": next_offset if has_more else None,
             "updated_count": len(results["updated"]),
             "skipped_count": len(results["skipped"]),
             "error_count": len(results["errors"]),
             "updated": results["updated"],
             "errors": results["errors"],
-            "skipped": results["skipped"][:20]
+            "skipped": results["skipped"]
         }
 
     except Exception as e:
