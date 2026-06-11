@@ -7,7 +7,7 @@ from fastapi import FastAPI, UploadFile, File
 
 app = FastAPI()
 
-VERSION = "2026-06-11-v10-import-sku-csv"
+VERSION = "2026-06-11-v11-import-sku-json"
 
 ODOO_URL = os.getenv("ODOO_URL")
 ODOO_DB = os.getenv("ODOO_DB")
@@ -560,9 +560,20 @@ def apply_sync_all():
 
 @app.post("/import-sku-csv")
 async def import_sku_csv(file: UploadFile = File(...)):
+    return await _process_sku_csv(await file.read())
+
+
+@app.post("/import-sku-json")
+async def import_sku_json(payload: dict):
+    """Accepte le CSV encodé en base64 dans un JSON: {"csv": "contenu..."}"""
+    import base64
+    content = base64.b64decode(payload["csv"])
+    return await _process_sku_csv(content)
+
+
+async def _process_sku_csv(content: bytes):
     """Importe les SKUs depuis un export CSV Ecwid directement dans Odoo."""
     try:
-        content = await file.read()
         text = content.decode("utf-8")
         reader = csv.reader(io.StringIO(text))
         next(reader)  # skip header
