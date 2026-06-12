@@ -7,7 +7,7 @@ from fastapi import FastAPI, UploadFile, File
 
 app = FastAPI()
 
-VERSION = "2026-06-11-v21-pro-category"
+VERSION = "2026-06-11-v22-search-products"
 
 ODOO_URL = os.getenv("ODOO_URL")
 ODOO_DB = os.getenv("ODOO_DB")
@@ -1199,6 +1199,19 @@ PRO_STANDARD_PRICES = {
     "Smoked Salmon sliced": 1050,
     "Smoked Salmon whole fillet": 890,
 }
+
+
+@app.get("/search-products/{name}")
+def search_products(name: str):
+    """Cherche des produits par nom (recherche partielle). Ex: /search-products/Chipolata"""
+    try:
+        templates = odoo_execute("product.template", "search_read",
+            [[["name", "ilike", name]]],
+            {"fields": ["id", "name", "categ_id", "product_variant_count", "active"], "limit": 50}
+        )
+        return {"status": "ok", "count": len(templates), "products": templates}
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
 
 
 @app.get("/assign-pro-category")
