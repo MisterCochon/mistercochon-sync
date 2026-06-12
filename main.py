@@ -15,7 +15,7 @@ from reportlab.lib.enums import TA_LEFT, TA_CENTER, TA_RIGHT
 
 app = FastAPI()
 
-VERSION = "2026-06-11-v24-order-pdf"
+VERSION = "2026-06-11-v25-order-pdf-by-ref"
 
 ODOO_URL = os.getenv("ODOO_URL")
 ODOO_DB = os.getenv("ODOO_DB")
@@ -1222,17 +1222,18 @@ def search_products(name: str):
         return {"status": "error", "error": str(e)}
 
 
-@app.get("/order-pdf/{order_id}")
-def order_pdf(order_id: int):
-    """Génère le bon de préparation PDF pour une commande Odoo (sale.order)."""
+@app.get("/order-pdf/{order_ref}")
+def order_pdf(order_ref: str):
+    """Génère le bon de préparation PDF. order_ref = numéro Ecwid ou référence Odoo (ex: S00001)."""
     try:
-        # Récupérer la commande
-        orders = odoo_execute("sale.order", "read", [[order_id]], {
-            "fields": ["name", "date_order", "partner_id", "client_order_ref",
-                       "order_line", "note"]
-        })
+        # Chercher par référence Odoo (name) ou numéro Ecwid (client_order_ref)
+        orders = odoo_execute("sale.order", "search_read",
+            [["|", ["name", "=", order_ref], ["client_order_ref", "=", order_ref]]],
+            {"fields": ["name", "date_order", "partner_id", "client_order_ref", "order_line", "note"],
+             "limit": 1}
+        )
         if not orders:
-            return {"status": "error", "error": "Commande introuvable"}
+            return {"status": "error", "error": f"Commande '{order_ref}' introuvable"}
         order = orders[0]
 
         # Récupérer le client
