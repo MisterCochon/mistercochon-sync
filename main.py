@@ -4,10 +4,18 @@ import io
 import requests
 import xmlrpc.client
 from fastapi import FastAPI, UploadFile, File
+from fastapi.responses import StreamingResponse
+from reportlab.lib.pagesizes import A4
+from reportlab.lib import colors
+from reportlab.lib.units import mm
+from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.pdfgen import canvas
+from reportlab.lib.enums import TA_LEFT, TA_CENTER, TA_RIGHT
 
 app = FastAPI()
 
-VERSION = "2026-06-11-v23-chipolata-pro"
+VERSION = "2026-06-11-v24-order-pdf"
 
 ODOO_URL = os.getenv("ODOO_URL")
 ODOO_DB = os.getenv("ODOO_DB")
@@ -1210,6 +1218,199 @@ def search_products(name: str):
             {"fields": ["id", "name", "categ_id", "product_variant_count", "active"], "limit": 50}
         )
         return {"status": "ok", "count": len(templates), "products": templates}
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+
+
+@app.get("/order-pdf/{order_id}")
+def order_pdf(order_id: int):
+    """Génère le bon de préparation PDF pour une commande Odoo (sale.order)."""
+    try:
+        # Récupérer la commande
+        orders = odoo_execute("sale.order", "read", [[order_id]], {
+            "fields": ["name", "date_order", "partner_id", "client_order_ref",
+                       "order_line", "note"]
+        })
+        if not orders:
+            return {"status": "error", "error": "Commande introuvable"}
+        order = orders[0]
+
+        # Récupérer le client
+        partner = odoo_execute("res.partner", "read",
+            [[order["partner_id"][0]]],
+            {"fields": ["name", "street", "street2", "city", "zip", "country_id", "phone"]}
+        )[0]
+
+        # Récupérer les lignes de commande
+        lines = odoo_execute("sale.order.line", "read",
+            [order["order_line"]],
+            {"fields": ["product_id", "product_uom_qty", "product_uom", "name", "default_code"]}
+        )
+
+        # Récupérer les SKUs des variantes
+        variant_ids = [l["product_id"][0] for l in lines if l.get("product_id")]
+        variants = odoo_execute("product.product", "read", [variant_ids],
+            {"fields": ["id", "default_code", "display_name"]}
+        )
+        sku_map = {v["id"]: v.get("default_code") or "" for v in variants}
+
+        # Numéro de commande affiché
+        order_ref = order.get("client_order_ref") or order["name"]
+        order_date = str(order["date_order"])[:10] if order.get("date_order") else ""
+        customer_name = partner["name"]
+
+        # Adresse client
+        addr_parts = [partner.get("street") or "", partner.get("street2") or "",
+                      partner.get("city") or "", partner.get("zip") or ""]
+        address = "\n".join(p for p in addr_parts if p)
+        phone = partner.get("phone") or ""
+
+        # Générer le PDF
+        buf = io.BytesIO()
+        w, h = A4
+        c = canvas.Canvas(buf, pagesize=A4)
+
+        # ─── LOGO placeholder ───
+        c.setFont("Helvetica-Bold", 14)
+        c.setFillColor(colors.HexColor("#1a3a6b"))
+        c.drawString(15*mm, h - 25*mm, "FRENCH")
+        c.drawString(15*mm, h - 32*mm, "DELICATESSEN")
+        c.setFont("Helvetica", 8)
+        c.drawString(15*mm, h - 37*mm, "fresh and dry deli")
+
+        # ─── SHIP TO (droite) ───
+        c.setStrokeColor(colors.black)
+        c.setLineWidth(1)
+        c.rect(95*mm, h - 55*mm, 105*mm, 50*mm)
+        c.setFont("Helvetica-Bold", 11)
+        c.drawString(97*mm, h - 18*mm, "SHIP TO")
+        c.setFont("Helvetica-Bold", 12)
+        c.drawString(97*mm, h - 27*mm, customer_name)
+        c.setFont("Helvetica", 9)
+        y_addr = h - 35*mm
+        for line_addr in address.split("\n"):
+            c.drawString(97*mm, y_addr, line_addr)
+            y_addr -= 5*mm
+
+        # ─── Boîte gauche : cases S1..F3 ───
+        c.rect(15*mm, h - 75*mm, 72*mm, 18*mm)
+        box_labels = ["S1", "S2", "A1", "F1", "F2", "F3"]
+        for i, lbl in enumerate(box_labels):
+            x = 17*mm + i * 11.5*mm
+            c.rect(x, h - 70*mm, 8*mm, 8*mm)
+            c.setFont("Helvetica", 8)
+            c.drawString(x + 1*mm, h - 63*mm, lbl)
+
+        # ─── Chilled / Frozen ───
+        c.rect(15*mm, h - 95*mm, 72*mm, 15*mm)
+        c.setFont("Helvetica-Bold", 9)
+        c.drawString(17*mm, h - 85*mm, "Chilled")
+        c.rect(17*mm, h - 93*mm, 10*mm, 7*mm)
+        c.drawString(32*mm, h - 85*mm, "Frozen")
+        c.rect(32*mm, h - 93*mm, 10*mm, 7*mm)
+
+        # ─── Infos commande (droite) ───
+        c.setFont("Helvetica-Bold", 10)
+        c.rect(95*mm, h - 75*mm, 105*mm, 18*mm)
+        c.drawString(97*mm, h - 65*mm, order_date)
+        c.setFont("Helvetica", 9)
+        c.drawString(140*mm, h - 65*mm, "Pro")
+        c.setFont("Helvetica-Bold", 10)
+        c.drawString(97*mm, h - 73*mm, order_ref)
+
+        c.rect(95*mm, h - 95*mm, 105*mm, 15*mm)
+        c.setFont("Helvetica", 8)
+        c.drawString(97*mm, h - 84*mm, "Phone")
+        c.drawString(140*mm, h - 84*mm, phone)
+        c.drawString(97*mm, h - 92*mm, "Customer Order")
+
+        # ─── Bande client + ref ───
+        c.setFillColor(colors.HexColor("#1a3a6b"))
+        c.rect(15*mm, h - 105*mm, 185*mm, 8*mm, fill=1)
+        c.setFillColor(colors.white)
+        c.setFont("Helvetica-Bold", 9)
+        c.drawString(17*mm, h - 102*mm, customer_name)
+        c.drawString(120*mm, h - 102*mm, order_ref)
+        c.drawString(185*mm, h - 102*mm, "1/1")
+
+        # ─── En-têtes tableau ───
+        c.setFillColor(colors.HexColor("#1a3a6b"))
+        c.rect(15*mm, h - 114*mm, 185*mm, 8*mm, fill=1)
+        c.setFillColor(colors.white)
+        c.setFont("Helvetica-Bold", 8)
+        c.drawString(17*mm, h - 111*mm, "Qty Ordered")
+        c.drawString(45*mm, h - 111*mm, "kg/unit")
+        c.drawString(70*mm, h - 111*mm, "Designation and variation")
+        c.drawString(160*mm, h - 111*mm, "SKU")
+        c.drawString(175*mm, h - 111*mm, "Qty delivered")
+
+        # ─── Lignes produits ───
+        y = h - 120*mm
+        c.setFillColor(colors.black)
+        total_products = 0
+
+        for line in lines:
+            if not line.get("product_id"):
+                continue
+            vid = line["product_id"][0]
+            prod_name = line["product_id"][1] if line.get("product_id") else ""
+            qty = line.get("product_uom_qty", 0)
+            uom = line.get("product_uom", ["", ""])[1] if line.get("product_uom") else ""
+            sku = sku_map.get(vid, "")
+            description = line.get("name") or prod_name
+
+            # Nom produit (gras)
+            c.setFont("Helvetica-Bold", 9)
+            c.drawString(70*mm, y, prod_name)
+
+            # Variation (si différente du nom)
+            variation = description.replace(prod_name, "").strip(" \n-[]")
+            if variation:
+                c.setFont("Helvetica", 8)
+                c.drawString(70*mm, y - 4*mm, variation)
+
+            # Qté dans grande police
+            c.setFont("Helvetica-Bold", 16)
+            c.drawString(17*mm, y - 4*mm, str(int(qty) if qty == int(qty) else qty))
+            c.setFont("Helvetica", 9)
+            c.drawString(38*mm, y - 3*mm, uom)
+
+            # SKU
+            c.setFont("Helvetica", 8)
+            c.drawString(160*mm, y, sku)
+
+            # Case Qty delivered
+            c.rect(175*mm, y - 6*mm, 22*mm, 10*mm)
+
+            # Séparateur
+            c.setLineWidth(0.3)
+            c.line(15*mm, y - 9*mm, 200*mm, y - 9*mm)
+
+            y -= 18*mm
+            total_products += 1
+
+            if y < 40*mm:  # nouvelle page si besoin
+                c.showPage()
+                y = h - 30*mm
+
+        # ─── Total ───
+        c.setFont("Helvetica-Bold", 9)
+        c.drawString(15*mm, y, f"{total_products}   Total Product")
+
+        # ─── Footer ───
+        c.setFont("Helvetica", 7)
+        c.setFillColor(colors.grey)
+        footer = "French Delicatessen Ltd – 64/21 Moo 2 – Bang Saray – Sattahip – 20250 Chon Buri"
+        c.drawCentredString(w/2, 12*mm, footer)
+        c.drawCentredString(w/2, 8*mm, "0828.04.04.55 – Contact@french-delicatessen.co.th")
+
+        c.save()
+        buf.seek(0)
+
+        filename = f"BonPreparation_{order_ref}.pdf"
+        return StreamingResponse(buf, media_type="application/pdf",
+            headers={"Content-Disposition": f"attachment; filename={filename}"})
+
     except Exception as e:
         return {"status": "error", "error": str(e)}
 
