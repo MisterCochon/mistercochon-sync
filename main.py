@@ -7,7 +7,7 @@ from fastapi import FastAPI, UploadFile, File
 
 app = FastAPI()
 
-VERSION = "2026-06-11-v18-batch-create-products"
+VERSION = "2026-06-11-v19-fix-list-price"
 
 ODOO_URL = os.getenv("ODOO_URL")
 ODOO_DB = os.getenv("ODOO_DB")
@@ -1226,7 +1226,7 @@ def create_pro_products():
 
         vals_list = []
         for name, price in to_create.items():
-            vals = {"name": name, "type": "consu", "sale_ok": True, "purchase_ok": True, "lst_price": price}
+            vals = {"name": name, "type": "consu", "sale_ok": True, "purchase_ok": True, "list_price": price}
             if uom_id:
                 vals["uom_id"] = uom_id
                 vals["uom_po_id"] = uom_id
