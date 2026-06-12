@@ -15,7 +15,7 @@ from reportlab.lib.enums import TA_LEFT, TA_CENTER, TA_RIGHT
 
 app = FastAPI()
 
-VERSION = "2026-06-11-v25-order-pdf-by-ref"
+VERSION = "2026-06-12-v26-order-numbering"
 
 ODOO_URL = os.getenv("ODOO_URL")
 ODOO_DB = os.getenv("ODOO_DB")
@@ -1677,3 +1677,93 @@ def disable_bacon_unused():
             "error": str(e),
             "type": type(e).__name__
         }
+
+
+# ─── Numérotation des commandes ───────────────────────────────────────────────
+
+SEQ_CODES = {
+    "P": "sale.order.pro",
+    "D": "fd.order.direct",
+    "S": "fd.order.shop",
+}
+
+
+@app.get("/next-order-number/{order_type}")
+def next_order_number(order_type: str):
+    """Retourne ET consomme le prochain numéro de séquence. order_type: P, D ou S."""
+    order_type = order_type.upper()
+    if order_type not in SEQ_CODES:
+        return {"status": "error", "error": f"Type invalide: {order_type}. Utiliser P, D ou S."}
+    try:
+        seq_code = SEQ_CODES[order_type]
+        number = odoo_execute("ir.sequence", "next_by_code", [[seq_code]])
+        if not number:
+            return {"status": "error", "error": f"Séquence '{seq_code}' introuvable dans Odoo"}
+        return {"status": "ok", "order_type": order_type, "sequence_code": seq_code, "number": number}
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+
+
+@app.post("/set-order-number/{order_id}/{order_type}")
+def set_order_number(order_id: int, order_type: str):
+    """
+    Assigne un numéro FD à une commande Odoo existante.
+    order_type: P (PRO), D (Direct), S (Shop)
+    Consomme un numéro de séquence.
+    """
+    order_type = order_type.upper()
+    if order_type not in SEQ_CODES:
+        return {"status": "error", "error": f"Type invalide: {order_type}. Utiliser P, D ou S."}
+    try:
+        orders = odoo_execute("sale.order", "search_read",
+            [[["id", "=", order_id]]],
+            {"fields": ["id", "name", "state"], "limit": 1}
+        )
+        if not orders:
+            return {"status": "error", "error": f"Commande ID {order_id} introuvable"}
+
+        old_name = orders[0]["name"]
+        seq_code = SEQ_CODES[order_type]
+        new_name = odoo_execute("ir.sequence", "next_by_code", [[seq_code]])
+        if not new_name:
+            return {"status": "error", "error": f"Séquence '{seq_code}' introuvable"}
+
+        odoo_execute("sale.order", "write", [[order_id], {"name": new_name}])
+
+        return {
+            "status": "ok",
+            "order_id": order_id,
+            "old_name": old_name,
+            "new_name": new_name,
+            "order_type": order_type
+        }
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+
+
+@app.get("/order-number-preview/{order_type}")
+def order_number_preview(order_type: str):
+    """Aperçu du prochain numéro SANS le consommer. order_type: P, D ou S."""
+    order_type = order_type.upper()
+    if order_type not in SEQ_CODES:
+        return {"status": "error", "error": f"Type invalide: {order_type}. Utiliser P, D ou S."}
+    try:
+        seq_code = SEQ_CODES[order_type]
+        seqs = odoo_execute("ir.sequence", "search_read",
+            [[["code", "=", seq_code]]],
+            {"fields": ["id", "name", "prefix", "suffix", "number_next_actual", "padding"], "limit": 1}
+        )
+        if not seqs:
+            return {"status": "error", "error": f"Séquence '{seq_code}' introuvable"}
+        seq = seqs[0]
+        return {
+            "status": "ok",
+            "sequence": seq["name"],
+            "code": seq_code,
+            "prefix": seq.get("prefix"),
+            "suffix": seq.get("suffix"),
+            "next_number": seq.get("number_next_actual"),
+            "padding": seq.get("padding"),
+        }
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
