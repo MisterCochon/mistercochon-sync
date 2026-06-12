@@ -1704,7 +1704,7 @@ def next_order_number(order_type: str):
         return {"status": "error", "error": str(e)}
 
 
-@app.post("/set-order-number/{order_id}/{order_type}")
+@app.get("/set-order-number/{order_id}/{order_type}")
 def set_order_number(order_id: int, order_type: str):
     """
     Assigne un numéro FD à une commande Odoo existante.
