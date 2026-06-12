@@ -7,7 +7,7 @@ from fastapi import FastAPI, UploadFile, File
 
 app = FastAPI()
 
-VERSION = "2026-06-11-v16-pro-pricelist"
+VERSION = "2026-06-11-v17-create-pro-products"
 
 ODOO_URL = os.getenv("ODOO_URL")
 ODOO_DB = os.getenv("ODOO_DB")
@@ -1199,6 +1199,56 @@ PRO_STANDARD_PRICES = {
     "Smoked Salmon sliced": 1050,
     "Smoked Salmon whole fillet": 890,
 }
+
+
+@app.get("/create-pro-products")
+def create_pro_products():
+    """Crée dans Odoo les produits PRO manquants (ceux absents du catalogue actuel)."""
+    try:
+        # Trouver l'UoM kg
+        uom_kg = odoo_execute("uom.uom", "search_read",
+            [[["name", "=", "kg"]]],
+            {"fields": ["id", "name"], "limit": 1}
+        )
+        uom_id = uom_kg[0]["id"] if uom_kg else False
+
+        # Trouver les produits déjà existants
+        names = list(PRO_STANDARD_PRICES.keys())
+        existing = odoo_execute("product.template", "search_read",
+            [[["name", "in", names], ["active", "=", True]]],
+            {"fields": ["name"], "limit": 500}
+        )
+        existing_names = {t["name"] for t in existing}
+        to_create = {n: p for n, p in PRO_STANDARD_PRICES.items() if n not in existing_names}
+
+        created, errors = [], []
+        for name, price in to_create.items():
+            try:
+                vals = {
+                    "name": name,
+                    "type": "consu",
+                    "sale_ok": True,
+                    "purchase_ok": True,
+                    "lst_price": price,
+                }
+                if uom_id:
+                    vals["uom_id"] = uom_id
+                    vals["uom_po_id"] = uom_id
+                tmpl_id = odoo_execute("product.template", "create", [vals])
+                created.append({"name": name, "price": price, "template_id": tmpl_id})
+            except Exception as e:
+                errors.append({"name": name, "error": str(e)})
+
+        return {
+            "status": "ok",
+            "created_count": len(created),
+            "skipped_existing": len(existing_names),
+            "error_count": len(errors),
+            "created": created,
+            "errors": errors
+        }
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
 
 
 @app.get("/pro-pricelist-preview")
