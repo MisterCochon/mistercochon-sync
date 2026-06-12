@@ -7,7 +7,7 @@ from fastapi import FastAPI, UploadFile, File
 
 app = FastAPI()
 
-VERSION = "2026-06-11-v14-delete-assign"
+VERSION = "2026-06-11-v15-generic-ops"
 
 ODOO_URL = os.getenv("ODOO_URL")
 ODOO_DB = os.getenv("ODOO_DB")
@@ -1077,6 +1077,29 @@ def delete_products():
             "not_found_ecwid": not_found_ecwid,
             "errors_ecwid": ecwid_errors
         }
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+
+
+@app.get("/assign-sku/{variant_id}/{sku}")
+def assign_sku(variant_id: int, sku: str):
+    """Assigne un SKU à une variante Odoo par son ID. Ex: /assign-sku/218/OCBC1420"""
+    try:
+        odoo_execute("product.product", "write", [[variant_id], {"default_code": sku}])
+        return {"status": "ok", "variant_id": variant_id, "sku": sku}
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+
+
+@app.get("/archive-template/{template_id}")
+def archive_template(template_id: int):
+    """Archive un template Odoo (et toutes ses variantes). Ex: /archive-template/314"""
+    try:
+        template = odoo_execute("product.template", "read", [[template_id]], {"fields": ["id", "name"]})
+        if not template:
+            return {"status": "not_found", "template_id": template_id}
+        odoo_execute("product.template", "write", [[template_id], {"active": False}])
+        return {"status": "ok", "archived": template[0]["name"], "template_id": template_id}
     except Exception as e:
         return {"status": "error", "error": str(e)}
 
