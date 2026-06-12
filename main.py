@@ -7,7 +7,7 @@ from fastapi import FastAPI, UploadFile, File
 
 app = FastAPI()
 
-VERSION = "2026-06-11-v17-create-pro-products"
+VERSION = "2026-06-11-v18-batch-create-products"
 
 ODOO_URL = os.getenv("ODOO_URL")
 ODOO_DB = os.getenv("ODOO_DB")
@@ -1221,31 +1221,27 @@ def create_pro_products():
         existing_names = {t["name"] for t in existing}
         to_create = {n: p for n, p in PRO_STANDARD_PRICES.items() if n not in existing_names}
 
-        created, errors = [], []
+        if not to_create:
+            return {"status": "ok", "created_count": 0, "skipped_existing": len(existing_names), "message": "Tous les produits existent déjà"}
+
+        vals_list = []
         for name, price in to_create.items():
-            try:
-                vals = {
-                    "name": name,
-                    "type": "consu",
-                    "sale_ok": True,
-                    "purchase_ok": True,
-                    "lst_price": price,
-                }
-                if uom_id:
-                    vals["uom_id"] = uom_id
-                    vals["uom_po_id"] = uom_id
-                tmpl_id = odoo_execute("product.template", "create", [vals])
-                created.append({"name": name, "price": price, "template_id": tmpl_id})
-            except Exception as e:
-                errors.append({"name": name, "error": str(e)})
+            vals = {"name": name, "type": "consu", "sale_ok": True, "purchase_ok": True, "lst_price": price}
+            if uom_id:
+                vals["uom_id"] = uom_id
+                vals["uom_po_id"] = uom_id
+            vals_list.append(vals)
+
+        new_ids = odoo_execute("product.template", "create", [vals_list])
+        if not isinstance(new_ids, list):
+            new_ids = [new_ids]
 
         return {
             "status": "ok",
-            "created_count": len(created),
+            "created_count": len(new_ids),
             "skipped_existing": len(existing_names),
-            "error_count": len(errors),
-            "created": created,
-            "errors": errors
+            "error_count": 0,
+            "new_template_ids": new_ids
         }
     except Exception as e:
         return {"status": "error", "error": str(e)}
