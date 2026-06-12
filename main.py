@@ -7,7 +7,7 @@ from fastapi import FastAPI, UploadFile, File
 
 app = FastAPI()
 
-VERSION = "2026-06-11-v15-generic-ops"
+VERSION = "2026-06-11-v16-pro-pricelist"
 
 ODOO_URL = os.getenv("ODOO_URL")
 ODOO_DB = os.getenv("ODOO_DB")
@@ -1100,6 +1100,192 @@ def archive_template(template_id: int):
             return {"status": "not_found", "template_id": template_id}
         odoo_execute("product.template", "write", [[template_id], {"active": False}])
         return {"status": "ok", "archived": template[0]["name"], "template_id": template_id}
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+
+
+PRO_STANDARD_PRICES = {
+    "Merguez beef & Lamb (diam 22mm - 17cm)": 590,
+    "Merguez beef & Lamb (18mm/20cm sandwiches)": 590,
+    "Pork Merguez": 490,
+    "Chipolata": 480,
+    "Herb Chipolatas": 485,
+    "Chipolata Tandoori Masala": 485,
+    "Chipolata Kebab": 485,
+    "Chipolata Ail des ours": 485,
+    "Toulouse Sausage": 375,
+    "Cooking Chorizo": 490,
+    "Morteau Sausage": 510,
+    "Montbeliard": 510,
+    "Smoked sausages": 450,
+    "Creole sausages": 350,
+    "Cervelas pistachio": 790,
+    "Cervelas pistachio & truffle": 1100,
+    "Swiss Vaud sausages": 450,
+    "Boudin Noir": 520,
+    "Boudin noir vrac": 420,
+    "Boudin creole": 590,
+    "Boudin blanc Apple": 590,
+    "Boudin blanc Mushrooms - Morels": 690,
+    "Boudin blanc Truffle": 1100,
+    "Breakfast sausages": 250,
+    "Breakfast Chicken Sausage": 250,
+    "Country Pate": 550,
+    "Country Pate green pepper": 570,
+    "Country Pate Basque": 490,
+    "Duck liver pate": 650,
+    "Pork Rillettes": 450,
+    "Duck Rillettes": 580,
+    "Duck Liver Mousse": 490,
+    "Garlic Sausage": 490,
+    "Parsley ham": 420,
+    "Head cheese pate": 490,
+    "Knack": 520,
+    "Hotdog sausages": 520,
+    "Chorizo": 790,
+    "Bresaola sliced": 950,
+    "Lonzo": 950,
+    "Coppa": 890,
+    "Pancetta": 890,
+    "Rosette or Jesus": 890,
+    "Saucisson Sec (diam 40/50mm)": 795,
+    "Saucisson Walnut": 820,
+    "Saucisson Provencal": 890,
+    "Dry sausage": 720,
+    "Dry liver sausages": 695,
+    "Dry duck sausage": 820,
+    "Cold cut": 120,
+    "Pave chorizo": 590,
+    "Pave saucisson": 590,
+    "Finger saucisson": 890,
+    "Finger Chorizo": 990,
+    "Paris Ham (Block)": 450,
+    "Paris Ham (Sliced)": 470,
+    "Parisian heel (Talon)": 250,
+    "Ham hock": 400,
+    "Chicken Ham": 290,
+    "Petit sale": 490,
+    "Smoked Bacon": 520,
+    "Smoked Bacon (Sliced)": 590,
+    "Smoked Bacon (Diced)": 520,
+    "Duck breast": 480,
+    "Duck breast (magret)": 1750,
+    "Smoked Duck Breast": 690,
+    "Dry Duck Breast Pepper": 1100,
+    "Duck Leg": 295,
+    "Duck leg Confit": 495,
+    "Gizzard Confit": 320,
+    "Drummets": 320,
+    "Duck Fat (oil)": 320,
+    "Pork Chop": 450,
+    "Seasoned minced pork": 350,
+    "Harissa": 890,
+    "Espelette Piment": 1500,
+    "Toulouse sausage Premium": 490,
+    "Saucisson premium": 1190,
+    "Chorizo Premium": 1090,
+    "Bacon smoked": 890,
+    "Duck rillette (fat duck)": 950,
+    "Duck legs fattened": 1270,
+    "Duck Magret": 1790,
+    "Duck magret dried": 1850,
+    "Duck legs confit": 1590,
+    "Andouillette 5A (180gr)": 1495,
+    "Andouillette 5A (160gr Standard)": 1295,
+    "Foie Gras Lobe Extra Deveined": 2950,
+    "Foie gras Ballotine": 3900,
+    "Smoked Trout from Himalaya sliced": 1050,
+    "Smoked Trout from Himalaya Whole fillet": 890,
+    "Smoked Salmon sliced": 1050,
+    "Smoked Salmon whole fillet": 890,
+}
+
+
+@app.get("/pro-pricelist-preview")
+def pro_pricelist_preview():
+    """Aperçu : quels produits PRO existent dans Odoo (par nom) avant création de la liste de prix."""
+    try:
+        names = list(PRO_STANDARD_PRICES.keys())
+        templates = odoo_execute("product.template", "search_read",
+            [[["name", "in", names], ["active", "=", True]]],
+            {"fields": ["id", "name"], "limit": 500}
+        )
+        found_names = {t["name"] for t in templates}
+        not_found = [n for n in names if n not in found_names]
+        return {
+            "status": "ok",
+            "total_in_list": len(names),
+            "found_in_odoo": len(found_names),
+            "not_found_count": len(not_found),
+            "found": sorted(found_names),
+            "not_found": sorted(not_found)
+        }
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+
+
+@app.get("/create-pro-pricelist")
+def create_pro_pricelist():
+    """Crée la liste de prix 'Tarif PRO Standard' dans Odoo avec les prix du catalogue PRO."""
+    try:
+        # Trouver la devise THB
+        currencies = odoo_execute("res.currency", "search_read",
+            [[["name", "=", "THB"]]],
+            {"fields": ["id", "name"], "limit": 1}
+        )
+        currency_id = currencies[0]["id"] if currencies else False
+
+        # Vérifier si la liste de prix existe déjà
+        existing = odoo_execute("product.pricelist", "search_read",
+            [[["name", "=", "Tarif PRO Standard"]]],
+            {"fields": ["id", "name"], "limit": 1}
+        )
+
+        if existing:
+            pricelist_id = existing[0]["id"]
+            # Supprimer les anciennes règles
+            old_items = odoo_execute("product.pricelist.item", "search",
+                [[["pricelist_id", "=", pricelist_id]]]
+            )
+            if old_items:
+                odoo_execute("product.pricelist.item", "unlink", [old_items])
+        else:
+            pricelist_id = odoo_execute("product.pricelist", "create", [{
+                "name": "Tarif PRO Standard",
+                "currency_id": currency_id,
+            }])
+
+        # Chercher les templates par nom
+        names = list(PRO_STANDARD_PRICES.keys())
+        templates = odoo_execute("product.template", "search_read",
+            [[["name", "in", names], ["active", "=", True]]],
+            {"fields": ["id", "name"], "limit": 500}
+        )
+        template_map = {t["name"]: t["id"] for t in templates}
+
+        created, not_found = [], []
+        for name, price in PRO_STANDARD_PRICES.items():
+            tmpl_id = template_map.get(name)
+            if not tmpl_id:
+                not_found.append(name)
+                continue
+            odoo_execute("product.pricelist.item", "create", [{
+                "pricelist_id": pricelist_id,
+                "applied_on": "1_product",
+                "product_tmpl_id": tmpl_id,
+                "compute_price": "fixed",
+                "fixed_price": price,
+            }])
+            created.append({"name": name, "price": price})
+
+        return {
+            "status": "ok",
+            "pricelist_id": pricelist_id,
+            "pricelist_name": "Tarif PRO Standard",
+            "rules_created": len(created),
+            "not_found_count": len(not_found),
+            "not_found": not_found
+        }
     except Exception as e:
         return {"status": "error", "error": str(e)}
 
