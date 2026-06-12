@@ -7,7 +7,7 @@ from fastapi import FastAPI, UploadFile, File
 
 app = FastAPI()
 
-VERSION = "2026-06-11-v20-fix-uom"
+VERSION = "2026-06-11-v21-pro-category"
 
 ODOO_URL = os.getenv("ODOO_URL")
 ODOO_DB = os.getenv("ODOO_DB")
@@ -1199,6 +1199,39 @@ PRO_STANDARD_PRICES = {
     "Smoked Salmon sliced": 1050,
     "Smoked Salmon whole fillet": 890,
 }
+
+
+@app.get("/assign-pro-category")
+def assign_pro_category():
+    """Assigne la catégorie 'Pro' à tous les produits PRO créés (templates 450-535)."""
+    try:
+        # Trouver la catégorie "Pro"
+        categories = odoo_execute("product.category", "search_read",
+            [[["name", "=", "Pro"]]],
+            {"fields": ["id", "name"], "limit": 5}
+        )
+        if not categories:
+            return {"status": "error", "error": "Catégorie 'Pro' introuvable dans Odoo"}
+        cat_id = categories[0]["id"]
+
+        # Trouver tous les produits de la liste PRO qui existent
+        names = list(PRO_STANDARD_PRICES.keys())
+        templates = odoo_execute("product.template", "search_read",
+            [[["name", "in", names]]],
+            {"fields": ["id", "name"], "limit": 500}
+        )
+        template_ids = [t["id"] for t in templates]
+
+        odoo_execute("product.template", "write", [template_ids, {"categ_id": cat_id}])
+
+        return {
+            "status": "ok",
+            "category": "Pro",
+            "category_id": cat_id,
+            "products_updated": len(template_ids)
+        }
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
 
 
 @app.get("/create-pro-products")
