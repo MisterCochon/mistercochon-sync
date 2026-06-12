@@ -7,7 +7,7 @@ from fastapi import FastAPI, UploadFile, File
 
 app = FastAPI()
 
-VERSION = "2026-06-11-v22-search-products"
+VERSION = "2026-06-11-v23-chipolata-pro"
 
 ODOO_URL = os.getenv("ODOO_URL")
 ODOO_DB = os.getenv("ODOO_DB")
@@ -1210,6 +1210,63 @@ def search_products(name: str):
             {"fields": ["id", "name", "categ_id", "product_variant_count", "active"], "limit": 50}
         )
         return {"status": "ok", "count": len(templates), "products": templates}
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+
+
+@app.get("/set-chipolata-pro-prices")
+def set_chipolata_pro_prices():
+    """Définit les prix PRO par variante Chipolata : nature=480, autres=485 THB."""
+    try:
+        # Trouver la liste de prix PRO Standard
+        pricelists = odoo_execute("product.pricelist", "search_read",
+            [[["name", "=", "Tarif PRO Standard"]]],
+            {"fields": ["id"], "limit": 1}
+        )
+        if not pricelists:
+            return {"status": "error", "error": "Liste de prix 'Tarif PRO Standard' introuvable"}
+        pricelist_id = pricelists[0]["id"]
+
+        # Supprimer les règles existantes pour template 74
+        old_items = odoo_execute("product.pricelist.item", "search",
+            [[["pricelist_id", "=", pricelist_id], ["product_tmpl_id", "=", 74]]]
+        )
+        if old_items:
+            odoo_execute("product.pricelist.item", "unlink", [old_items])
+
+        # Nature → 480 THB
+        nature_ids = [476, 481, 486]
+        # Autres saveurs → 485 THB
+        other_ids = [477, 478, 479, 480, 482, 483, 484, 485, 487, 488, 489, 490]
+
+        rules = []
+        for vid in nature_ids:
+            rules.append({
+                "pricelist_id": pricelist_id,
+                "applied_on": "0_product_variant",
+                "product_id": vid,
+                "compute_price": "fixed",
+                "fixed_price": 480,
+            })
+        for vid in other_ids:
+            rules.append({
+                "pricelist_id": pricelist_id,
+                "applied_on": "0_product_variant",
+                "product_id": vid,
+                "compute_price": "fixed",
+                "fixed_price": 485,
+            })
+
+        odoo_execute("product.pricelist.item", "create", [rules])
+
+        return {
+            "status": "ok",
+            "rules_created": len(rules),
+            "nature_variants": len(nature_ids),
+            "other_variants": len(other_ids),
+            "nature_price": 480,
+            "other_price": 485
+        }
     except Exception as e:
         return {"status": "error", "error": str(e)}
 
