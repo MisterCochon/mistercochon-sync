@@ -16,7 +16,7 @@ from reportlab.lib.enums import TA_LEFT, TA_CENTER, TA_RIGHT
 
 app = FastAPI()
 
-VERSION = "2026-06-14-v29-clean-product-name"
+VERSION = "2026-06-14-v30-fix-s1f3-layout"
 
 ODOO_URL = os.getenv("ODOO_URL")
 ODOO_DB = os.getenv("ODOO_DB")
@@ -1294,17 +1294,8 @@ def order_pdf(order_ref: str):
             c.drawString(97*mm, y_addr, line_addr)
             y_addr -= 5*mm
 
-        # ─── Boîte gauche : cases S1..F3 ───
-        c.rect(15*mm, h - 75*mm, 72*mm, 18*mm)
-        box_labels = ["S1", "S2", "A1", "F1", "F2", "F3"]
-        for i, lbl in enumerate(box_labels):
-            x = 17*mm + i * 11.5*mm
-            c.rect(x, h - 70*mm, 8*mm, 8*mm)
-            c.setFont("Helvetica", 8)
-            c.drawString(x + 1*mm, h - 63*mm, lbl)
-
         # ─── Chilled / Frozen ───
-        c.rect(15*mm, h - 95*mm, 72*mm, 15*mm)
+        c.rect(15*mm, h - 95*mm, 72*mm, 36*mm)
         c.setFont("Helvetica-Bold", 9)
         c.drawString(17*mm, h - 85*mm, "Chilled")
         c.rect(17*mm, h - 93*mm, 10*mm, 7*mm)
@@ -1389,6 +1380,17 @@ def order_pdf(order_ref: str):
             if y < 40*mm:  # nouvelle page si besoin
                 c.showPage()
                 y = h - 30*mm
+                # Rappel S1-F3 en haut de page 2+
+                c.setStrokeColor(colors.black)
+                c.setLineWidth(0.5)
+                box_labels = ["S1", "S2", "A1", "F1", "F2", "F3"]
+                for i, lbl in enumerate(box_labels):
+                    bx = 15*mm + i * 14*mm
+                    c.rect(bx, h - 18*mm, 10*mm, 8*mm)
+                    c.setFont("Helvetica", 7)
+                    c.setFillColor(colors.black)
+                    c.drawString(bx + 1*mm, h - 11*mm, lbl)
+                y = h - 35*mm
 
         # ─── Total ───
         c.setFont("Helvetica-Bold", 9)
