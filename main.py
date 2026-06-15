@@ -16,7 +16,7 @@ from reportlab.lib.enums import TA_LEFT, TA_CENTER, TA_RIGHT
 
 app = FastAPI()
 
-VERSION = "2026-06-14-v31-remove-s1f3"
+VERSION = "2026-06-14-v32-bilingual-names"
 
 ODOO_URL = os.getenv("ODOO_URL")
 ODOO_DB = os.getenv("ODOO_DB")
@@ -1249,12 +1249,17 @@ def order_pdf(order_ref: str):
             {"fields": ["product_id", "product_uom_qty", "name"]}
         )
 
-        # Récupérer les SKUs des variantes
+        # Récupérer les SKUs et noms EN + TH des variantes
         variant_ids = [l["product_id"][0] for l in lines if l.get("product_id")]
-        variants = odoo_execute("product.product", "read", [variant_ids],
-            {"fields": ["id", "default_code", "display_name"]}
+        variants_en = odoo_execute("product.product", "read", [variant_ids],
+            {"fields": ["id", "default_code", "display_name"], "context": {"lang": "en_US"}}
         )
-        sku_map = {v["id"]: v.get("default_code") or "" for v in variants}
+        variants_th = odoo_execute("product.product", "read", [variant_ids],
+            {"fields": ["id", "display_name"], "context": {"lang": "th_TH"}}
+        )
+        sku_map = {v["id"]: v.get("default_code") or "" for v in variants_en}
+        name_en_map = {v["id"]: re.sub(r'^\[.*?\]\s*', '', v.get("display_name") or "").strip() for v in variants_en}
+        name_th_map = {v["id"]: re.sub(r'^\[.*?\]\s*', '', v.get("display_name") or "").strip() for v in variants_th}
 
         # Numéro de commande affiché
         order_ref = order.get("client_order_ref") or order["name"]
@@ -1346,35 +1351,45 @@ def order_pdf(order_ref: str):
             if not line.get("product_id"):
                 continue
             vid = line["product_id"][0]
-            raw_name = line["product_id"][1] if line.get("product_id") else ""
-            # Enlever le préfixe [SKU] du nom produit Odoo
-            prod_name = re.sub(r'^\[.*?\]\s*', '', raw_name).strip()
             qty = line.get("product_uom_qty", 0)
             uom = "kg"
             sku = sku_map.get(vid, "")
+            name_en = name_en_map.get(vid, "")
+            name_th = name_th_map.get(vid, "")
+            # N'afficher le thaï que s'il est différent de l'anglais
+            show_th = name_th and name_th != name_en
 
-            # Nom produit (gras)
+            # Nom EN (gras)
             c.setFont("Helvetica-Bold", 9)
-            c.drawString(70*mm, y, prod_name)
+            c.setFillColor(colors.black)
+            c.drawString(70*mm, y, name_en)
+
+            # Nom TH (en dessous, taille légèrement plus petite)
+            if show_th:
+                c.setFont("Helvetica", 8)
+                c.drawString(70*mm, y - 4.5*mm, name_th)
 
             # Qté dans grande police
             c.setFont("Helvetica-Bold", 16)
-            c.drawString(17*mm, y - 4*mm, str(int(qty) if qty == int(qty) else qty))
+            row_mid = y - (5*mm if show_th else 3*mm)
+            c.drawString(17*mm, row_mid, str(int(qty) if qty == int(qty) else qty))
             c.setFont("Helvetica", 9)
-            c.drawString(38*mm, y - 3*mm, uom)
+            c.drawString(38*mm, row_mid + 1*mm, uom)
 
             # SKU
             c.setFont("Helvetica", 8)
             c.drawString(160*mm, y, sku)
 
             # Case Qty delivered
-            c.rect(175*mm, y - 6*mm, 22*mm, 10*mm)
+            row_h = 14*mm if show_th else 10*mm
+            c.rect(175*mm, y - row_h + 4*mm, 22*mm, row_h)
 
             # Séparateur
             c.setLineWidth(0.3)
-            c.line(15*mm, y - 9*mm, 200*mm, y - 9*mm)
+            sep_y = y - row_h + 2*mm
+            c.line(15*mm, sep_y, 200*mm, sep_y)
 
-            y -= 18*mm
+            y -= (row_h + 4*mm)
             total_products += 1
 
             if y < 40*mm:  # nouvelle page si besoin
