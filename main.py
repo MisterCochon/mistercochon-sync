@@ -5,6 +5,8 @@ import re
 import requests
 import xmlrpc.client
 from fastapi import FastAPI, UploadFile, File
+from pydantic import BaseModel
+from typing import Dict
 from fastapi.responses import StreamingResponse
 from reportlab.lib.pagesizes import A4
 from reportlab.lib import colors
@@ -16,7 +18,7 @@ from reportlab.lib.enums import TA_LEFT, TA_CENTER, TA_RIGHT
 
 app = FastAPI()
 
-VERSION = "2026-06-14-v33-restore-s1f3"
+VERSION = "2026-06-14-v34-thai-names-api"
 
 ODOO_URL = os.getenv("ODOO_URL")
 ODOO_DB = os.getenv("ODOO_DB")
@@ -1779,5 +1781,82 @@ def order_number_preview(order_type: str):
             "next_number": seq.get("number_next_actual"),
             "padding": seq.get("padding"),
         }
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+
+
+# ─── Traductions thaïes ───────────────────────────────────────────────────────
+
+class ThaiNamesPayload(BaseModel):
+    translations: Dict[str, str]  # {nom_anglais: nom_thai}
+
+
+@app.post("/set-thai-names")
+def set_thai_names(payload: ThaiNamesPayload):
+    """
+    Écrit les traductions thaïes des noms produits dans Odoo.
+    Body JSON: {"translations": {"Chipolata": "ไส้กรอกหมู", ...}}
+    Cherche les templates par nom anglais, écrit le nom thaï via contexte lang=th_TH.
+    """
+    try:
+        names_en = list(payload.translations.keys())
+
+        # Chercher les templates par nom anglais
+        templates = odoo_execute("product.template", "search_read",
+            [[["name", "in", names_en]]],
+            {"fields": ["id", "name"], "limit": 500, "context": {"lang": "en_US"}}
+        )
+
+        updated, not_found = [], []
+
+        for tmpl in templates:
+            tmpl_id = tmpl["id"]
+            name_en = tmpl["name"]
+            name_th = payload.translations.get(name_en)
+            if not name_th:
+                continue
+            # Écrire le nom thaï avec le contexte de langue
+            odoo_execute("product.template", "write",
+                [[tmpl_id], {"name": name_th}],
+                {"context": {"lang": "th_TH"}}
+            )
+            updated.append({"id": tmpl_id, "en": name_en, "th": name_th})
+
+        found_names = {t["name"] for t in templates}
+        not_found = [n for n in names_en if n not in found_names]
+
+        return {
+            "status": "ok",
+            "updated": len(updated),
+            "not_found": not_found,
+            "details": updated
+        }
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+
+
+@app.get("/get-thai-names")
+def get_thai_names():
+    """Retourne les noms EN et TH de tous les produits actifs."""
+    try:
+        templates_en = odoo_execute("product.template", "search_read",
+            [[["active", "=", True]]],
+            {"fields": ["id", "name"], "limit": 1000, "context": {"lang": "en_US"}}
+        )
+        ids = [t["id"] for t in templates_en]
+        templates_th = odoo_execute("product.template", "read",
+            [ids],
+            {"fields": ["id", "name"], "context": {"lang": "th_TH"}}
+        )
+        en_map = {t["id"]: t["name"] for t in templates_en}
+        th_map = {t["id"]: t["name"] for t in templates_th}
+
+        result = []
+        for tid in ids:
+            en = en_map.get(tid, "")
+            th = th_map.get(tid, "")
+            result.append({"id": tid, "en": en, "th": th, "has_thai": th != en})
+
+        return {"status": "ok", "count": len(result), "products": result}
     except Exception as e:
         return {"status": "error", "error": str(e)}
