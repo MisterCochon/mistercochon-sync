@@ -1,6 +1,7 @@
 import os
 import csv
 import io
+import re
 import requests
 import xmlrpc.client
 from fastapi import FastAPI, UploadFile, File
@@ -15,7 +16,7 @@ from reportlab.lib.enums import TA_LEFT, TA_CENTER, TA_RIGHT
 
 app = FastAPI()
 
-VERSION = "2026-06-14-v28-fix-order-line-fields"
+VERSION = "2026-06-14-v29-clean-product-name"
 
 ODOO_URL = os.getenv("ODOO_URL")
 ODOO_DB = os.getenv("ODOO_DB")
@@ -1354,21 +1355,16 @@ def order_pdf(order_ref: str):
             if not line.get("product_id"):
                 continue
             vid = line["product_id"][0]
-            prod_name = line["product_id"][1] if line.get("product_id") else ""
+            raw_name = line["product_id"][1] if line.get("product_id") else ""
+            # Enlever le préfixe [SKU] du nom produit Odoo
+            prod_name = re.sub(r'^\[.*?\]\s*', '', raw_name).strip()
             qty = line.get("product_uom_qty", 0)
             uom = "kg"
             sku = sku_map.get(vid, "")
-            description = line.get("name") or prod_name
 
             # Nom produit (gras)
             c.setFont("Helvetica-Bold", 9)
             c.drawString(70*mm, y, prod_name)
-
-            # Variation (si différente du nom)
-            variation = description.replace(prod_name, "").strip(" \n-[]")
-            if variation:
-                c.setFont("Helvetica", 8)
-                c.drawString(70*mm, y - 4*mm, variation)
 
             # Qté dans grande police
             c.setFont("Helvetica-Bold", 16)
