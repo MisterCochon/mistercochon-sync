@@ -16,7 +16,7 @@ from reportlab.lib.enums import TA_LEFT, TA_CENTER, TA_RIGHT
 
 app = FastAPI()
 
-VERSION = "2026-06-14-v32-bilingual-names"
+VERSION = "2026-06-14-v33-restore-s1f3"
 
 ODOO_URL = os.getenv("ODOO_URL")
 ODOO_DB = os.getenv("ODOO_DB")
@@ -1299,8 +1299,20 @@ def order_pdf(order_ref: str):
             c.drawString(97*mm, y_addr, line_addr)
             y_addr -= 5*mm
 
+        # ─── Boîte gauche : cases S1..F3 ───
+        c.setStrokeColor(colors.black)
+        c.setLineWidth(0.8)
+        c.rect(15*mm, h - 78*mm, 72*mm, 22*mm)
+        box_labels = ["S1", "S2", "A1", "F1", "F2", "F3"]
+        for i, lbl in enumerate(box_labels):
+            x = 17*mm + i * 11.5*mm
+            c.setFont("Helvetica-Bold", 8)
+            c.setFillColor(colors.black)
+            c.drawString(x + 1*mm, h - 62*mm, lbl)   # label AU-DESSUS de la case
+            c.rect(x, h - 75*mm, 8*mm, 8*mm)          # case à cocher
+
         # ─── Chilled / Frozen ───
-        c.rect(15*mm, h - 95*mm, 72*mm, 36*mm)
+        c.rect(15*mm, h - 95*mm, 72*mm, 15*mm)
         c.setFont("Helvetica-Bold", 9)
         c.drawString(17*mm, h - 85*mm, "Chilled")
         c.rect(17*mm, h - 93*mm, 10*mm, 7*mm)
