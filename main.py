@@ -15,10 +15,20 @@ from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, 
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.pdfgen import canvas
 from reportlab.lib.enums import TA_LEFT, TA_CENTER, TA_RIGHT
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
 
 app = FastAPI()
 
-VERSION = "2026-06-14-v34-thai-names-api"
+VERSION = "2026-06-15-v35-thai-font"
+
+# Enregistrer la police Thai au démarrage
+_THAI_FONT = "NotoSansThai"
+try:
+    _font_path = os.path.join(os.path.dirname(__file__), "NotoSansThai-Regular.ttf")
+    pdfmetrics.registerFont(TTFont(_THAI_FONT, _font_path))
+except Exception:
+    _THAI_FONT = "Helvetica"  # fallback
 
 ODOO_URL = os.getenv("ODOO_URL")
 ODOO_DB = os.getenv("ODOO_DB")
@@ -1378,9 +1388,9 @@ def order_pdf(order_ref: str):
             c.setFillColor(colors.black)
             c.drawString(70*mm, y, name_en)
 
-            # Nom TH (en dessous, taille légèrement plus petite)
+            # Nom TH (en dessous, police Unicode)
             if show_th:
-                c.setFont("Helvetica", 8)
+                c.setFont(_THAI_FONT, 8)
                 c.drawString(70*mm, y - 4.5*mm, name_th)
 
             # Qté dans grande police
