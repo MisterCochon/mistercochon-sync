@@ -15,7 +15,7 @@ from reportlab.lib.enums import TA_LEFT, TA_CENTER, TA_RIGHT
 
 app = FastAPI()
 
-VERSION = "2026-06-14-v27-fix-product-uom"
+VERSION = "2026-06-14-v28-fix-order-line-fields"
 
 ODOO_URL = os.getenv("ODOO_URL")
 ODOO_DB = os.getenv("ODOO_DB")
@@ -1245,7 +1245,7 @@ def order_pdf(order_ref: str):
         # Récupérer les lignes de commande
         lines = odoo_execute("sale.order.line", "read",
             [order["order_line"]],
-            {"fields": ["product_id", "product_uom_qty", "product_uom_id", "name", "default_code"]}
+            {"fields": ["product_id", "product_uom_qty", "name"]}
         )
 
         # Récupérer les SKUs des variantes
@@ -1356,7 +1356,7 @@ def order_pdf(order_ref: str):
             vid = line["product_id"][0]
             prod_name = line["product_id"][1] if line.get("product_id") else ""
             qty = line.get("product_uom_qty", 0)
-            uom = line.get("product_uom_id", ["", ""])[1] if line.get("product_uom_id") else ""
+            uom = "kg"
             sku = sku_map.get(vid, "")
             description = line.get("name") or prod_name
 
