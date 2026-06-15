@@ -16,7 +16,7 @@ from reportlab.lib.enums import TA_LEFT, TA_CENTER, TA_RIGHT
 
 app = FastAPI()
 
-VERSION = "2026-06-14-v30-fix-s1f3-layout"
+VERSION = "2026-06-14-v31-remove-s1f3"
 
 ODOO_URL = os.getenv("ODOO_URL")
 ODOO_DB = os.getenv("ODOO_DB")
@@ -1380,17 +1380,6 @@ def order_pdf(order_ref: str):
             if y < 40*mm:  # nouvelle page si besoin
                 c.showPage()
                 y = h - 30*mm
-                # Rappel S1-F3 en haut de page 2+
-                c.setStrokeColor(colors.black)
-                c.setLineWidth(0.5)
-                box_labels = ["S1", "S2", "A1", "F1", "F2", "F3"]
-                for i, lbl in enumerate(box_labels):
-                    bx = 15*mm + i * 14*mm
-                    c.rect(bx, h - 18*mm, 10*mm, 8*mm)
-                    c.setFont("Helvetica", 7)
-                    c.setFillColor(colors.black)
-                    c.drawString(bx + 1*mm, h - 11*mm, lbl)
-                y = h - 35*mm
 
         # ─── Total ───
         c.setFont("Helvetica-Bold", 9)
