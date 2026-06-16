@@ -20,7 +20,7 @@ from reportlab.pdfbase.ttfonts import TTFont
 
 app = FastAPI()
 
-VERSION = "2026-06-16-v39-no-th-suffix-dup"
+VERSION = "2026-06-16-v40-ecwid-address"
 
 # Enregistrer la police Thai au démarrage
 _THAI_FONT = "NotoSansThai"
@@ -1308,15 +1308,39 @@ def order_pdf(order_ref: str):
                 name_th_map[vid] = name_th[:-len(suffix_match.group(1))].strip()
 
         # Numéro de commande affiché
-        order_ref = order.get("client_order_ref") or order["name"]
+        ecwid_order_ref = order.get("client_order_ref") or ""
+        order_ref = ecwid_order_ref or order["name"]
         order_date = str(order["date_order"])[:10] if order.get("date_order") else ""
         customer_name = partner["name"]
+        phone = partner.get("phone") or ""
 
-        # Adresse client
+        # Adresse client — si Odoo n'a pas d'adresse, on essaie Ecwid
         addr_parts = [partner.get("street") or "", partner.get("street2") or "",
                       partner.get("city") or "", partner.get("zip") or ""]
         address = "\n".join(p for p in addr_parts if p)
-        phone = partner.get("phone") or ""
+
+        if not address and ecwid_order_ref:
+            try:
+                ecwid_orders = ecwid_get("/orders", {"orderNumber": ecwid_order_ref, "limit": 1})
+                if ecwid_orders and ecwid_orders.get("items"):
+                    eco = ecwid_orders["items"][0]
+                    ship = eco.get("shippingPerson") or eco.get("billingPerson") or {}
+                    ecwid_name = ship.get("name") or eco.get("email") or customer_name
+                    if ecwid_name and ecwid_name != customer_name:
+                        customer_name = ecwid_name
+                    if not phone:
+                        phone = ship.get("phone") or ""
+                    addr_parts = [
+                        ship.get("companyName") or "",
+                        ship.get("street") or "",
+                        ship.get("city") or "",
+                        ship.get("stateOrProvinceName") or "",
+                        ship.get("postalCode") or "",
+                        ship.get("countryName") or "",
+                    ]
+                    address = "\n".join(p for p in addr_parts if p)
+            except Exception:
+                pass
 
         # Générer le PDF
         buf = io.BytesIO()
