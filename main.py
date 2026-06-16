@@ -2888,7 +2888,7 @@ def debug_ecwid_order(order_num: str):
     }
 
 
-@app.delete("/delete-ecwid-imports")
+@app.get("/delete-ecwid-imports")
 def delete_ecwid_imports(confirm: str = ""):
     """
     Supprime toutes les commandes Odoo importées depuis Ecwid (client_order_ref numérique).
