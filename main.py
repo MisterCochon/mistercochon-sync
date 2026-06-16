@@ -20,7 +20,7 @@ from reportlab.pdfbase.ttfonts import TTFont
 
 app = FastAPI()
 
-VERSION = "2026-06-16-v40-ecwid-address"
+VERSION = "2026-06-16-v41-import-clients"
 
 # Enregistrer la police Thai au démarrage
 _THAI_FONT = "NotoSansThai"
@@ -1972,5 +1972,136 @@ def restore_english_names(payload: ThaiNamesPayload):
             "not_found": len(not_found),
             "details": restored
         }
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+
+
+# ─── Import clients depuis Excel ──────────────────────────────────────────────
+
+@app.post("/import-clients-xlsx")
+async def import_clients_xlsx(file: UploadFile = File(...)):
+    """
+    Importe / met à jour les partenaires Odoo depuis Table Client.xlsx.
+    Colonnes attendues : PRO | Nom | Nickname | taxID | Telephone | Email |
+                         ok email | telephone thai | Adresse | Sub | District |
+                         Postal code | province | contact | tel contact | email contact
+    Matching : par Email d'abord, puis par Nom.
+    """
+    try:
+        import pandas as pd
+
+        content = await file.read()
+        buf = io.BytesIO(content)
+        df = pd.read_excel(buf, dtype=str)
+        df = df.where(pd.notna(df), "")
+
+        # Normaliser les noms de colonnes
+        df.columns = [str(c).strip() for c in df.columns]
+
+        col_pro   = "PRO"
+        col_nom   = "Nom"
+        col_nick  = "Nickname"
+        col_tax   = "taxID"
+        col_tel   = "Telephone"
+        col_email = "Email"
+        col_tel_th = "telephone thai"
+        col_addr  = "Adresse"
+        col_sub   = "Sub"
+        col_dist  = "District"
+        col_zip   = "Postal code"
+        col_prov  = "province"
+        col_cont  = "contact"
+        col_tel_c = "tel contact"
+        col_email_c = "email contact"
+
+        created, updated, skipped, errors = [], [], [], []
+
+        for _, row in df.iterrows():
+            nom   = str(row.get(col_nom, "")).strip()
+            if not nom:
+                skipped.append({"reason": "nom vide"})
+                continue
+
+            email  = str(row.get(col_email, "")).strip()
+            phone  = str(row.get(col_tel, "")).strip() or str(row.get(col_tel_th, "")).strip()
+            street = str(row.get(col_addr, "")).strip()
+            sub    = str(row.get(col_sub, "")).strip()
+            dist   = str(row.get(col_dist, "")).strip()
+            zip_c  = str(row.get(col_zip, "")).strip()
+            prov   = str(row.get(col_prov, "")).strip()
+            nick   = str(row.get(col_nick, "")).strip()
+            tax_id = str(row.get(col_tax, "")).strip()
+            contact_name = str(row.get(col_cont, "")).strip()
+            pro_flag = str(row.get(col_pro, "")).strip()
+
+            # Construire l'adresse : rue + sous-district
+            street_full = street
+            if sub and sub not in street:
+                street_full = (street + " " + sub).strip()
+
+            # Ville = district + province
+            city = dist or prov
+            if dist and prov and dist != prov:
+                city = dist
+
+            vals = {
+                "name": nom,
+                "phone": phone,
+                "street": street_full,
+                "street2": dist if dist and dist != city else "",
+                "zip": zip_c,
+                "city": prov or dist,
+            }
+            if email:
+                vals["email"] = email
+            if nick:
+                vals["ref"] = nick
+            if tax_id:
+                vals["vat"] = tax_id
+            # Tag PRO
+            comment = ""
+            if pro_flag == "1":
+                comment = "PRO"
+            if contact_name:
+                comment = (comment + " | " + contact_name).strip(" |")
+            if comment:
+                vals["comment"] = comment
+
+            # Recherche dans Odoo
+            partner_id = None
+            if email:
+                results = odoo_execute("res.partner", "search_read",
+                    [[["email", "=", email], ["active", "=", True]]],
+                    {"fields": ["id", "name"], "limit": 1}
+                )
+                if results:
+                    partner_id = results[0]["id"]
+
+            if not partner_id:
+                results = odoo_execute("res.partner", "search_read",
+                    [[["name", "=", nom], ["active", "=", True]]],
+                    {"fields": ["id", "name"], "limit": 1}
+                )
+                if results:
+                    partner_id = results[0]["id"]
+
+            if partner_id:
+                odoo_execute("res.partner", "write", [[partner_id], vals])
+                updated.append({"id": partner_id, "name": nom})
+            else:
+                new_id = odoo_execute("res.partner", "create", [vals])
+                created.append({"id": new_id, "name": nom})
+
+        return {
+            "status": "ok",
+            "total_rows": len(df),
+            "updated": len(updated),
+            "created": len(created),
+            "skipped": len(skipped),
+            "errors": len(errors),
+            "updated_list": updated[:20],
+            "created_list": created[:20],
+        }
+
     except Exception as e:
         return {"status": "error", "error": str(e)}
