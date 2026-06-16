@@ -20,7 +20,7 @@ from reportlab.pdfbase.ttfonts import TTFont
 
 app = FastAPI()
 
-VERSION = "2026-06-16-v42-import-commandes"
+VERSION = "2026-06-16-v43-sync-ecwid-orders"
 
 # Enregistrer la police Thai au démarrage
 _THAI_FONT = "NotoSansThai"
@@ -2342,4 +2342,211 @@ async def import_commandes_xlsx(
         "errors": len(errors_list),
         "created_sample": created[:10],
         "errors_detail": errors_list[:20],
+    }
+
+
+# ─── Sync commandes Ecwid → Odoo ─────────────────────────────────────────────
+
+@app.get("/sync-ecwid-orders")
+def sync_ecwid_orders(
+    status: str = "PAID",
+    limit: int = 100,
+    offset: int = 0,
+    since_order_id: int = 0,
+):
+    """
+    Importe les commandes Ecwid dans Odoo.
+    - status     : filtre Ecwid (PAID, AWAITING_PAYMENT, SHIPPED, etc.) défaut PAID
+    - limit      : nb commandes à traiter par appel (max 100)
+    - offset     : pagination
+    - since_order_id : importer seulement les commandes avec orderNumber > cette valeur
+
+    Chaque commande Ecwid crée un sale.order Odoo numéroté FD-S-XXXX.
+    Le client est trouvé par email ; créé si absent.
+    Les produits sont trouvés par SKU puis par nom.
+    """
+    seq_code = SEQ_CODES["S"]
+
+    # ── Pré-charger produits Odoo ────────────────────────────────────────────
+    odoo_products = odoo_execute("product.product", "search_read",
+        [[["active", "=", True]]],
+        {"fields": ["id", "name", "default_code", "uom_id", "lst_price"],
+         "limit": 2000, "context": {"lang": "en_US"}}
+    )
+    prod_by_sku  = {str(p["default_code"]).strip().upper(): p
+                   for p in odoo_products if p.get("default_code")}
+    prod_by_name = {}
+    for p in odoo_products:
+        key = str(p["name"]).strip().lower()
+        if key not in prod_by_name:
+            prod_by_name[key] = p
+
+    def find_product(sku: str, name: str):
+        if sku:
+            p = prod_by_sku.get(str(sku).strip().upper())
+            if p:
+                return p
+        if name:
+            p = prod_by_name.get(str(name).strip().lower())
+            if p:
+                return p
+        return None
+
+    # ── Pré-charger partenaires Odoo (email) ─────────────────────────────────
+    odoo_partners = odoo_execute("res.partner", "search_read",
+        [[["active", "=", True]]],
+        {"fields": ["id", "name", "email"], "limit": 5000}
+    )
+    partner_by_email = {str(p["email"]).strip().lower(): p["id"]
+                        for p in odoo_partners if p.get("email")}
+
+    # ── Commandes déjà importées (client_order_ref = numéro Ecwid) ───────────
+    existing = odoo_execute("sale.order", "search_read",
+        [[["client_order_ref", "!=", False]]],
+        {"fields": ["client_order_ref"], "limit": 5000}
+    )
+    already_imported = {str(e["client_order_ref"]) for e in existing}
+
+    # ── Récupérer commandes Ecwid ─────────────────────────────────────────────
+    params = {"paymentStatus": status, "limit": limit, "offset": offset,
+              "sortBy": "ORDER_DATE_DESC"}
+    ecwid_data = ecwid_get("/orders", params)
+    if not ecwid_data:
+        return {"status": "error", "error": "Impossible de joindre l'API Ecwid"}
+
+    items = ecwid_data.get("items", [])
+    total_ecwid = ecwid_data.get("total", 0)
+
+    created, skipped, errors_list = [], [], []
+
+    for eco in items:
+        order_num = str(eco.get("orderNumber", ""))
+        if not order_num:
+            skipped.append({"reason": "pas de numéro"})
+            continue
+
+        if order_num in already_imported:
+            skipped.append({"ecwid": order_num, "reason": "déjà importé"})
+            continue
+
+        if since_order_id and int(order_num) <= since_order_id:
+            skipped.append({"ecwid": order_num, "reason": "trop ancien"})
+            continue
+
+        # ── Client ───────────────────────────────────────────────────────────
+        email = str(eco.get("email") or "").strip().lower()
+        ship  = eco.get("shippingPerson") or eco.get("billingPerson") or {}
+        cname = ship.get("name") or eco.get("email") or f"Ecwid #{order_num}"
+        phone = ship.get("phone") or ""
+        street = ship.get("street") or ""
+        city   = ship.get("city") or ""
+        zipcode = ship.get("postalCode") or ""
+
+        partner_id = partner_by_email.get(email) if email else None
+        if not partner_id:
+            # Créer le partenaire
+            vals_p = {"name": cname}
+            if email:
+                vals_p["email"] = email
+            if phone:
+                vals_p["phone"] = phone
+            if street:
+                vals_p["street"] = street
+            if city:
+                vals_p["city"] = city
+            if zipcode:
+                vals_p["zip"] = zipcode
+            try:
+                partner_id = odoo_execute("res.partner", "create", [vals_p])
+                if email:
+                    partner_by_email[email] = partner_id
+            except Exception as e:
+                errors_list.append({"ecwid": order_num, "reason": f"Création client: {e}"})
+                continue
+
+        # ── Obtenir numéro FD ─────────────────────────────────────────────────
+        fd_number = odoo_execute("ir.sequence", "next_by_code", [[seq_code]])
+        if not fd_number:
+            errors_list.append({"ecwid": order_num, "reason": "Séquence FD-S introuvable"})
+            continue
+
+        # ── Créer commande ────────────────────────────────────────────────────
+        order_date = eco.get("createDate") or eco.get("updateDate")
+        order_vals = {
+            "partner_id": partner_id,
+            "client_order_ref": order_num,
+            "name": fd_number,
+        }
+        if order_date:
+            try:
+                from datetime import datetime
+                dt = datetime.utcfromtimestamp(order_date / 1000 if order_date > 1e10 else order_date)
+                order_vals["date_order"] = dt.strftime("%Y-%m-%d %H:%M:%S")
+            except Exception:
+                pass
+
+        try:
+            order_id = odoo_execute("sale.order", "create", [order_vals])
+        except Exception as e:
+            errors_list.append({"ecwid": order_num, "reason": f"Création commande: {e}"})
+            continue
+
+        # ── Lignes ────────────────────────────────────────────────────────────
+        lines_created, lines_missing = 0, []
+        for item in eco.get("items", []):
+            sku      = str(item.get("sku") or "").strip()
+            name_i   = str(item.get("name") or "").strip()
+            qty      = float(item.get("quantity") or 1)
+            price    = float(item.get("price") or 0)
+
+            product = find_product(sku, name_i)
+            if not product:
+                lines_missing.append(sku or name_i)
+                line_vals = {
+                    "order_id": order_id,
+                    "name": name_i or sku or "Article Ecwid",
+                    "product_uom_qty": qty,
+                    "price_unit": price,
+                }
+            else:
+                uom_id = product["uom_id"][0] if isinstance(product.get("uom_id"), list) else False
+                line_vals = {
+                    "order_id": order_id,
+                    "product_id": product["id"],
+                    "name": name_i or product["name"],
+                    "product_uom_qty": qty,
+                    "price_unit": price,
+                }
+                if uom_id:
+                    line_vals["product_uom"] = uom_id
+
+            try:
+                odoo_execute("sale.order.line", "create", [line_vals])
+                lines_created += 1
+            except Exception as e:
+                lines_missing.append(f"erreur: {e}")
+
+        # Confirmer la commande
+        try:
+            odoo_execute("sale.order", "action_confirm", [[order_id]])
+        except Exception:
+            pass
+
+        created.append({
+            "ecwid": order_num,
+            "fd": fd_number,
+            "client": cname,
+            "lines_created": lines_created,
+            "lines_missing": lines_missing[:3] if lines_missing else [],
+        })
+
+    return {
+        "status": "ok",
+        "ecwid_total": total_ecwid,
+        "processed": len(items),
+        "created": len(created),
+        "skipped": len(skipped),
+        "errors": len(errors_list),
+        "created_sample": created[:20],
+        "errors_detail": errors_list[:10],
     }
