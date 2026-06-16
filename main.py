@@ -20,7 +20,7 @@ from reportlab.pdfbase.ttfonts import TTFont
 
 app = FastAPI()
 
-VERSION = "2026-06-16-v41-import-clients"
+VERSION = "2026-06-16-v42-import-commandes"
 
 # Enregistrer la police Thai au démarrage
 _THAI_FONT = "NotoSansThai"
@@ -2105,3 +2105,241 @@ async def import_clients_xlsx(file: UploadFile = File(...)):
 
     except Exception as e:
         return {"status": "error", "error": str(e)}
+
+
+# ─── Import commandes depuis WinDev (2 fichiers CSV/Excel) ────────────────────
+
+@app.post("/import-commandes-xlsx")
+async def import_commandes_xlsx(
+    orders_file: UploadFile = File(...),
+    lines_file: UploadFile = File(...),
+    order_type: str = "D",
+):
+    """
+    Importe les commandes WinDev dans Odoo (Option A).
+    - orders_file : export COMMANDES (CSV ou Excel)
+    - lines_file  : export LIGNCDE  (CSV ou Excel)
+    - order_type  : P (PRO), D (Direct boutique), S (Shop Ecwid) — défaut D
+
+    Option A : name Odoo = nouveau numéro FD (séquence P/D/S)
+               client_order_ref = numéro WinDev original
+    """
+    import pandas as pd
+
+    order_type = order_type.upper()
+    if order_type not in SEQ_CODES:
+        return {"status": "error", "error": f"order_type invalide: {order_type}. Utiliser P, D ou S."}
+
+    seq_code = SEQ_CODES[order_type]
+
+    def read_file(upload: UploadFile) -> pd.DataFrame:
+        content = upload.file.read()
+        buf = io.BytesIO(content)
+        name = upload.filename or ""
+        if name.lower().endswith(".csv"):
+            try:
+                df = pd.read_csv(buf, dtype=str, sep="\t", encoding="utf-8")
+            except Exception:
+                buf.seek(0)
+                df = pd.read_csv(buf, dtype=str, sep=";", encoding="utf-8")
+        else:
+            df = pd.read_excel(buf, dtype=str)
+        df.columns = [str(c).strip() for c in df.columns]
+        return df.where(pd.notna(df), "")
+
+    def find_col(df: pd.DataFrame, candidates: list):
+        for c in candidates:
+            if c in df.columns:
+                return c
+        return None
+
+    try:
+        df_orders = read_file(orders_file)
+        df_lines  = read_file(lines_file)
+    except Exception as e:
+        return {"status": "error", "error": f"Lecture fichiers: {e}"}
+
+    # ── Colonnes commandes ──────────────────────────────────────────────────
+    col_num    = find_col(df_orders, ["NumCommande","Numero","RefCommande","Num","N°","Numéro","Number"])
+    col_date   = find_col(df_orders, ["DateCommande","Date","date_order","Date commande"])
+    col_client = find_col(df_orders, ["NomClient","Client","CodeClient","Nom client","Customer"])
+    col_statut = find_col(df_orders, ["StatutCommande","Statut","Etat","Status","Etat commande"])
+
+    if not col_num:
+        return {"status": "error", "error": f"Colonne numéro commande introuvable. Colonnes dispo: {list(df_orders.columns)}"}
+    if not col_client:
+        return {"status": "error", "error": f"Colonne client introuvable. Colonnes dispo: {list(df_orders.columns)}"}
+
+    # ── Colonnes lignes ─────────────────────────────────────────────────────
+    ln_num  = find_col(df_lines, ["NumCommande","Numero","RefCommande","Num","N°","Numéro","Number"])
+    ln_art  = find_col(df_lines, ["CodeArticle","RefArticle","Article","Code","Ref","SKU"])
+    ln_des  = find_col(df_lines, ["Designation","Description","NomArticle","Libelle","Nom article"])
+    ln_qty  = find_col(df_lines, ["Quantite","Qte","Qty","Quantité","Quantity"])
+    ln_prix = find_col(df_lines, ["PrixUnitaire","PrixVente","Prix","Price","PU","Prix unitaire"])
+    ln_rem  = find_col(df_lines, ["Remise","TauxRemise","Discount","Remise%","Remise %"])
+
+    if not ln_num:
+        return {"status": "error", "error": f"Colonne numéro commande (lignes) introuvable. Colonnes dispo: {list(df_lines.columns)}"}
+
+    # ── Pré-charger les produits Odoo ───────────────────────────────────────
+    odoo_products = odoo_execute("product.product", "search_read",
+        [[["active", "=", True]]],
+        {"fields": ["id", "name", "default_code", "uom_id"], "limit": 2000, "context": {"lang": "en_US"}}
+    )
+    prod_by_ref  = {str(p["default_code"]).strip().upper(): p for p in odoo_products if p.get("default_code")}
+    prod_by_name = {}
+    for p in odoo_products:
+        key = str(p["name"]).strip().lower()
+        if key not in prod_by_name:
+            prod_by_name[key] = p
+
+    def find_product(code: str, name: str):
+        if code:
+            p = prod_by_ref.get(str(code).strip().upper())
+            if p:
+                return p
+        if name:
+            p = prod_by_name.get(str(name).strip().lower())
+            if p:
+                return p
+        return None
+
+    # ── Pré-charger les partenaires Odoo ───────────────────────────────────
+    odoo_partners = odoo_execute("res.partner", "search_read",
+        [[["active", "=", True]]],
+        {"fields": ["id", "name", "email"], "limit": 5000}
+    )
+    partner_by_name  = {str(p["name"]).strip().lower(): p["id"] for p in odoo_partners}
+    partner_by_email = {str(p["email"]).strip().lower(): p["id"] for p in odoo_partners if p.get("email")}
+
+    def find_partner(client_str: str):
+        key = str(client_str).strip().lower()
+        pid = partner_by_name.get(key)
+        if pid:
+            return pid
+        return partner_by_email.get(key)
+
+    # ── Grouper les lignes par numéro commande ──────────────────────────────
+    lines_by_order = {}
+    for _, row in df_lines.iterrows():
+        num = str(row.get(ln_num, "")).strip()
+        if num:
+            lines_by_order.setdefault(num, []).append(row)
+
+    # ── Importer les commandes ──────────────────────────────────────────────
+    created, skipped, errors_list = [], [], []
+
+    for _, row in df_orders.iterrows():
+        windev_num = str(row.get(col_num, "")).strip()
+        client_str = str(row.get(col_client, "")).strip()
+        date_str   = str(row.get(col_date, "")).strip() if col_date else ""
+
+        if not windev_num:
+            skipped.append({"reason": "numéro vide"})
+            continue
+
+        partner_id = find_partner(client_str)
+        if not partner_id:
+            errors_list.append({"windev": windev_num, "reason": f"Client introuvable: '{client_str}'"})
+            continue
+
+        fd_number = odoo_execute("ir.sequence", "next_by_code", [[seq_code]])
+        if not fd_number:
+            errors_list.append({"windev": windev_num, "reason": f"Séquence '{seq_code}' introuvable"})
+            continue
+
+        order_vals = {
+            "partner_id": partner_id,
+            "client_order_ref": windev_num,
+            "name": fd_number,
+        }
+
+        if date_str:
+            try:
+                m = re.match(r"(\d{2})[/\-](\d{2})[/\-](\d{4})", date_str)
+                if m:
+                    order_vals["date_order"] = f"{m.group(3)}-{m.group(2)}-{m.group(1)} 00:00:00"
+                else:
+                    m2 = re.match(r"(\d{4})[/\-](\d{2})[/\-](\d{2})", date_str)
+                    if m2:
+                        order_vals["date_order"] = f"{m2.group(1)}-{m2.group(2)}-{m2.group(3)} 00:00:00"
+            except Exception:
+                pass
+
+        try:
+            order_id = odoo_execute("sale.order", "create", [order_vals])
+        except Exception as e:
+            errors_list.append({"windev": windev_num, "reason": f"Création: {e}"})
+            continue
+
+        # ── Lignes de commande ──────────────────────────────────────────────
+        order_lines = lines_by_order.get(windev_num, [])
+        lines_created, lines_missing = 0, []
+
+        for line_row in order_lines:
+            art_code = str(line_row.get(ln_art, "")).strip() if ln_art else ""
+            art_name = str(line_row.get(ln_des, "")).strip() if ln_des else ""
+            qty_str  = str(line_row.get(ln_qty, "1")).strip() if ln_qty else "1"
+            prix_str = str(line_row.get(ln_prix, "0")).strip() if ln_prix else "0"
+            rem_str  = str(line_row.get(ln_rem, "0")).strip() if ln_rem else "0"
+
+            try:
+                qty    = float(qty_str.replace(",", ".")) if qty_str else 1.0
+                prix   = float(prix_str.replace(",", ".")) if prix_str else 0.0
+                remise = float(rem_str.replace(",", ".")) if rem_str else 0.0
+            except ValueError:
+                qty, prix, remise = 1.0, 0.0, 0.0
+
+            product = find_product(art_code, art_name)
+            if not product:
+                lines_missing.append(art_code or art_name)
+                line_vals = {
+                    "order_id": order_id,
+                    "name": art_name or art_code or "Article inconnu",
+                    "product_uom_qty": qty,
+                    "price_unit": prix,
+                    "discount": remise,
+                }
+            else:
+                uom_id = product["uom_id"][0] if isinstance(product.get("uom_id"), list) else False
+                line_vals = {
+                    "order_id": order_id,
+                    "product_id": product["id"],
+                    "name": art_name or product["name"],
+                    "product_uom_qty": qty,
+                    "price_unit": prix,
+                    "discount": remise,
+                }
+                if uom_id:
+                    line_vals["product_uom"] = uom_id
+
+            try:
+                odoo_execute("sale.order.line", "create", [line_vals])
+                lines_created += 1
+            except Exception as e:
+                lines_missing.append(f"erreur ligne: {e}")
+
+        try:
+            odoo_execute("sale.order", "action_confirm", [[order_id]])
+        except Exception:
+            pass
+
+        created.append({
+            "windev": windev_num,
+            "fd": fd_number,
+            "partner": client_str,
+            "lines_created": lines_created,
+            "lines_missing": lines_missing[:5] if lines_missing else [],
+        })
+
+    return {
+        "status": "ok",
+        "order_type": order_type,
+        "seq_code": seq_code,
+        "total_orders": len(df_orders),
+        "created": len(created),
+        "skipped": len(skipped),
+        "errors": len(errors_list),
+        "created_sample": created[:10],
+        "errors_detail": errors_list[:20],
+    }
