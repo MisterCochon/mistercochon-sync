@@ -20,7 +20,7 @@ from reportlab.pdfbase.ttfonts import TTFont
 
 app = FastAPI()
 
-VERSION = "2026-06-16-v45-sync-all-orders"
+VERSION = "2026-06-16-v46-stripe-webhook"
 
 # Enregistrer la police Thai au démarrage
 _THAI_FONT = "NotoSansThai"
@@ -63,6 +63,8 @@ ODOO_PASSWORD = os.getenv("ODOO_PASSWORD")
 
 ECWID_STORE_ID = os.getenv("ECWID_STORE_ID")
 ECWID_TOKEN = os.getenv("ECWID_TOKEN")
+
+STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "")
 
 
 _odoo_cache = {"uid": None, "models": None}
@@ -2699,3 +2701,135 @@ async def webhook_ecwid(request: Request):
     eco = ecwid_data["items"][0]
     result = _import_one_ecwid_order(entity_id, eco)
     return {"status": "ok", "order": entity_id, "result": result}
+
+
+# ─── Webhook Stripe → Odoo (paiement carte) ──────────────────────────────────
+
+def _mark_order_paid_odoo(ecwid_order_ref: str, stripe_payment_id: str):
+    """Cherche la commande Odoo par ref Ecwid et enregistre le paiement."""
+    orders = odoo_execute("sale.order", "search_read",
+        [[["client_order_ref", "=", ecwid_order_ref]]],
+        {"fields": ["id", "name", "amount_total", "invoice_ids", "partner_id"], "limit": 1}
+    )
+    if not orders:
+        return {"found": False}
+
+    order = orders[0]
+    order_id = order["id"]
+
+    # Créer la facture si pas encore créée
+    invoice_ids = order.get("invoice_ids") or []
+    if not invoice_ids:
+        try:
+            odoo_execute("sale.order", "action_lock", [[order_id]])
+        except Exception:
+            pass
+        try:
+            invoice_ids = odoo_execute("sale.order", "action_invoice_create", [[order_id]])
+            if not isinstance(invoice_ids, list):
+                invoice_ids = [invoice_ids]
+        except Exception:
+            pass
+
+    if invoice_ids:
+        inv_id = invoice_ids[0]
+        # Confirmer la facture
+        try:
+            odoo_execute("account.move", "action_post", [[inv_id]])
+        except Exception:
+            pass
+        # Enregistrer le paiement
+        try:
+            journals = odoo_execute("account.journal", "search_read",
+                [[["type", "=", "bank"]]],
+                {"fields": ["id", "name"], "limit": 1}
+            )
+            if journals:
+                payment_vals = {
+                    "move_id": inv_id,
+                    "journal_id": journals[0]["id"],
+                    "payment_method_line_id": False,
+                    "amount": order["amount_total"],
+                    "currency_id": False,
+                }
+                odoo_execute("account.payment.register", "create", [payment_vals])
+        except Exception:
+            pass
+
+    # Ajouter note Stripe en internal note
+    try:
+        odoo_execute("sale.order", "message_post", [[order_id]], {
+            "body": f"Paiement Stripe confirmé : {stripe_payment_id}",
+            "message_type": "comment",
+            "subtype_xmlid": "mail.mt_note",
+        })
+    except Exception:
+        pass
+
+    return {"found": True, "order": order["name"], "invoiced": bool(invoice_ids)}
+
+
+@app.post("/webhook/stripe")
+async def webhook_stripe(request: Request):
+    """
+    Webhook Stripe — appelé automatiquement par Stripe après un paiement réussi.
+    Enregistrer l'URL dans Stripe Dashboard → Developers → Webhooks
+    URL : https://mistercochon-backend.onrender.com/webhook/stripe
+    Événements : payment_intent.succeeded, checkout.session.completed
+
+    Cherche la commande Ecwid/Odoo via les metadata Stripe (order_id ou ecwid_order_id).
+    """
+    payload = await request.body()
+    sig_header = request.headers.get("stripe-signature", "")
+
+    # Vérification signature Stripe (si secret configuré)
+    if STRIPE_WEBHOOK_SECRET:
+        try:
+            import hmac, hashlib, time
+            parts = {p.split("=")[0]: p.split("=")[1]
+                     for p in sig_header.split(",") if "=" in p}
+            ts = parts.get("t", "0")
+            v1 = parts.get("v1", "")
+            signed = f"{ts}.{payload.decode()}"
+            expected = hmac.new(
+                STRIPE_WEBHOOK_SECRET.encode(),
+                signed.encode(),
+                hashlib.sha256
+            ).hexdigest()
+            if not hmac.compare_digest(expected, v1):
+                return {"status": "error", "reason": "signature invalide"}
+        except Exception:
+            pass
+
+    try:
+        event = await request.json() if not payload else __import__("json").loads(payload)
+    except Exception:
+        return {"status": "error", "reason": "JSON invalide"}
+
+    event_type = event.get("type", "")
+    data_obj   = event.get("data", {}).get("object", {})
+
+    # Extraire référence commande Ecwid depuis metadata Stripe
+    metadata = data_obj.get("metadata") or {}
+    ecwid_ref = (
+        metadata.get("ecwid_order_id") or
+        metadata.get("order_id") or
+        metadata.get("orderNumber") or
+        data_obj.get("description") or ""
+    )
+    stripe_id = data_obj.get("id", "")
+
+    if event_type not in ("payment_intent.succeeded", "checkout.session.completed",
+                          "charge.succeeded"):
+        return {"status": "ignored", "event": event_type}
+
+    if not ecwid_ref:
+        return {
+            "status": "ignored",
+            "reason": "Pas de référence commande dans les metadata Stripe",
+            "stripe_id": stripe_id,
+            "metadata": metadata,
+        }
+
+    result = _mark_order_paid_odoo(str(ecwid_ref), stripe_id)
+    return {"status": "ok", "event": event_type, "ecwid_ref": ecwid_ref, "result": result}
