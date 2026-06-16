@@ -20,7 +20,7 @@ from reportlab.pdfbase.ttfonts import TTFont
 
 app = FastAPI()
 
-VERSION = "2026-06-16-v46-stripe-webhook"
+VERSION = "2026-06-16-v47-fix-order-lines"
 
 # Enregistrer la police Thai au démarrage
 _THAI_FONT = "NotoSansThai"
@@ -2558,6 +2558,28 @@ def sync_ecwid_orders(
 
 # ─── Webhook Ecwid → Odoo (temps réel) ───────────────────────────────────────
 
+def _parse_ecwid_date(order_date) -> str:
+    """Parse date Ecwid (unix seconds, unix ms, ou string ISO) → 'YYYY-MM-DD HH:MM:SS'"""
+    if not order_date:
+        return ""
+    try:
+        from datetime import datetime
+        if isinstance(order_date, (int, float)):
+            ts = order_date / 1000 if order_date > 1e10 else order_date
+            return datetime.utcfromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
+        if isinstance(order_date, str):
+            for fmt in ("%Y-%m-%d %H:%M:%S %z", "%Y-%m-%dT%H:%M:%S%z",
+                        "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+                try:
+                    dt = datetime.strptime(order_date[:19], fmt[:len(fmt)])
+                    return dt.strftime("%Y-%m-%d %H:%M:%S")
+                except Exception:
+                    continue
+    except Exception:
+        pass
+    return ""
+
+
 def _import_one_ecwid_order(order_num: str, eco: dict) -> dict:
     """Importe une commande Ecwid dans Odoo. Retourne {"fd": ..., "status": ...}"""
     seq_code = SEQ_CODES["S"]
@@ -2613,21 +2635,16 @@ def _import_one_ecwid_order(order_num: str, eco: dict) -> dict:
         "client_order_ref": order_num,
         "name": fd_number,
     }
-    order_date = eco.get("createDate") or eco.get("updateDate")
-    if order_date:
-        try:
-            from datetime import datetime
-            dt = datetime.utcfromtimestamp(order_date / 1000 if order_date > 1e10 else order_date)
-            order_vals["date_order"] = dt.strftime("%Y-%m-%d %H:%M:%S")
-        except Exception:
-            pass
+    order_date_str = _parse_ecwid_date(eco.get("createDate") or eco.get("updateDate"))
+    if order_date_str:
+        order_vals["date_order"] = order_date_str
 
     order_id = odoo_execute("sale.order", "create", [order_vals])
 
-    # Pré-charger produits
+    # Pré-charger produits (en_US pour matching correct)
     odoo_products = odoo_execute("product.product", "search_read",
         [[["active", "=", True]]],
-        {"fields": ["id", "name", "default_code", "uom_id"], "limit": 2000,
+        {"fields": ["id", "name", "default_code", "uom_id"], "limit": 5000,
          "context": {"lang": "en_US"}}
     )
     prod_by_sku  = {str(p["default_code"]).strip().upper(): p
@@ -2640,12 +2657,21 @@ def _import_one_ecwid_order(order_num: str, eco: dict) -> dict:
 
     lines_created = 0
     for item in eco.get("items", []):
-        sku   = str(item.get("sku") or "").strip().upper()
-        name_i = str(item.get("name") or "").strip()
-        qty   = float(item.get("quantity") or 1)
-        price = float(item.get("price") or 0)
+        sku    = str(item.get("sku") or item.get("productSku") or "").strip().upper()
+        name_i = str(item.get("name") or item.get("productName") or "").strip()
+        qty    = float(item.get("quantity") or 1)
+        price  = float(item.get("price") or item.get("unitPrice") or 0)
 
-        product = prod_by_sku.get(sku) or prod_by_name.get(name_i.lower())
+        # Matching : SKU exact → nom exact → nom partiel
+        product = prod_by_sku.get(sku)
+        if not product and name_i:
+            product = prod_by_name.get(name_i.lower())
+        if not product and name_i:
+            # Recherche partielle : trouver produit dont le nom Odoo est contenu dans le nom Ecwid
+            for k, p in prod_by_name.items():
+                if k and (k in name_i.lower() or name_i.lower() in k):
+                    product = p
+                    break
         if not product:
             line_vals = {"order_id": order_id, "name": name_i or sku or "Article Ecwid",
                          "product_uom_qty": qty, "price_unit": price}
@@ -2833,3 +2859,77 @@ async def webhook_stripe(request: Request):
 
     result = _mark_order_paid_odoo(str(ecwid_ref), stripe_id)
     return {"status": "ok", "event": event_type, "ecwid_ref": ecwid_ref, "result": result}
+
+
+# ─── Utilitaires import Ecwid ────────────────────────────────────────────────
+
+@app.get("/debug-ecwid-order/{order_num}")
+def debug_ecwid_order(order_num: str):
+    """Affiche la structure brute d'une commande Ecwid (pour debug)."""
+    data = ecwid_get("/orders", {"orderNumber": order_num, "limit": 1})
+    if not data or not data.get("items"):
+        return {"status": "not_found"}
+    eco = data["items"][0]
+    items = eco.get("items", [])
+    return {
+        "orderNumber": eco.get("orderNumber"),
+        "createDate": eco.get("createDate"),
+        "createDate_parsed": _parse_ecwid_date(eco.get("createDate")),
+        "paymentStatus": eco.get("paymentStatus"),
+        "email": eco.get("email"),
+        "total": eco.get("total"),
+        "items_count": len(items),
+        "items_sample": [
+            {"sku": i.get("sku"), "productSku": i.get("productSku"),
+             "name": i.get("name"), "quantity": i.get("quantity"),
+             "price": i.get("price")}
+            for i in items[:3]
+        ],
+    }
+
+
+@app.delete("/delete-ecwid-imports")
+def delete_ecwid_imports(confirm: str = ""):
+    """
+    Supprime toutes les commandes Odoo importées depuis Ecwid (client_order_ref numérique).
+    Passer ?confirm=yes pour exécuter.
+    """
+    if confirm != "yes":
+        orders = odoo_execute("sale.order", "search_read",
+            [[["client_order_ref", "!=", False]]],
+            {"fields": ["id", "name", "client_order_ref", "state"], "limit": 500}
+        )
+        ecwid_orders = [o for o in orders if str(o["client_order_ref"]).isdigit()]
+        return {
+            "status": "preview",
+            "to_delete": len(ecwid_orders),
+            "sample": [{"id": o["id"], "name": o["name"],
+                        "ref": o["client_order_ref"], "state": o["state"]}
+                       for o in ecwid_orders[:10]],
+            "action": "Ajouter ?confirm=yes pour supprimer"
+        }
+
+    orders = odoo_execute("sale.order", "search_read",
+        [[["client_order_ref", "!=", False]]],
+        {"fields": ["id", "name", "client_order_ref", "state"], "limit": 500}
+    )
+    ecwid_orders = [o for o in orders if str(o["client_order_ref"]).isdigit()]
+    deleted, errors = [], []
+
+    for o in ecwid_orders:
+        try:
+            # Annuler d'abord si confirmée
+            if o["state"] in ("sale", "done"):
+                odoo_execute("sale.order", "action_cancel", [[o["id"]]])
+            odoo_execute("sale.order", "unlink", [[o["id"]]])
+            deleted.append(o["name"])
+        except Exception as e:
+            errors.append({"name": o["name"], "error": str(e)})
+
+    return {
+        "status": "ok",
+        "deleted": len(deleted),
+        "errors": len(errors),
+        "errors_detail": errors[:10],
+    }
+
