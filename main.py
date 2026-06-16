@@ -20,7 +20,7 @@ from reportlab.pdfbase.ttfonts import TTFont
 
 app = FastAPI()
 
-VERSION = "2026-06-16-v37-logo"
+VERSION = "2026-06-16-v38-mixed-font-thai"
 
 # Enregistrer la police Thai au démarrage
 _THAI_FONT = "NotoSansThai"
@@ -31,6 +31,30 @@ except Exception:
     _THAI_FONT = "Helvetica"  # fallback
 
 _LOGO_PATH = os.path.join(os.path.dirname(__file__), "logo.png")
+
+
+def draw_mixed_text(c, x, y, text, size, latin_font="Helvetica", unicode_font=_THAI_FONT):
+    """Dessine du texte en alternant police latine et police Unicode (Thai)
+    selon les caractères, pour éviter les glyphes manquants entre polices."""
+    segments = []
+    current, current_is_ascii = "", None
+    for ch in text:
+        is_ascii = ord(ch) < 128
+        if current_is_ascii is None or is_ascii == current_is_ascii:
+            current += ch
+            current_is_ascii = is_ascii
+        else:
+            segments.append((current, current_is_ascii))
+            current, current_is_ascii = ch, is_ascii
+    if current:
+        segments.append((current, current_is_ascii))
+
+    cur_x = x
+    for seg_text, is_ascii in segments:
+        font = latin_font if is_ascii else unicode_font
+        c.setFont(font, size)
+        c.drawString(cur_x, y, seg_text)
+        cur_x += c.stringWidth(seg_text, font, size)
 
 ODOO_URL = os.getenv("ODOO_URL")
 ODOO_DB = os.getenv("ODOO_DB")
@@ -1396,8 +1420,7 @@ def order_pdf(order_ref: str):
 
             # Nom TH (en dessous, police Unicode)
             if show_th:
-                c.setFont(_THAI_FONT, 8)
-                c.drawString(70*mm, y - 4.5*mm, name_th)
+                draw_mixed_text(c, 70*mm, y - 4.5*mm, name_th, 8)
 
             # Qté dans grande police
             c.setFont("Helvetica-Bold", 16)
