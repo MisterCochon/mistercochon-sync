@@ -20,7 +20,7 @@ from reportlab.pdfbase.ttfonts import TTFont
 
 app = FastAPI()
 
-VERSION = "2026-06-16-v36-restore-english"
+VERSION = "2026-06-16-v37-logo"
 
 # Enregistrer la police Thai au démarrage
 _THAI_FONT = "NotoSansThai"
@@ -29,6 +29,8 @@ try:
     pdfmetrics.registerFont(TTFont(_THAI_FONT, _font_path))
 except Exception:
     _THAI_FONT = "Helvetica"  # fallback
+
+_LOGO_PATH = os.path.join(os.path.dirname(__file__), "logo.png")
 
 ODOO_URL = os.getenv("ODOO_URL")
 ODOO_DB = os.getenv("ODOO_DB")
@@ -1289,13 +1291,17 @@ def order_pdf(order_ref: str):
         w, h = A4
         c = canvas.Canvas(buf, pagesize=A4)
 
-        # ─── LOGO placeholder ───
-        c.setFont("Helvetica-Bold", 14)
-        c.setFillColor(colors.HexColor("#1a3a6b"))
-        c.drawString(15*mm, h - 25*mm, "FRENCH")
-        c.drawString(15*mm, h - 32*mm, "DELICATESSEN")
-        c.setFont("Helvetica", 8)
-        c.drawString(15*mm, h - 37*mm, "fresh and dry deli")
+        # ─── LOGO ───
+        if os.path.exists(_LOGO_PATH):
+            c.drawImage(_LOGO_PATH, 15*mm, h - 40*mm, width=28*mm, height=28*mm,
+                        preserveAspectRatio=True, mask='auto')
+        else:
+            c.setFont("Helvetica-Bold", 14)
+            c.setFillColor(colors.HexColor("#1a3a6b"))
+            c.drawString(15*mm, h - 25*mm, "FRENCH")
+            c.drawString(15*mm, h - 32*mm, "DELICATESSEN")
+            c.setFont("Helvetica", 8)
+            c.drawString(15*mm, h - 37*mm, "fresh and dry deli")
 
         # ─── SHIP TO (droite) ───
         c.setStrokeColor(colors.black)
