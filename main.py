@@ -20,7 +20,7 @@ from reportlab.pdfbase.ttfonts import TTFont
 
 app = FastAPI()
 
-VERSION = "2026-06-16-v38-mixed-font-thai"
+VERSION = "2026-06-16-v39-no-th-suffix-dup"
 
 # Enregistrer la police Thai au démarrage
 _THAI_FONT = "NotoSansThai"
@@ -1298,6 +1298,14 @@ def order_pdf(order_ref: str):
         sku_map = {v["id"]: v.get("default_code") or "" for v in variants_en}
         name_en_map = {v["id"]: re.sub(r'^\[.*?\]\s*', '', v.get("display_name") or "").strip() for v in variants_en}
         name_th_map = {v["id"]: re.sub(r'^\[.*?\]\s*', '', v.get("display_name") or "").strip() for v in variants_th}
+
+        # La variation entre parenthèses n'est pas traduite par Odoo : si elle apparaît
+        # telle quelle à la fin du nom thaï (identique à l'anglais), on la retire pour éviter la redondance.
+        for vid, name_th in list(name_th_map.items()):
+            name_en = name_en_map.get(vid, "")
+            suffix_match = re.search(r'(\s*\([^)]*\))$', name_en)
+            if suffix_match and name_th.endswith(suffix_match.group(1)):
+                name_th_map[vid] = name_th[:-len(suffix_match.group(1))].strip()
 
         # Numéro de commande affiché
         order_ref = order.get("client_order_ref") or order["name"]
