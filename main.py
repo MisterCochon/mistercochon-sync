@@ -20,7 +20,7 @@ from reportlab.pdfbase.ttfonts import TTFont
 
 app = FastAPI()
 
-VERSION = "2026-06-16-v44-ecwid-webhook"
+VERSION = "2026-06-16-v45-sync-all-orders"
 
 # Enregistrer la police Thai au démarrage
 _THAI_FONT = "NotoSansThai"
@@ -2349,21 +2349,16 @@ async def import_commandes_xlsx(
 
 @app.get("/sync-ecwid-orders")
 def sync_ecwid_orders(
-    status: str = "PAID",
-    limit: int = 100,
-    offset: int = 0,
     since_order_id: int = 0,
 ):
     """
-    Importe les commandes Ecwid dans Odoo.
-    - status     : filtre Ecwid (PAID, AWAITING_PAYMENT, SHIPPED, etc.) défaut PAID
-    - limit      : nb commandes à traiter par appel (max 100)
-    - offset     : pagination
-    - since_order_id : importer seulement les commandes avec orderNumber > cette valeur
+    Importe TOUTES les commandes Ecwid dans Odoo (tous statuts, toutes pages).
+    - since_order_id : si fourni, importe seulement les commandes avec orderNumber > valeur
 
     Chaque commande Ecwid crée un sale.order Odoo numéroté FD-S-XXXX.
     Le client est trouvé par email ; créé si absent.
     Les produits sont trouvés par SKU puis par nom.
+    Les commandes déjà importées sont ignorées (vérification par client_order_ref).
     """
     seq_code = SEQ_CODES["S"]
 
@@ -2407,19 +2402,26 @@ def sync_ecwid_orders(
     )
     already_imported = {str(e["client_order_ref"]) for e in existing}
 
-    # ── Récupérer commandes Ecwid ─────────────────────────────────────────────
-    params = {"paymentStatus": status, "limit": limit, "offset": offset,
-              "sortBy": "ORDER_DATE_DESC"}
-    ecwid_data = ecwid_get("/orders", params)
-    if not ecwid_data:
-        return {"status": "error", "error": "Impossible de joindre l'API Ecwid"}
-
-    items = ecwid_data.get("items", [])
-    total_ecwid = ecwid_data.get("total", 0)
+    # ── Récupérer TOUTES les commandes Ecwid (pagination) ────────────────────
+    all_items = []
+    offset = 0
+    batch = 100
+    total_ecwid = 0
+    while True:
+        ecwid_data = ecwid_get("/orders", {"limit": batch, "offset": offset,
+                                           "sortBy": "ORDER_DATE_DESC"})
+        if not ecwid_data:
+            return {"status": "error", "error": "Impossible de joindre l'API Ecwid"}
+        items_page = ecwid_data.get("items", [])
+        total_ecwid = ecwid_data.get("total", total_ecwid)
+        all_items.extend(items_page)
+        if len(items_page) < batch:
+            break
+        offset += batch
 
     created, skipped, errors_list = [], [], []
 
-    for eco in items:
+    for eco in all_items:
         order_num = str(eco.get("orderNumber", ""))
         if not order_num:
             skipped.append({"reason": "pas de numéro"})
@@ -2543,7 +2545,7 @@ def sync_ecwid_orders(
     return {
         "status": "ok",
         "ecwid_total": total_ecwid,
-        "processed": len(items),
+        "processed": len(all_items),
         "created": len(created),
         "skipped": len(skipped),
         "errors": len(errors_list),
@@ -2695,11 +2697,5 @@ async def webhook_ecwid(request: Request):
         return {"status": "error", "reason": f"Commande {entity_id} non trouvée dans Ecwid"}
 
     eco = ecwid_data["items"][0]
-    payment_status = eco.get("paymentStatus", "")
-
-    # Ne traiter que les commandes payées
-    if payment_status not in ("PAID", "ACCEPTED"):
-        return {"status": "ignored", "reason": f"paymentStatus={payment_status}"}
-
     result = _import_one_ecwid_order(entity_id, eco)
     return {"status": "ok", "order": entity_id, "result": result}
