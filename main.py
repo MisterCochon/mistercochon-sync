@@ -20,7 +20,7 @@ from reportlab.pdfbase.ttfonts import TTFont
 
 app = FastAPI()
 
-VERSION = "2026-06-15-v35-thai-font"
+VERSION = "2026-06-16-v36-restore-english"
 
 # Enregistrer la police Thai au démarrage
 _THAI_FONT = "NotoSansThai"
@@ -1868,5 +1868,48 @@ def get_thai_names():
             result.append({"id": tid, "en": en, "th": th, "has_thai": th != en})
 
         return {"status": "ok", "count": len(result), "products": result}
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+
+
+@app.post("/restore-english-names")
+def restore_english_names(payload: ThaiNamesPayload):
+    """
+    Restaure les noms anglais en cherchant les produits par leur nom thai actuel.
+    Body: {"translations": {"nom_anglais": "nom_thai"}} - meme format que set-thai-names.
+    Cherche par nom thai et reecrit le nom anglais sans contexte de langue.
+    """
+    try:
+        restored, not_found = [], []
+        # Inverser: thai -> anglais
+        th_to_en = {v: k for k, v in payload.translations.items()}
+        thai_names = list(th_to_en.keys())
+
+        # Chercher par nom thai (sans contexte langue = cherche dans le champ principal)
+        templates = odoo_execute("product.template", "search_read",
+            [[["name", "in", thai_names]]],
+            {"fields": ["id", "name"], "limit": 1000}
+        )
+
+        for tmpl in templates:
+            thai_found = tmpl["name"]
+            english_name = th_to_en.get(thai_found)
+            if not english_name:
+                continue
+            # Ecrire le nom anglais sans contexte de langue
+            odoo_execute("product.template", "write",
+                [[tmpl["id"]], {"name": english_name}]
+            )
+            restored.append({"id": tmpl["id"], "was": thai_found, "now": english_name})
+
+        found_thai = {t["name"] for t in templates}
+        not_found = [t for t in thai_names if t not in found_thai]
+
+        return {
+            "status": "ok",
+            "restored": len(restored),
+            "not_found": len(not_found),
+            "details": restored
+        }
     except Exception as e:
         return {"status": "error", "error": str(e)}
