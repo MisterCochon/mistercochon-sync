@@ -20,7 +20,7 @@ from reportlab.pdfbase.ttfonts import TTFont
 
 app = FastAPI()
 
-VERSION = "2026-06-16-v43-sync-ecwid-orders"
+VERSION = "2026-06-16-v44-ecwid-webhook"
 
 # Enregistrer la police Thai au démarrage
 _THAI_FONT = "NotoSansThai"
@@ -2550,3 +2550,156 @@ def sync_ecwid_orders(
         "created_sample": created[:20],
         "errors_detail": errors_list[:10],
     }
+
+
+# ─── Webhook Ecwid → Odoo (temps réel) ───────────────────────────────────────
+
+def _import_one_ecwid_order(order_num: str, eco: dict) -> dict:
+    """Importe une commande Ecwid dans Odoo. Retourne {"fd": ..., "status": ...}"""
+    seq_code = SEQ_CODES["S"]
+
+    # Vérifier si déjà importée
+    existing = odoo_execute("sale.order", "search_read",
+        [[["client_order_ref", "=", order_num]]],
+        {"fields": ["id", "name"], "limit": 1}
+    )
+    if existing:
+        return {"status": "already_exists", "fd": existing[0]["name"]}
+
+    # Client
+    email  = str(eco.get("email") or "").strip().lower()
+    ship   = eco.get("shippingPerson") or eco.get("billingPerson") or {}
+    cname  = ship.get("name") or eco.get("email") or f"Ecwid #{order_num}"
+    phone  = ship.get("phone") or ""
+    street = ship.get("street") or ""
+    city   = ship.get("city") or ""
+    zipcode = ship.get("postalCode") or ""
+
+    partner_id = None
+    if email:
+        results = odoo_execute("res.partner", "search_read",
+            [[["email", "=", email], ["active", "=", True]]],
+            {"fields": ["id"], "limit": 1}
+        )
+        if results:
+            partner_id = results[0]["id"]
+
+    if not partner_id:
+        vals_p = {"name": cname}
+        if email:
+            vals_p["email"] = email
+        if phone:
+            vals_p["phone"] = phone
+        if street:
+            vals_p["street"] = street
+        if city:
+            vals_p["city"] = city
+        if zipcode:
+            vals_p["zip"] = zipcode
+        partner_id = odoo_execute("res.partner", "create", [vals_p])
+
+    # Numéro FD
+    fd_number = odoo_execute("ir.sequence", "next_by_code", [[seq_code]])
+    if not fd_number:
+        return {"status": "error", "reason": "Séquence FD-S introuvable"}
+
+    # Créer commande
+    order_vals = {
+        "partner_id": partner_id,
+        "client_order_ref": order_num,
+        "name": fd_number,
+    }
+    order_date = eco.get("createDate") or eco.get("updateDate")
+    if order_date:
+        try:
+            from datetime import datetime
+            dt = datetime.utcfromtimestamp(order_date / 1000 if order_date > 1e10 else order_date)
+            order_vals["date_order"] = dt.strftime("%Y-%m-%d %H:%M:%S")
+        except Exception:
+            pass
+
+    order_id = odoo_execute("sale.order", "create", [order_vals])
+
+    # Pré-charger produits
+    odoo_products = odoo_execute("product.product", "search_read",
+        [[["active", "=", True]]],
+        {"fields": ["id", "name", "default_code", "uom_id"], "limit": 2000,
+         "context": {"lang": "en_US"}}
+    )
+    prod_by_sku  = {str(p["default_code"]).strip().upper(): p
+                   for p in odoo_products if p.get("default_code")}
+    prod_by_name = {}
+    for p in odoo_products:
+        key = str(p["name"]).strip().lower()
+        if key not in prod_by_name:
+            prod_by_name[key] = p
+
+    lines_created = 0
+    for item in eco.get("items", []):
+        sku   = str(item.get("sku") or "").strip().upper()
+        name_i = str(item.get("name") or "").strip()
+        qty   = float(item.get("quantity") or 1)
+        price = float(item.get("price") or 0)
+
+        product = prod_by_sku.get(sku) or prod_by_name.get(name_i.lower())
+        if not product:
+            line_vals = {"order_id": order_id, "name": name_i or sku or "Article Ecwid",
+                         "product_uom_qty": qty, "price_unit": price}
+        else:
+            uom_id = product["uom_id"][0] if isinstance(product.get("uom_id"), list) else False
+            line_vals = {"order_id": order_id, "product_id": product["id"],
+                         "name": name_i or product["name"],
+                         "product_uom_qty": qty, "price_unit": price}
+            if uom_id:
+                line_vals["product_uom"] = uom_id
+        try:
+            odoo_execute("sale.order.line", "create", [line_vals])
+            lines_created += 1
+        except Exception:
+            pass
+
+    try:
+        odoo_execute("sale.order", "action_confirm", [[order_id]])
+    except Exception:
+        pass
+
+    return {"status": "created", "fd": fd_number, "lines": lines_created}
+
+
+@app.post("/webhook/ecwid")
+async def webhook_ecwid(request: Request):
+    """
+    Webhook Ecwid — appelé automatiquement par Ecwid à chaque événement.
+    Enregistrer l'URL dans Ecwid : Paramètres → API → Webhooks
+    URL : https://mistercochon-backend.onrender.com/webhook/ecwid
+
+    Traite : order.created, order.updated (si payé)
+    """
+    try:
+        payload = await request.json()
+    except Exception:
+        return {"status": "ignored", "reason": "payload non JSON"}
+
+    event_type = payload.get("eventType", "")
+    entity_id  = str(payload.get("entityId", ""))
+
+    if event_type not in ("order.created", "order.updated"):
+        return {"status": "ignored", "event": event_type}
+
+    if not entity_id:
+        return {"status": "ignored", "reason": "pas d'entityId"}
+
+    # Récupérer la commande depuis Ecwid
+    ecwid_data = ecwid_get("/orders", {"orderNumber": entity_id, "limit": 1})
+    if not ecwid_data or not ecwid_data.get("items"):
+        return {"status": "error", "reason": f"Commande {entity_id} non trouvée dans Ecwid"}
+
+    eco = ecwid_data["items"][0]
+    payment_status = eco.get("paymentStatus", "")
+
+    # Ne traiter que les commandes payées
+    if payment_status not in ("PAID", "ACCEPTED"):
+        return {"status": "ignored", "reason": f"paymentStatus={payment_status}"}
+
+    result = _import_one_ecwid_order(entity_id, eco)
+    return {"status": "ok", "order": entity_id, "result": result}
