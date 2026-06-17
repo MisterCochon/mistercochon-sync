@@ -2917,19 +2917,28 @@ def delete_ecwid_imports(confirm: str = ""):
     deleted, errors = [], []
 
     for o in ecwid_orders:
+        oid = o["id"]
+        name = o["name"]
         try:
-            # Annuler d'abord si confirmée
+            # 1. Annuler si confirmée
             if o["state"] in ("sale", "done"):
-                odoo_execute("sale.order", "action_cancel", [[o["id"]]])
-            odoo_execute("sale.order", "unlink", [[o["id"]]])
-            deleted.append(o["name"])
+                odoo_execute("sale.order", "action_cancel", [[oid]])
+            # 2. Repasser en brouillon (nécessaire dans certaines versions Odoo)
+            try:
+                odoo_execute("sale.order", "action_draft", [[oid]])
+            except Exception:
+                pass
+            # 3. Supprimer
+            odoo_execute("sale.order", "unlink", [[oid]])
+            deleted.append(name)
         except Exception as e:
-            errors.append({"name": o["name"], "error": str(e)})
+            errors.append({"name": name, "error": str(e)})
 
     return {
         "status": "ok",
+        "found": len(ecwid_orders),
         "deleted": len(deleted),
         "errors": len(errors),
-        "errors_detail": errors[:10],
+        "errors_detail": errors[:20],
     }
 
