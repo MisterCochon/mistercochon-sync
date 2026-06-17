@@ -2896,39 +2896,46 @@ def delete_ecwid_imports(confirm: str = ""):
     """
     if confirm != "yes":
         orders = odoo_execute("sale.order", "search_read",
-            [[["client_order_ref", "!=", False]]],
-            {"fields": ["id", "name", "client_order_ref", "state"], "limit": 500}
+            [[["name", "like", "S"]]],
+            {"fields": ["id", "name", "state"], "limit": 500}
         )
-        ecwid_orders = [o for o in orders if str(o["client_order_ref"]).isdigit()]
+        ecwid_orders = [o for o in orders if o["name"].endswith("S") and "FD" in o["name"]]
         return {
             "status": "preview",
             "to_delete": len(ecwid_orders),
-            "sample": [{"id": o["id"], "name": o["name"],
-                        "ref": o["client_order_ref"], "state": o["state"]}
+            "sample": [{"id": o["id"], "name": o["name"], "state": o["state"]}
                        for o in ecwid_orders[:10]],
             "action": "Ajouter ?confirm=yes pour supprimer"
         }
 
-    orders = odoo_execute("sale.order", "search_read",
-        [[["client_order_ref", "!=", False]]],
-        {"fields": ["id", "name", "client_order_ref", "state"], "limit": 500}
-    )
-    ecwid_orders = [o for o in orders if str(o["client_order_ref"]).isdigit()]
-    deleted, errors = [], []
+    # Chercher toutes les commandes Ecwid par nom (se terminent par 'S')
+    all_ids = []
+    offset = 0
+    while True:
+        batch = odoo_execute("sale.order", "search_read",
+            [[["name", "like", "S"]]],
+            {"fields": ["id", "name", "state"], "limit": 200, "offset": offset}
+        )
+        if not batch:
+            break
+        # Garder seulement les FD-S (ex: FD0626265S)
+        ecwid_batch = [o for o in batch if o["name"].endswith("S") and "FD" in o["name"]]
+        all_ids.extend(ecwid_batch)
+        if len(batch) < 200:
+            break
+        offset += 200
 
-    for o in ecwid_orders:
+    deleted, errors = [], []
+    for o in all_ids:
         oid = o["id"]
         name = o["name"]
         try:
-            # 1. Annuler si confirmée
             if o["state"] in ("sale", "done"):
                 odoo_execute("sale.order", "action_cancel", [[oid]])
-            # 2. Repasser en brouillon (nécessaire dans certaines versions Odoo)
             try:
                 odoo_execute("sale.order", "action_draft", [[oid]])
             except Exception:
                 pass
-            # 3. Supprimer
             odoo_execute("sale.order", "unlink", [[oid]])
             deleted.append(name)
         except Exception as e:
@@ -2936,7 +2943,7 @@ def delete_ecwid_imports(confirm: str = ""):
 
     return {
         "status": "ok",
-        "found": len(ecwid_orders),
+        "found": len(all_ids),
         "deleted": len(deleted),
         "errors": len(errors),
         "errors_detail": errors[:20],
