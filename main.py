@@ -2909,21 +2909,11 @@ def delete_ecwid_imports(confirm: str = ""):
         }
 
     # Chercher toutes les commandes Ecwid par nom (se terminent par 'S')
-    all_ids = []
-    offset = 0
-    while True:
-        batch = odoo_execute("sale.order", "search_read",
-            [[["name", "like", "S"]]],
-            {"fields": ["id", "name", "state"], "limit": 200, "offset": offset}
-        )
-        if not batch:
-            break
-        # Garder seulement les FD-S (ex: FD0626265S)
-        ecwid_batch = [o for o in batch if o["name"].endswith("S") and "FD" in o["name"]]
-        all_ids.extend(ecwid_batch)
-        if len(batch) < 200:
-            break
-        offset += 200
+    orders = odoo_execute("sale.order", "search_read",
+        [[["name", "like", "S"]]],
+        {"fields": ["id", "name", "state"], "limit": 2000}
+    )
+    all_ids = [o for o in (orders or []) if o["name"].endswith("S") and "FD" in o["name"]]
 
     deleted, errors = [], []
     for o in all_ids:
