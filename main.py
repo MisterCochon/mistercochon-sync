@@ -58,9 +58,12 @@ async def _poll_ecwid_orders():
             orders = r.json().get("items", []) if r.ok else []
 
             for eco in orders:
-                order_num = str(eco.get("orderNumber") or eco.get("id", ""))
+                # Utiliser "id" en priorité (même logique que import_ecwid_orders.py)
+                order_num = str(eco.get("id") or eco.get("orderNumber", ""))
                 ref = f"ECWID-{order_num}"
-                if ref in existing_refs:
+                # Vérifier aussi avec orderNumber pour éviter les doublons
+                ref_alt = f"ECWID-{eco.get('orderNumber', '')}"
+                if ref in existing_refs or ref_alt in existing_refs:
                     continue
 
                 email = (eco.get("email") or "").strip().lower()
