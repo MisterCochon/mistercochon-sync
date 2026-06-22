@@ -2,8 +2,10 @@ import os
 import csv
 import io
 import re
+import asyncio
 import requests
 import xmlrpc.client
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, UploadFile, File, Request
 from pydantic import BaseModel
 from typing import Dict
@@ -18,9 +20,48 @@ from reportlab.lib.enums import TA_LEFT, TA_CENTER, TA_RIGHT
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 
-app = FastAPI()
+POLL_INTERVAL = 120  # secondes entre chaque vérification Ecwid → Odoo
 
-VERSION = "2026-06-16-v47-fix-order-lines"
+async def _poll_ecwid_orders():
+    """Tâche de fond : vérifie les nouvelles commandes Ecwid toutes les 2 min."""
+    await asyncio.sleep(30)  # Attendre que l'app soit prête
+    while True:
+        try:
+            from datetime import datetime
+            ecwid_base = f"https://app.ecwid.com/api/v3/{ECWID_STORE_ID}"
+            headers    = {"Authorization": f"Bearer {ECWID_TOKEN}"}
+
+            # Commandes déjà dans Odoo
+            existing = odoo_execute("sale.order", "search_read",
+                [[["client_order_ref", "like", "ECWID-"]]],
+                {"fields": ["client_order_ref"], "limit": 10000})
+            existing_refs = set(o["client_order_ref"] for o in existing if o["client_order_ref"])
+
+            # 200 dernières commandes Ecwid
+            r = requests.get(f"{ecwid_base}/orders", headers=headers,
+                params={"limit": 200, "sortBy": "CREATED_DATE_DESC"})
+            orders = r.json().get("items", []) if r.ok else []
+
+            for eco in orders:
+                order_num = str(eco.get("orderNumber") or eco.get("id", ""))
+                ref = f"ECWID-{order_num}"
+                if ref in existing_refs:
+                    continue
+                result = _import_one_ecwid_order(order_num, eco)
+                print(f"[POLL] Nouvelle commande {ref} → {result.get('status')}")
+        except Exception as e:
+            print(f"[POLL] Erreur polling: {e}")
+        await asyncio.sleep(POLL_INTERVAL)
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    task = asyncio.create_task(_poll_ecwid_orders())
+    yield
+    task.cancel()
+
+app = FastAPI(lifespan=lifespan)
+
+VERSION = "2026-06-22-v48-poll-orders"
 
 # Enregistrer la police Thai au démarrage
 _THAI_FONT = "NotoSansThai"
