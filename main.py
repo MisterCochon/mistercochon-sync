@@ -24,18 +24,33 @@ POLL_INTERVAL = 120  # secondes entre chaque vérification Ecwid → Odoo
 
 async def _poll_ecwid_orders():
     """Tâche de fond : vérifie les nouvelles commandes Ecwid toutes les 2 min."""
-    await asyncio.sleep(30)  # Attendre que l'app soit prête
+    await asyncio.sleep(30)
     while True:
         try:
-            from datetime import datetime
+            from datetime import datetime as _dt
             ecwid_base = f"https://app.ecwid.com/api/v3/{ECWID_STORE_ID}"
             headers    = {"Authorization": f"Bearer {ECWID_TOKEN}"}
 
-            # Commandes déjà dans Odoo
+            # Refs déjà importées (format ECWID-xxx)
             existing = odoo_execute("sale.order", "search_read",
                 [[["client_order_ref", "like", "ECWID-"]]],
                 {"fields": ["client_order_ref"], "limit": 10000})
             existing_refs = set(o["client_order_ref"] for o in existing if o["client_order_ref"])
+
+            # Produits par SKU
+            products = odoo_execute("product.product", "search_read",
+                [[["default_code", "!=", False]]],
+                {"fields": ["id", "default_code", "taxes_id"], "limit": 5000})
+            sku_map = {p["default_code"].strip(): p for p in products}
+
+            # Contacts par email
+            partners = odoo_execute("res.partner", "search_read",
+                [[["email", "!=", False]]],
+                {"fields": ["id", "email"], "limit": 10000})
+            email_map = {p["email"].strip().lower(): p["id"] for p in partners}
+
+            default_partner = odoo_execute("res.partner", "search", [[["name", "=", "Mister Cochon"]]])
+            default_partner_id = default_partner[0] if default_partner else 1
 
             # 200 dernières commandes Ecwid
             r = requests.get(f"{ecwid_base}/orders", headers=headers,
@@ -47,10 +62,48 @@ async def _poll_ecwid_orders():
                 ref = f"ECWID-{order_num}"
                 if ref in existing_refs:
                     continue
-                result = _import_one_ecwid_order(order_num, eco)
-                print(f"[POLL] Nouvelle commande {ref} → {result.get('status')}")
+
+                email = (eco.get("email") or "").strip().lower()
+                partner_id = email_map.get(email, default_partner_id)
+
+                try:
+                    ts = eco.get("createDate", "")
+                    date_order = _dt.fromisoformat(ts.replace("Z", "+00:00")).strftime("%Y-%m-%d %H:%M:%S")
+                except Exception:
+                    date_order = _dt.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+
+                lines = []
+                for item in eco.get("items", []):
+                    sku   = (item.get("sku") or "").strip()
+                    qty   = item.get("quantity", 1)
+                    price = item.get("price", 0)
+                    prod  = sku_map.get(sku)
+                    if prod:
+                        line = {"product_id": prod["id"], "product_uom_qty": qty, "price_unit": price}
+                        if prod.get("taxes_id"):
+                            line["tax_ids"] = [(6, 0, prod["taxes_id"])]
+                        lines.append((0, 0, line))
+                    else:
+                        name = item.get("name", sku or "Produit inconnu")
+                        lines.append((0, 0, {
+                            "name": f"[{sku}] {name}" if sku else name,
+                            "product_uom_qty": qty, "price_unit": price, "product_id": False
+                        }))
+
+                if not lines:
+                    continue
+
+                new_id = odoo_execute("sale.order", "create", [{
+                    "partner_id": partner_id,
+                    "client_order_ref": ref,
+                    "date_order": date_order,
+                    "order_line": lines,
+                }])
+                odoo_execute("sale.order", "action_confirm", [[new_id]])
+                print(f"[POLL] ✓ Nouvelle commande importée : {ref}")
+
         except Exception as e:
-            print(f"[POLL] Erreur polling: {e}")
+            print(f"[POLL] Erreur: {e}")
         await asyncio.sleep(POLL_INTERVAL)
 
 @asynccontextmanager
