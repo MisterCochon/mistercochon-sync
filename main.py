@@ -31,9 +31,9 @@ async def _poll_ecwid_orders():
             ecwid_base = f"https://app.ecwid.com/api/v3/{ECWID_STORE_ID}"
             headers    = {"Authorization": f"Bearer {ECWID_TOKEN}"}
 
-            # Refs déjà importées (format ECWID-xxx)
+            # Toutes les refs existantes (ECWID-, FD sans préfixe, etc.)
             existing = odoo_execute("sale.order", "search_read",
-                [[["client_order_ref", "like", "ECWID-"]]],
+                [[["client_order_ref", "!=", False]]],
                 {"fields": ["client_order_ref"], "limit": 10000})
             existing_refs = set(o["client_order_ref"] for o in existing if o["client_order_ref"])
 
@@ -58,12 +58,13 @@ async def _poll_ecwid_orders():
             orders = r.json().get("items", []) if r.ok else []
 
             for eco in orders:
-                # Utiliser "id" en priorité (même logique que import_ecwid_orders.py)
-                order_num = str(eco.get("id") or eco.get("orderNumber", ""))
-                ref = f"ECWID-{order_num}"
-                # Vérifier aussi avec orderNumber pour éviter les doublons
-                ref_alt = f"ECWID-{eco.get('orderNumber', '')}"
-                if ref in existing_refs or ref_alt in existing_refs:
+                ecwid_id  = str(eco.get("id") or eco.get("orderNumber", ""))
+                order_num = str(eco.get("orderNumber") or eco.get("id", ""))
+                ref      = f"ECWID-{ecwid_id}"
+                ref_alt  = f"ECWID-{order_num}"
+                # Détecte toutes les formes : ECWID-xxx, ou le raw id (FD orders)
+                if ref in existing_refs or ref_alt in existing_refs \
+                   or ecwid_id in existing_refs or order_num in existing_refs:
                     continue
 
                 email = (eco.get("email") or "").strip().lower()
@@ -117,7 +118,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
-VERSION = "2026-06-22-v48-poll-orders"
+VERSION = "2026-06-23-v49-fix-dedup"
 
 # Enregistrer la police Thai au démarrage
 _THAI_FONT = "NotoSansThai"
