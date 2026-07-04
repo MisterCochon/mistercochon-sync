@@ -43,11 +43,12 @@ async def _poll_ecwid_orders():
                 {"fields": ["id", "default_code", "taxes_id"], "limit": 5000})
             sku_map = {p["default_code"].strip(): p for p in products}
 
-            # Contacts par email
+            # Contacts par email (rechargé à chaque cycle)
             partners = odoo_execute("res.partner", "search_read",
                 [[["email", "!=", False]]],
-                {"fields": ["id", "email"], "limit": 10000})
+                {"fields": ["id", "email", "name"], "limit": 10000})
             email_map = {p["email"].strip().lower(): p["id"] for p in partners}
+            name_map  = {p["name"].strip().lower(): p["id"] for p in partners if p["name"]}
 
             default_partner = odoo_execute("res.partner", "search", [[["name", "=", "Mister Cochon"]]])
             default_partner_id = default_partner[0] if default_partner else 1
@@ -67,8 +68,53 @@ async def _poll_ecwid_orders():
                    or ecwid_id in existing_refs or order_num in existing_refs:
                     continue
 
+                billing = eco.get("billingPerson") or eco.get("shippingPerson") or {}
+                customer_name  = (billing.get("name") or eco.get("email") or "Client Ecwid").strip()
+                customer_phone = (billing.get("phone") or "").strip()
+                customer_street= (billing.get("street") or "").strip()
+                customer_city  = (billing.get("city") or "").strip()
+                customer_zip   = (billing.get("postalCode") or "").strip()
                 email = (eco.get("email") or "").strip().lower()
-                partner_id = email_map.get(email, default_partner_id)
+
+                # Chercher par email d'abord, puis par nom
+                partner_id = None
+                if email and email in email_map:
+                    partner_id = email_map[email]
+                if not partner_id and customer_name and customer_name != "Client Ecwid":
+                    partner_id = name_map.get(customer_name.strip().lower())
+                    if not partner_id:
+                        found = odoo_execute("res.partner", "search_read",
+                            [[["name", "=", customer_name]]],
+                            {"fields": ["id"], "limit": 1})
+                        if found:
+                            partner_id = found[0]["id"]
+                if not partner_id:
+                    if not customer_name or customer_name == "Client Ecwid":
+                        customer_name = email or "Client Ecwid"
+                    vals = {"name": customer_name, "customer_rank": 1}
+                    if email:          vals["email"]  = email
+                    if customer_phone: vals["phone"]  = customer_phone
+                    if customer_street:vals["street"] = customer_street
+                    if customer_city:  vals["city"]   = customer_city
+                    if customer_zip:   vals["zip"]    = customer_zip
+                    partner_id = odoo_execute("res.partner", "create", [vals])
+                    if email:
+                        email_map[email] = partner_id
+                else:
+                    # Mettre à jour l'adresse/téléphone si manquants
+                    existing_partner = odoo_execute("res.partner", "read",
+                        [[partner_id]], {"fields": ["phone","street","city","zip"]})[0]
+                    update_vals = {}
+                    if customer_phone and not existing_partner.get("phone"):
+                        update_vals["phone"] = customer_phone
+                    if customer_street and not existing_partner.get("street"):
+                        update_vals["street"] = customer_street
+                    if customer_city and not existing_partner.get("city"):
+                        update_vals["city"] = customer_city
+                    if customer_zip and not existing_partner.get("zip"):
+                        update_vals["zip"] = customer_zip
+                    if update_vals:
+                        odoo_execute("res.partner", "write", [[partner_id], update_vals])
 
                 try:
                     ts = eco.get("createDate", "")
@@ -97,12 +143,29 @@ async def _poll_ecwid_orders():
                 if not lines:
                     continue
 
-                new_id = odoo_execute("sale.order", "create", [{
+                # Remise
+                disc = float(eco.get("discount") or 0) + float(eco.get("couponDiscount") or 0)
+                if disc > 0:
+                    lines.append((0, 0, {"product_id": 2712, "name": "Remise",
+                        "product_uom_qty": 1, "price_unit": -round(disc, 2), "tax_ids": [(5,0,0)]}))
+                # Transport
+                ship_opt  = eco.get("shippingOption") or {}
+                ship_cost = float(ship_opt.get("discountedShippingRate") or ship_opt.get("shippingRate") or 0)
+                if ship_cost > 0:
+                    lines.append((0, 0, {"product_id": 1915,
+                        "name": ship_opt.get("shippingMethodName") or "Transport",
+                        "product_uom_qty": 1, "price_unit": round(ship_cost, 2), "tax_ids": [(5,0,0)]}))
+
+                eco_note = (eco.get("customerComment") or "").strip()
+                so_vals = {
                     "partner_id": partner_id,
                     "client_order_ref": ref,
                     "date_order": date_order,
                     "order_line": lines,
-                }])
+                }
+                if eco_note:
+                    so_vals["note"] = eco_note
+                new_id = odoo_execute("sale.order", "create", [so_vals])
                 odoo_execute("sale.order", "action_confirm", [[new_id]])
                 print(f"[POLL] ✓ Nouvelle commande importée : {ref}")
 
@@ -118,7 +181,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
-VERSION = "2026-06-23-v49-fix-dedup"
+VERSION = "2026-06-23-v50-customer-by-name"
 
 # Enregistrer la police Thai au démarrage
 _THAI_FONT = "NotoSansThai"
