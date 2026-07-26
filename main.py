@@ -3585,7 +3585,7 @@ def _line_create_order(partner: dict, items: list) -> str:
 
 # ── Webhook ───────────────────────────────────────────────────────────────────
 
-# In-memory session: {user_id: {"category_products": [...], "page": 0}}
+# In-memory session: {user_id: {"category_products": [...], "page": 0, "state": ...}}
 _line_sessions: dict = {}
 
 
@@ -3611,34 +3611,54 @@ async def webhook_line(request: Request):
 
         # ── Not authenticated ──────────────────────────────────────────────
         if not partner:
-            # Try to use text as access code
+            sess = _line_sessions.get(user_id, {})
+
+            # Registration step 2: waiting for business name
+            if sess.get("state") == "awaiting_name":
+                biz_name = text.strip()
+                if len(biz_name) < 2:
+                    line_reply(reply_token, [line_text("Please enter your business name (at least 2 characters).")])
+                    continue
+                display = _line_get_display_name(user_id)
+                new_partner_id = odoo_execute("res.partner", "create", [{
+                    "name": biz_name,
+                    "customer_rank": 1,
+                    "comment": f"line:{user_id}\nRegistered via LINE bot — {display}",
+                    "team_id": False,
+                }])
+                _line_sessions.pop(user_id, None)
+                partner = _line_get_partner(user_id)
+                line_reply(reply_token, [line_text(
+                    f"✅ Welcome, {biz_name}!\n\n"
+                    "Your account has been created.\n"
+                    "Type *menu* to browse our PRO catalog."
+                )])
+                continue
+
+            # New user: try code or offer NEW registration
+            if text.upper() == "NEW":
+                _line_sessions[user_id] = {"state": "awaiting_name"}
+                line_reply(reply_token, [line_text(
+                    "📝 *New account registration*\n\n"
+                    "Please enter your business name:"
+                )])
+                continue
+
+            # Try code authentication
             ok, name = _line_authenticate(text, user_id, "")
             if ok:
                 partner = _line_get_partner(user_id)
                 display = _line_get_display_name(user_id)
                 line_reply(reply_token, [line_text(
-                    f"✅ Welcome, {display or name}!\n\n"
-                    "You now have access to French Delicatessen B2B ordering.\n\n"
-                    "Type *menu* to see product categories."
+                    f"✅ Welcome back, {display or name}!\n\n"
+                    "Type *menu* to browse our PRO catalog."
                 )])
             else:
-                # Check if message looks like a code attempt (short alphanumeric)
-                looks_like_code = bool(re.match(r"^[A-Za-z0-9]{3,12}$", text))
-                if looks_like_code:
-                    line_reply(reply_token, [line_text(
-                        "❌ Invalid access code.\n\n"
-                        "Please contact us to get your code:\n"
-                        "📞 @jfbuc\n"
-                        "📧 jfbuc@french-delicatessen.co.th"
-                    )])
-                else:
-                    line_reply(reply_token, [line_text(
-                        "🔐 *French Delicatessen — Professional Portal*\n\n"
-                        "Please enter your access code to continue.\n\n"
-                        "Don't have a code? Contact us:\n"
-                        "📞 @jfbuc\n"
-                        "📧 jfbuc@french-delicatessen.co.th"
-                    )])
+                line_reply(reply_token, [line_quick_reply(
+                    "🇫🇷 *French Delicatessen — Professional Portal*\n\n"
+                    "Enter your access code, or tap below to register as a new client:",
+                    [("🆕 New client", "NEW")]
+                )])
             continue
 
         pricelist = partner.get("property_product_pricelist")
