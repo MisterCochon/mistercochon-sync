@@ -3316,16 +3316,18 @@ def delete_ecwid_imports(confirm: str = ""):
 # ─── LINE Messaging API — Bot commandes B2B French Delicatessen ───────────────
 
 LINE_API = "https://api.line.me/v2/bot"
+LINE_FALLBACK_IMG = "https://upload.wikimedia.org/wikipedia/commons/thumb/6/65/No-Image-Placeholder.svg/1024px-No-Image-Placeholder.svg.png"
+
 
 def line_reply(reply_token: str, messages: list):
-    """Envoie un ou plusieurs messages via LINE Messaging API."""
     headers = {
         "Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}",
         "Content-Type": "application/json",
     }
-    payload = {"replyToken": reply_token, "messages": messages}
     try:
-        requests.post(f"{LINE_API}/message/reply", json=payload, headers=headers, timeout=10)
+        requests.post(f"{LINE_API}/message/reply",
+            json={"replyToken": reply_token, "messages": messages},
+            headers=headers, timeout=10)
     except Exception:
         pass
 
@@ -3334,28 +3336,180 @@ def line_text(text: str) -> dict:
     return {"type": "text", "text": text}
 
 
-def _line_get_catalogue() -> str:
-    """Retourne le catalogue produits pro depuis Odoo (pricelist pro si dispo)."""
-    products = odoo_execute("product.product", "search_read",
-        [[["active", "=", True], ["sale_ok", "=", True]]],
-        {"fields": ["name", "default_code", "list_price"], "limit": 100,
-         "context": {"lang": "en_US"}}
-    )
-    if not products:
-        return "Catalogue indisponible pour le moment."
-    lines = ["📋 *Catalogue French Delicatessen*\n"]
-    for p in products[:30]:
-        sku = p.get("default_code") or "—"
-        name = p.get("name", "")
-        price = p.get("list_price", 0)
-        lines.append(f"• [{sku}] {name} — {price:.0f} ฿")
-    lines.append("\n📝 Pour commander : tapez le SKU et la quantité")
-    lines.append("Exemple : *JAM001 x3, SAU002 x2*")
-    return "\n".join(lines)
+def line_quick_reply(text: str, items: list) -> dict:
+    """Text message with quick reply buttons. items = [(label, text), ...]"""
+    return {
+        "type": "text",
+        "text": text,
+        "quickReply": {
+            "items": [
+                {"type": "action", "action": {"type": "message", "label": lbl[:20], "text": txt}}
+                for lbl, txt in items[:13]
+            ]
+        }
+    }
 
+
+# ── Auth helpers ──────────────────────────────────────────────────────────────
+
+def _line_get_display_name(user_id: str) -> str:
+    try:
+        r = requests.get(f"{LINE_API}/profile/{user_id}",
+            headers={"Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}"},
+            timeout=5)
+        return r.json().get("displayName", "")
+    except Exception:
+        return ""
+
+
+def _line_get_partner(user_id: str) -> dict | None:
+    """Return Odoo partner linked to this LINE user_id, or None."""
+    results = odoo_execute("res.partner", "search_read",
+        [[["comment", "like", f"line:{user_id}"]]],
+        {"fields": ["id", "name", "property_product_pricelist"], "limit": 1}
+    )
+    return results[0] if results else None
+
+
+def _line_authenticate(code: str, user_id: str, display_name: str) -> tuple:
+    """Try to authenticate user with access code. Returns (ok, partner_name)."""
+    results = odoo_execute("res.partner", "search_read",
+        [[["ref", "=", code.strip().upper()], ["customer_rank", ">", 0]]],
+        {"fields": ["id", "name", "comment"], "limit": 1}
+    )
+    if not results:
+        return False, ""
+    partner = results[0]
+    comment = partner.get("comment") or ""
+    marker = f"line:{user_id}"
+    if marker not in comment:
+        new_comment = (comment + "\n" + marker).strip()
+        odoo_execute("res.partner", "write", [[partner["id"]], {"comment": new_comment}])
+    return True, partner["name"]
+
+
+# ── Product helpers ───────────────────────────────────────────────────────────
+
+def _line_get_pro_categories() -> list:
+    """Return list of product categories that have PRO products."""
+    # Get all PRO products and their categories
+    products = odoo_execute("product.product", "search_read",
+        [[["active", "=", True], ["sale_ok", "=", True],
+          ["categ_id.name", "ilike", "pro"]]],
+        {"fields": ["categ_id"], "limit": 500, "context": {"lang": "en_US"}}
+    )
+    seen, cats = set(), []
+    for p in (products or []):
+        cid = p["categ_id"][0] if isinstance(p.get("categ_id"), list) else None
+        cname = p["categ_id"][1] if isinstance(p.get("categ_id"), list) else ""
+        if cid and cid not in seen:
+            seen.add(cid)
+            # Strip "PRO / " prefix for display
+            label = cname.replace("PRO / ", "").replace("Pro / ", "").strip()
+            cats.append((cid, label))
+    return cats
+
+
+def _line_get_ecwid_images() -> dict:
+    """Return {sku_upper: image_url} from Ecwid."""
+    img_map = {}
+    try:
+        data = ecwid_get("/products", {"limit": 100, "offset": 0})
+        for item in data.get("items", []):
+            img = item.get("imageUrl") or item.get("thumbnailUrl") or ""
+            # Main product SKU
+            sku = str(item.get("sku") or "").strip().upper()
+            if sku and img:
+                img_map[sku] = img
+            # Variants
+            for combo in item.get("combinations", []):
+                vsku = str(combo.get("sku") or "").strip().upper()
+                if vsku and img:
+                    img_map[vsku] = img
+    except Exception:
+        pass
+    return img_map
+
+
+def _line_get_client_price(product_id: int, list_price: float, pricelist) -> float:
+    """Get price for a product given partner's pricelist."""
+    if not pricelist or pricelist is False:
+        return list_price
+    pricelist_id = pricelist[0] if isinstance(pricelist, list) else pricelist
+    items = odoo_execute("product.pricelist.item", "search_read",
+        [[["pricelist_id", "=", pricelist_id],
+          ["product_id", "=", product_id],
+          ["compute_price", "=", "fixed"]]],
+        {"fields": ["fixed_price"], "limit": 1}
+    )
+    if items:
+        return items[0]["fixed_price"]
+    return list_price
+
+
+def _line_build_carousel(products: list, pricelist, page: int = 0) -> list:
+    """
+    Build LINE carousel template messages (max 10 cards per carousel).
+    Returns list of LINE message dicts.
+    """
+    PAGE = 10
+    start = page * PAGE
+    page_prods = products[start:start + PAGE]
+    if not page_prods:
+        return [line_text("No products found in this category.")]
+
+    img_map = _line_get_ecwid_images()
+    columns = []
+
+    for p in page_prods:
+        sku = str(p.get("default_code") or "").strip().upper()
+        name = (p.get("name") or "")[:40]
+        price = _line_get_client_price(p["id"], p.get("list_price", 0), pricelist)
+        img = img_map.get(sku) or LINE_FALLBACK_IMG
+
+        col = {
+            "thumbnailImageUrl": img,
+            "imageSize": "cover",
+            "title": name,
+            "text": f"{price:.0f} ฿  |  SKU: {sku or '—'}"[:60],
+            "actions": [
+                {"type": "message", "label": "Order 1",  "text": f"{sku} x1"},
+                {"type": "message", "label": "Order 5",  "text": f"{sku} x5"},
+                {"type": "message", "label": "Order 10", "text": f"{sku} x10"},
+            ]
+        }
+        columns.append(col)
+
+    carousel = {
+        "type": "template",
+        "altText": f"French Delicatessen — Products (page {page + 1})",
+        "template": {
+            "type": "carousel",
+            "columns": columns,
+            "imageAspectRatio": "rectangle",
+            "imageSize": "cover",
+        }
+    }
+    messages = [carousel]
+
+    # Navigation: previous / next
+    nav = []
+    if page > 0:
+        nav.append(("◀ Previous", f"__page_{page - 1}"))
+    if start + PAGE < len(products):
+        nav.append(("Next ▶", f"__page_{page + 1}"))
+    if nav:
+        messages.append(line_quick_reply(
+            f"Page {page + 1} / {((len(products) - 1) // PAGE) + 1}",
+            nav
+        ))
+
+    return messages
+
+
+# ── Order helpers ─────────────────────────────────────────────────────────────
 
 def _line_parse_order(text: str) -> list:
-    """Parse un message comme 'JAM001 x3, SAU002 x2' → [(sku, qty), ...]"""
     items = []
     for part in re.split(r"[,;\n]+", text):
         part = part.strip()
@@ -3365,34 +3519,24 @@ def _line_parse_order(text: str) -> list:
     return items
 
 
-def _line_create_order(user_id: str, display_name: str, items: list) -> str:
-    """Crée une commande Odoo depuis une liste (sku, qty)."""
-    # Trouver ou créer le client
-    partners = odoo_execute("res.partner", "search_read",
-        [[["comment", "like", f"line:{user_id}"]]],
-        {"fields": ["id", "name"], "limit": 1}
-    )
-    if partners:
-        partner_id = partners[0]["id"]
-    else:
-        partner_id = odoo_execute("res.partner", "create", [{
-            "name": display_name or f"Line {user_id}",
-            "comment": f"line:{user_id}",
-            "customer_rank": 1,
-        }])
+def _line_create_order(partner: dict, items: list) -> str:
+    pricelist = partner.get("property_product_pricelist")
 
-    # Numéro FD-P (Pro)
     fd_number = odoo_execute("ir.sequence", "next_by_code", [[SEQ_CODES["P"]]])
     if not fd_number:
-        return "❌ Erreur création commande (séquence)."
+        return "❌ Order creation failed (sequence error). Please contact us."
 
-    order_id = odoo_execute("sale.order", "create", [{
-        "partner_id": partner_id,
+    order_vals = {
+        "partner_id": partner["id"],
         "name": fd_number,
-        "note": "Commande Line Bot",
-    }])
+        "note": "Order via LINE Bot — French Delicatessen",
+    }
+    if pricelist and pricelist is not False:
+        pl_id = pricelist[0] if isinstance(pricelist, list) else pricelist
+        order_vals["pricelist_id"] = pl_id
 
-    # Charger produits
+    order_id = odoo_execute("sale.order", "create", [order_vals])
+
     all_prods = odoo_execute("product.product", "search_read",
         [[["active", "=", True]]],
         {"fields": ["id", "name", "default_code", "list_price", "uom_id"], "limit": 2000,
@@ -3407,13 +3551,14 @@ def _line_create_order(user_id: str, display_name: str, items: list) -> str:
         if not p:
             lines_nok.append(sku)
             continue
+        price = _line_get_client_price(p["id"], p["list_price"], pricelist)
         uom_id = p["uom_id"][0] if isinstance(p.get("uom_id"), list) else False
         line_vals = {
             "order_id": order_id,
             "product_id": p["id"],
             "name": p["name"],
             "product_uom_qty": qty,
-            "price_unit": p["list_price"],
+            "price_unit": price,
         }
         if uom_id:
             line_vals["product_uom"] = uom_id
@@ -3429,18 +3574,23 @@ def _line_create_order(user_id: str, display_name: str, items: list) -> str:
         except Exception:
             pass
 
-    msg = [f"✅ Commande *{fd_number}* créée !"]
+    msg = [f"✅ Order *{fd_number}* confirmed!"]
     if lines_ok:
-        msg.append("Produits : " + ", ".join(lines_ok))
+        msg.append("Items: " + ", ".join(lines_ok))
     if lines_nok:
-        msg.append("❓ SKUs non trouvés : " + ", ".join(lines_nok))
-    msg.append("Notre équipe vous contactera pour confirmer la livraison.")
+        msg.append("⚠️ SKUs not found: " + ", ".join(lines_nok))
+    msg.append("Our team will contact you to confirm delivery. Thank you!")
     return "\n".join(msg)
+
+
+# ── Webhook ───────────────────────────────────────────────────────────────────
+
+# In-memory session: {user_id: {"category_products": [...], "page": 0}}
+_line_sessions: dict = {}
 
 
 @app.post("/webhook/line")
 async def webhook_line(request: Request):
-    """Webhook LINE — reçoit les messages des clients pro."""
     try:
         body = await request.json()
     except Exception:
@@ -3457,66 +3607,135 @@ async def webhook_line(request: Request):
         text = event["message"]["text"].strip()
         text_low = text.lower()
 
-        # Récupérer le nom display via LINE API
-        display_name = ""
-        try:
-            r = requests.get(f"{LINE_API}/profile/{user_id}",
-                headers={"Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}"},
-                timeout=5)
-            display_name = r.json().get("displayName", "")
-        except Exception:
-            pass
+        partner = _line_get_partner(user_id)
 
-        # Commandes menu
-        if text_low in ("catalogue", "catalog", "menu", "สินค้า", "รายการ"):
-            catalogue = _line_get_catalogue()
-            line_reply(reply_token, [line_text(catalogue)])
-
-        elif text_low in ("aide", "help", "ช่วย"):
-            help_msg = (
-                "🇫🇷 *French Delicatessen — Bot commandes B2B*\n\n"
-                "📋 *catalogue* — voir tous les produits\n"
-                "📝 *Commander* — tapez SKU x quantité\n"
-                "   Exemple : JAM001 x3, SAU002 x2\n"
-                "📦 *mes commandes* — voir vos dernières commandes\n"
-                "📞 Contact : @jfbuc"
-            )
-            line_reply(reply_token, [line_text(help_msg)])
-
-        elif text_low in ("mes commandes", "commandes", "orders", "ประวัติ"):
-            partners = odoo_execute("res.partner", "search_read",
-                [[["comment", "like", f"line:{user_id}"]]],
-                {"fields": ["id"], "limit": 1}
-            )
-            if not partners:
-                line_reply(reply_token, [line_text("Aucune commande trouvée. Tapez *catalogue* pour voir nos produits.")])
+        # ── Not authenticated ──────────────────────────────────────────────
+        if not partner:
+            # Try to use text as access code
+            ok, name = _line_authenticate(text, user_id, "")
+            if ok:
+                partner = _line_get_partner(user_id)
+                display = _line_get_display_name(user_id)
+                line_reply(reply_token, [line_text(
+                    f"✅ Welcome, {display or name}!\n\n"
+                    "You now have access to French Delicatessen B2B ordering.\n\n"
+                    "Type *menu* to see product categories."
+                )])
             else:
-                orders = odoo_execute("sale.order", "search_read",
-                    [[["partner_id", "=", partners[0]["id"]]]],
-                    {"fields": ["name", "date_order", "amount_total", "state"], "limit": 5,
-                     "order": "date_order desc"}
-                )
-                if not orders:
-                    line_reply(reply_token, [line_text("Aucune commande trouvée.")])
+                # Check if message looks like a code attempt (short alphanumeric)
+                looks_like_code = bool(re.match(r"^[A-Za-z0-9]{3,12}$", text))
+                if looks_like_code:
+                    line_reply(reply_token, [line_text(
+                        "❌ Invalid access code.\n\n"
+                        "Please contact us to get your code:\n"
+                        "📞 @jfbuc\n"
+                        "📧 jfbuc@french-delicatessen.co.th"
+                    )])
                 else:
-                    lines = ["📦 *Vos dernières commandes :*\n"]
-                    for o in orders:
-                        date = str(o["date_order"])[:10]
-                        lines.append(f"• {o['name']} — {o['amount_total']:.0f} ฿ ({date})")
-                    line_reply(reply_token, [line_text("\n".join(lines))])
+                    line_reply(reply_token, [line_text(
+                        "🔐 *French Delicatessen — Professional Portal*\n\n"
+                        "Please enter your access code to continue.\n\n"
+                        "Don't have a code? Contact us:\n"
+                        "📞 @jfbuc\n"
+                        "📧 jfbuc@french-delicatessen.co.th"
+                    )])
+            continue
 
+        pricelist = partner.get("property_product_pricelist")
+
+        # ── Pagination (internal __page_N commands) ────────────────────────
+        if text.startswith("__page_"):
+            try:
+                page = int(text.split("_")[-1])
+            except ValueError:
+                page = 0
+            sess = _line_sessions.get(user_id, {})
+            prods = sess.get("category_products", [])
+            if prods:
+                _line_sessions[user_id] = {**sess, "page": page}
+                line_reply(reply_token, _line_build_carousel(prods, pricelist, page))
+            else:
+                line_reply(reply_token, [line_text("Type *menu* to browse products.")])
+            continue
+
+        # ── Category selected ──────────────────────────────────────────────
+        if text.startswith("__cat_"):
+            cat_id = int(text.split("__cat_")[1])
+            prods = odoo_execute("product.product", "search_read",
+                [[["active", "=", True], ["sale_ok", "=", True],
+                  ["categ_id", "=", cat_id]]],
+                {"fields": ["id", "name", "default_code", "list_price"], "limit": 200,
+                 "context": {"lang": "en_US"}}
+            )
+            if not prods:
+                line_reply(reply_token, [line_text("No products in this category.")])
+                continue
+            _line_sessions[user_id] = {"category_products": prods, "page": 0}
+            line_reply(reply_token, _line_build_carousel(prods, pricelist, 0))
+            continue
+
+        # ── Menu / catalogue ───────────────────────────────────────────────
+        if text_low in ("menu", "catalog", "catalogue", "products", "shop"):
+            cats = _line_get_pro_categories()
+            if not cats:
+                line_reply(reply_token, [line_text("No PRO products available yet.")])
+                continue
+            quick_items = [(label, f"__cat_{cid}") for cid, label in cats[:13]]
+            line_reply(reply_token, [line_quick_reply(
+                "🇫🇷 *French Delicatessen — PRO Catalog*\n\nSelect a category:",
+                quick_items
+            )])
+
+        # ── My orders ─────────────────────────────────────────────────────
+        elif text_low in ("orders", "my orders", "history"):
+            orders = odoo_execute("sale.order", "search_read",
+                [[["partner_id", "=", partner["id"]]]],
+                {"fields": ["name", "date_order", "amount_total", "state"],
+                 "limit": 5, "order": "date_order desc"}
+            )
+            if not orders:
+                line_reply(reply_token, [line_text("No orders found.")])
+            else:
+                lines = ["📦 *Your recent orders:*\n"]
+                for o in orders:
+                    date = str(o["date_order"])[:10]
+                    state = {"draft": "Draft", "sale": "Confirmed",
+                              "done": "Done", "cancel": "Cancelled"}.get(o["state"], o["state"])
+                    lines.append(f"• {o['name']} — {o['amount_total']:.0f} ฿ — {state} ({date})")
+                line_reply(reply_token, [line_text("\n".join(lines))])
+
+        # ── Help ──────────────────────────────────────────────────────────
+        elif text_low in ("help", "?"):
+            line_reply(reply_token, [line_text(
+                "🇫🇷 *French Delicatessen B2B Bot*\n\n"
+                "📋 *menu* — Browse product categories\n"
+                "📦 *orders* — View your recent orders\n"
+                "🛒 To order, tap a product button in the catalog\n"
+                "   or type: SKU001 x3, SKU002 x2\n"
+                "📞 Support: @jfbuc"
+            )])
+
+        # ── Order from text (SKU x qty) ────────────────────────────────────
         else:
-            # Essayer de parser comme une commande (SKU x qty)
             items = _line_parse_order(text)
             if items:
-                result = _line_create_order(user_id, display_name, items)
+                result = _line_create_order(partner, items)
                 line_reply(reply_token, [line_text(result)])
             else:
-                line_reply(reply_token, [line_text(
-                    "Bonjour ! 👋\n\n"
-                    "Tapez *catalogue* pour voir nos produits\n"
-                    "Tapez *aide* pour voir toutes les options"
+                line_reply(reply_token, [line_quick_reply(
+                    "Hello! What would you like to do?",
+                    [("📋 Browse catalog", "menu"),
+                     ("📦 My orders", "orders"),
+                     ("❓ Help", "help")]
                 )])
 
     return {"status": "ok"}
+
+
+@app.get("/line-set-client-code/{partner_id}/{code}")
+def line_set_client_code(partner_id: int, code: str):
+    """Set access code (ref field) for a client partner. Admin only."""
+    odoo_execute("res.partner", "write",
+        [[partner_id], {"ref": code.strip().upper()}])
+    return {"status": "ok", "partner_id": partner_id, "code": code.upper()}
 
