@@ -22,6 +22,13 @@ from reportlab.pdfbase.ttfonts import TTFont
 
 POLL_INTERVAL = 120  # secondes entre chaque vérification Ecwid → Odoo
 
+def _get_ecwid_subdistrict(eco: dict) -> str:
+    """Extrait le sous-district (champ personnalise Ecwid 'Sub-District') d'une commande."""
+    for f in eco.get("orderExtraFields") or []:
+        if str(f.get("title", "")).strip().lower() == "sub-district":
+            return str(f.get("value") or "").strip()
+    return ""
+
 async def _poll_ecwid_orders():
     """Tâche de fond : vérifie les nouvelles commandes Ecwid toutes les 2 min."""
     await asyncio.sleep(30)
@@ -59,6 +66,11 @@ async def _poll_ecwid_orders():
             orders = r.json().get("items", []) if r.ok else []
 
             for eco in orders:
+                # Ignorer les commandes Ecwid à 0 (paniers vides, tests, abandons)
+                eco_total = float(eco.get("total") or eco.get("grandTotal") or 0)
+                if eco_total <= 0:
+                    continue
+
                 ecwid_id  = str(eco.get("id") or eco.get("orderNumber", ""))
                 order_num = str(eco.get("orderNumber") or eco.get("id", ""))
                 ref      = f"ECWID-{ecwid_id}"
@@ -74,6 +86,7 @@ async def _poll_ecwid_orders():
                 customer_street= (billing.get("street") or "").strip()
                 customer_city  = (billing.get("city") or "").strip()
                 customer_zip   = (billing.get("postalCode") or "").strip()
+                customer_subdistrict = _get_ecwid_subdistrict(eco)
                 email = (eco.get("email") or "").strip().lower()
 
                 # Chercher par email d'abord, puis par nom
@@ -97,13 +110,14 @@ async def _poll_ecwid_orders():
                     if customer_street:vals["street"] = customer_street
                     if customer_city:  vals["city"]   = customer_city
                     if customer_zip:   vals["zip"]    = customer_zip
+                    if customer_subdistrict: vals["x_sub_district"] = customer_subdistrict
                     partner_id = odoo_execute("res.partner", "create", [vals])
                     if email:
                         email_map[email] = partner_id
                 else:
                     # Mettre à jour l'adresse/téléphone si manquants
                     existing_partner = odoo_execute("res.partner", "read",
-                        [[partner_id]], {"fields": ["phone","street","city","zip"]})[0]
+                        [[partner_id]], {"fields": ["phone","street","city","zip","x_sub_district"]})[0]
                     update_vals = {}
                     if customer_phone and not existing_partner.get("phone"):
                         update_vals["phone"] = customer_phone
@@ -113,6 +127,8 @@ async def _poll_ecwid_orders():
                         update_vals["city"] = customer_city
                     if customer_zip and not existing_partner.get("zip"):
                         update_vals["zip"] = customer_zip
+                    if customer_subdistrict and not existing_partner.get("x_sub_district"):
+                        update_vals["x_sub_district"] = customer_subdistrict
                     if update_vals:
                         odoo_execute("res.partner", "write", [[partner_id], update_vals])
 
@@ -122,12 +138,21 @@ async def _poll_ecwid_orders():
                 except Exception:
                     date_order = _dt.utcnow().strftime("%Y-%m-%d %H:%M:%S")
 
+                import sys as _sys, os as _os
+                _sys.path.insert(0, _os.path.dirname(_os.path.dirname(__file__)))
+                try:
+                    from sku_mapping import SKU_MAP as _SKU_MAP
+                except Exception:
+                    _SKU_MAP = {}
+
                 lines = []
                 for item in eco.get("items", []):
                     sku   = (item.get("sku") or "").strip()
                     qty   = item.get("quantity", 1)
                     price = item.get("price", 0)
                     prod  = sku_map.get(sku)
+                    if not prod and sku and sku in _SKU_MAP and _SKU_MAP[sku]:
+                        prod = sku_map.get(_SKU_MAP[sku])
                     if prod:
                         line = {"product_id": prod["id"], "product_uom_qty": qty, "price_unit": price}
                         if prod.get("taxes_id"):
@@ -155,6 +180,13 @@ async def _poll_ecwid_orders():
                     lines.append((0, 0, {"product_id": 1915,
                         "name": ship_opt.get("shippingMethodName") or "Transport",
                         "product_uom_qty": 1, "price_unit": round(ship_cost, 2), "tax_ids": [(5,0,0)]}))
+                # Supplements (ex: "Delivery Frozen or Chill")
+                for surcharge in (eco.get("customSurcharges") or []):
+                    amount = surcharge.get("total") or surcharge.get("value") or 0
+                    if amount:
+                        lines.append((0, 0, {"product_id": 1917,
+                            "name": surcharge.get("description") or "Supplement",
+                            "product_uom_qty": 1, "price_unit": amount}))
 
                 eco_note = (eco.get("customerComment") or "").strip()
                 so_vals = {
@@ -173,23 +205,123 @@ async def _poll_ecwid_orders():
             print(f"[POLL] Erreur: {e}")
         await asyncio.sleep(POLL_INTERVAL)
 
+STOCK_SYNC_INTERVAL = 600  # secondes entre chaque synchro stock Odoo -> Ecwid
+
+async def _poll_stock_sync():
+    """Tâche de fond : pousse le stock Odoo vers Ecwid toutes les 10 min."""
+    await asyncio.sleep(60)
+    while True:
+        try:
+            ecwid_base = f"https://app.ecwid.com/api/v3/{ECWID_STORE_ID}"
+            headers    = {"Authorization": f"Bearer {ECWID_TOKEN}"}
+
+            # Stock disponible Odoo par produit (emplacements internes uniquement)
+            quants = odoo_execute("stock.quant", "search_read",
+                [[["location_id.usage", "=", "internal"]]],
+                {"fields": ["product_id", "quantity", "reserved_quantity"], "limit": 10000})
+            stock_by_pid = {}
+            for q in quants:
+                pid = q["product_id"][0]
+                available = q["quantity"] - q["reserved_quantity"]
+                stock_by_pid[pid] = stock_by_pid.get(pid, 0) + available
+
+            if not stock_by_pid:
+                await asyncio.sleep(STOCK_SYNC_INTERVAL)
+                continue
+
+            prods = odoo_execute("product.product", "read",
+                [list(stock_by_pid.keys())], {"fields": ["id", "default_code", "lst_price"]})
+            odoo_data = {}
+            for p in prods:
+                sku = (p.get("default_code") or "").strip()
+                if sku:
+                    odoo_data[sku.upper()] = {
+                        "qty": max(0, int(stock_by_pid.get(p["id"], 0))),
+                        "price": round(float(p.get("lst_price") or 0), 2),
+                    }
+
+            # Produits Ecwid (simples + variantes), avec quantite/prix actuels
+            ecwid_targets = {}
+            offset = 0
+            while True:
+                r = requests.get(f"{ecwid_base}/products", headers=headers,
+                    params={"limit": 100, "offset": offset})
+                data = r.json()
+                items = data.get("items", [])
+                if not items:
+                    break
+                for prod in items:
+                    if prod.get("sku"):
+                        ecwid_targets[prod["sku"].strip().upper()] = {
+                            "url": f"{ecwid_base}/products/{prod['id']}",
+                            "qty": prod.get("quantity", 0),
+                            "price": round(float(prod.get("price") or 0), 2),
+                        }
+                    for combo in (prod.get("combinations") or []):
+                        if combo.get("sku"):
+                            ecwid_targets[combo["sku"].strip().upper()] = {
+                                "url": f"{ecwid_base}/products/{prod['id']}/combinations/{combo['id']}",
+                                "qty": combo.get("quantity", 0),
+                                "price": round(float(combo.get("price") or prod.get("price") or 0), 2),
+                            }
+                offset += 100
+                if offset >= data.get("total", 0):
+                    break
+
+            updated_qty, updated_price = 0, 0
+            for sku, vals in odoo_data.items():
+                target = ecwid_targets.get(sku)
+                if not target:
+                    continue
+                payload = {}
+                if target["qty"] != vals["qty"]:
+                    payload.update({"quantity": vals["qty"], "unlimited": False, "inStock": vals["qty"] > 0})
+                if vals["price"] and abs(target["price"] - vals["price"]) > 0.01:
+                    payload["price"] = vals["price"]
+                if not payload:
+                    continue
+                try:
+                    requests.put(target["url"], headers=headers, json=payload)
+                    if "quantity" in payload: updated_qty += 1
+                    if "price" in payload: updated_price += 1
+                except Exception:
+                    pass
+            print(f"[STOCK] {updated_qty} stocks, {updated_price} prix mis a jour sur Ecwid")
+        except Exception as e:
+            print(f"[STOCK] Erreur: {e}")
+        await asyncio.sleep(STOCK_SYNC_INTERVAL)
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     task = asyncio.create_task(_poll_ecwid_orders())
+    task2 = asyncio.create_task(_poll_stock_sync())
     yield
     task.cancel()
+    task2.cancel()
 
 app = FastAPI(lifespan=lifespan)
 
 VERSION = "2026-06-23-v50-customer-by-name"
 
 # Enregistrer la police Thai au démarrage
-_THAI_FONT = "NotoSansThai"
-try:
-    _font_path = os.path.join(os.path.dirname(__file__), "NotoSansThai-Regular.ttf")
-    pdfmetrics.registerFont(TTFont(_THAI_FONT, _font_path))
-except Exception:
-    _THAI_FONT = "Helvetica"  # fallback
+_THAI_FONT = "Helvetica"
+for _fp in [
+    os.path.join(os.path.dirname(__file__), "NotoSansThai-Regular.ttf"),
+    "/opt/delicatessen/fonts/tahoma.ttf",
+    "/opt/delicatessen/fonts/NotoSansThai-Regular.ttf",
+    "/usr/share/fonts/google-noto/NotoSansThai-Regular.ttf",
+    "/usr/share/fonts/truetype/noto/NotoSansThai-Regular.ttf",
+    "/usr/share/fonts/thai-scalable/Garuda.ttf",
+    r"C:\Windows\Fonts\THSarabunNew.ttf",
+    r"C:\Windows\Fonts\Tahoma.ttf",
+]:
+    if os.path.exists(_fp):
+        try:
+            pdfmetrics.registerFont(TTFont("ThaiMC", _fp))
+            _THAI_FONT = "ThaiMC"
+        except Exception:
+            pass
+        break
 
 _LOGO_PATH = os.path.join(os.path.dirname(__file__), "logo.png")
 
@@ -217,15 +349,28 @@ def draw_mixed_text(c, x, y, text, size, latin_font="Helvetica", unicode_font=_T
         c.drawString(cur_x, y, seg_text)
         cur_x += c.stringWidth(seg_text, font, size)
 
-ODOO_URL = os.getenv("ODOO_URL")
-ODOO_DB = os.getenv("ODOO_DB")
-ODOO_LOGIN = os.getenv("ODOO_LOGIN")
-ODOO_PASSWORD = os.getenv("ODOO_PASSWORD")
+try:
+    import sys as _sys
+    _sys.path.insert(0, r'C:\Users\LENOVO\OneDrive\Desktop\DELICATESSEN\ERP')
+    import config as _cfg
+    _CFG_URL = _cfg.ODOO_URL; _CFG_DB = _cfg.ODOO_DB
+    _CFG_LOGIN = _cfg.ODOO_LOGIN; _CFG_PWD = _cfg.ODOO_PASSWORD
+    _CFG_ECWID_ID = _cfg.ECWID_STORE_ID; _CFG_ECWID_TOKEN = _cfg.ECWID_TOKEN
+except Exception:
+    _CFG_URL = _CFG_DB = _CFG_LOGIN = _CFG_PWD = _CFG_ECWID_ID = _CFG_ECWID_TOKEN = None
 
-ECWID_STORE_ID = os.getenv("ECWID_STORE_ID")
-ECWID_TOKEN = os.getenv("ECWID_TOKEN")
+ODOO_URL = os.getenv("ODOO_URL") or _CFG_URL
+ODOO_DB = os.getenv("ODOO_DB") or _CFG_DB
+ODOO_LOGIN = os.getenv("ODOO_LOGIN") or _CFG_LOGIN
+ODOO_PASSWORD = os.getenv("ODOO_PASSWORD") or _CFG_PWD
+
+ECWID_STORE_ID = os.getenv("ECWID_STORE_ID") or _CFG_ECWID_ID
+ECWID_TOKEN = os.getenv("ECWID_TOKEN") or _CFG_ECWID_TOKEN
 
 STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "")
+
+LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "")
+LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")
 
 
 _odoo_cache = {"uid": None, "models": None}
@@ -2513,6 +2658,7 @@ async def import_commandes_xlsx(
 @app.get("/sync-ecwid-orders")
 def sync_ecwid_orders(
     since_order_id: int = 0,
+    since_days: int = 30,
 ):
     """
     Importe TOUTES les commandes Ecwid dans Odoo (tous statuts, toutes pages).
@@ -2539,11 +2685,23 @@ def sync_ecwid_orders(
         if key not in prod_by_name:
             prod_by_name[key] = p
 
+    try:
+        import sys as _s, os as _o
+        _s.path.insert(0, _o.path.dirname(_o.path.dirname(__file__)))
+        from sku_mapping import SKU_MAP as _SKU_MAP
+    except Exception:
+        _SKU_MAP = {}
+
     def find_product(sku: str, name: str):
         if sku:
             p = prod_by_sku.get(str(sku).strip().upper())
             if p:
                 return p
+            mapped = _SKU_MAP.get(str(sku).strip())
+            if mapped:
+                p = prod_by_sku.get(str(mapped).strip().upper())
+                if p:
+                    return p
         if name:
             p = prod_by_name.get(str(name).strip().lower())
             if p:
@@ -2558,21 +2716,32 @@ def sync_ecwid_orders(
     partner_by_email = {str(p["email"]).strip().lower(): p["id"]
                         for p in odoo_partners if p.get("email")}
 
-    # ── Commandes déjà importées (client_order_ref = numéro Ecwid) ───────────
+    # ── Commandes déjà importées (toutes formes : ECWID-xxx ou xxx) ──────────
     existing = odoo_execute("sale.order", "search_read",
         [[["client_order_ref", "!=", False]]],
         {"fields": ["client_order_ref"], "limit": 5000}
     )
-    already_imported = {str(e["client_order_ref"]) for e in existing}
+    already_imported = set()
+    for e in existing:
+        ref_val = str(e["client_order_ref"])
+        already_imported.add(ref_val)
+        # Ajouter aussi la forme numérique si c'est ECWID-xxx
+        if ref_val.startswith("ECWID-"):
+            already_imported.add(ref_val[6:])
+        else:
+            already_imported.add(f"ECWID-{ref_val}")
 
-    # ── Récupérer TOUTES les commandes Ecwid (pagination) ────────────────────
+    # ── Récupérer les commandes Ecwid récentes (since_days, défaut 30j) ─────────
+    from datetime import datetime, timezone, timedelta
+    since_ts = int((datetime.now(timezone.utc) - timedelta(days=since_days)).timestamp())
     all_items = []
     offset = 0
     batch = 100
     total_ecwid = 0
     while True:
-        ecwid_data = ecwid_get("/orders", {"limit": batch, "offset": offset,
-                                           "sortBy": "ORDER_DATE_DESC"})
+        params = {"limit": batch, "offset": offset, "sortBy": "ORDER_DATE_DESC",
+                  "createdFrom": since_ts}
+        ecwid_data = ecwid_get("/orders", params)
         if not ecwid_data:
             return {"status": "error", "error": "Impossible de joindre l'API Ecwid"}
         items_page = ecwid_data.get("items", [])
@@ -2606,6 +2775,7 @@ def sync_ecwid_orders(
         street = ship.get("street") or ""
         city   = ship.get("city") or ""
         zipcode = ship.get("postalCode") or ""
+        subdistrict = _get_ecwid_subdistrict(eco)
 
         partner_id = partner_by_email.get(email) if email else None
         if not partner_id:
@@ -2621,6 +2791,8 @@ def sync_ecwid_orders(
                 vals_p["city"] = city
             if zipcode:
                 vals_p["zip"] = zipcode
+            if subdistrict:
+                vals_p["x_sub_district"] = subdistrict
             try:
                 partner_id = odoo_execute("res.partner", "create", [vals_p])
                 if email:
@@ -2628,6 +2800,11 @@ def sync_ecwid_orders(
             except Exception as e:
                 errors_list.append({"ecwid": order_num, "reason": f"Création client: {e}"})
                 continue
+
+        # Ignorer les commandes Ecwid sans aucun article (ex: paniers vides/annules)
+        if not eco.get("items"):
+            skipped.append({"ecwid": order_num, "reason": "aucun article"})
+            continue
 
         # ── Obtenir numéro FD ─────────────────────────────────────────────────
         fd_number = odoo_execute("ir.sequence", "next_by_code", [[seq_code]])
@@ -2639,7 +2816,7 @@ def sync_ecwid_orders(
         order_date = eco.get("createDate") or eco.get("updateDate")
         order_vals = {
             "partner_id": partner_id,
-            "client_order_ref": order_num,
+            "client_order_ref": f"ECWID-{order_num}",
             "name": fd_number,
         }
         if order_date:
@@ -2690,6 +2867,22 @@ def sync_ecwid_orders(
                 lines_created += 1
             except Exception as e:
                 lines_missing.append(f"erreur: {e}")
+
+        # Supplements (ex: "Delivery Frozen or Chill")
+        for surcharge in (eco.get("customSurcharges") or []):
+            amount = surcharge.get("total") or surcharge.get("value") or 0
+            if amount:
+                try:
+                    odoo_execute("sale.order.line", "create", [{
+                        "order_id": order_id,
+                        "product_id": 1917,
+                        "name": surcharge.get("description") or "Supplement",
+                        "product_uom_qty": 1,
+                        "price_unit": amount,
+                    }])
+                    lines_created += 1
+                except Exception as e:
+                    lines_missing.append(f"erreur supplement: {e}")
 
         # Confirmer la commande
         try:
@@ -2753,6 +2946,9 @@ def _import_one_ecwid_order(order_num: str, eco: dict) -> dict:
     if existing:
         return {"status": "already_exists", "fd": existing[0]["name"]}
 
+    if not eco.get("items"):
+        return {"status": "skipped", "reason": "aucun article"}
+
     # Client
     email  = str(eco.get("email") or "").strip().lower()
     ship   = eco.get("shippingPerson") or eco.get("billingPerson") or {}
@@ -2761,6 +2957,7 @@ def _import_one_ecwid_order(order_num: str, eco: dict) -> dict:
     street = ship.get("street") or ""
     city   = ship.get("city") or ""
     zipcode = ship.get("postalCode") or ""
+    subdistrict = _get_ecwid_subdistrict(eco)
 
     partner_id = None
     if email:
@@ -2783,6 +2980,8 @@ def _import_one_ecwid_order(order_num: str, eco: dict) -> dict:
             vals_p["city"] = city
         if zipcode:
             vals_p["zip"] = zipcode
+        if subdistrict:
+            vals_p["x_sub_district"] = subdistrict
         partner_id = odoo_execute("res.partner", "create", [vals_p])
 
     # Numéro FD
@@ -2848,6 +3047,19 @@ def _import_one_ecwid_order(order_num: str, eco: dict) -> dict:
             lines_created += 1
         except Exception:
             pass
+
+    for surcharge in (eco.get("customSurcharges") or []):
+        amount = surcharge.get("total") or surcharge.get("value") or 0
+        if amount:
+            try:
+                odoo_execute("sale.order.line", "create", [{
+                    "order_id": order_id, "product_id": 1917,
+                    "name": surcharge.get("description") or "Supplement",
+                    "product_uom_qty": 1, "price_unit": amount,
+                }])
+                lines_created += 1
+            except Exception:
+                pass
 
     try:
         odoo_execute("sale.order", "action_confirm", [[order_id]])
@@ -3099,4 +3311,212 @@ def delete_ecwid_imports(confirm: str = ""):
         "errors": len(errors),
         "errors_detail": errors[:20],
     }
+
+
+# ─── LINE Messaging API — Bot commandes B2B French Delicatessen ───────────────
+
+LINE_API = "https://api.line.me/v2/bot"
+
+def line_reply(reply_token: str, messages: list):
+    """Envoie un ou plusieurs messages via LINE Messaging API."""
+    headers = {
+        "Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}",
+        "Content-Type": "application/json",
+    }
+    payload = {"replyToken": reply_token, "messages": messages}
+    try:
+        requests.post(f"{LINE_API}/message/reply", json=payload, headers=headers, timeout=10)
+    except Exception:
+        pass
+
+
+def line_text(text: str) -> dict:
+    return {"type": "text", "text": text}
+
+
+def _line_get_catalogue() -> str:
+    """Retourne le catalogue produits pro depuis Odoo (pricelist pro si dispo)."""
+    products = odoo_execute("product.product", "search_read",
+        [[["active", "=", True], ["sale_ok", "=", True]]],
+        {"fields": ["name", "default_code", "list_price"], "limit": 100,
+         "context": {"lang": "en_US"}}
+    )
+    if not products:
+        return "Catalogue indisponible pour le moment."
+    lines = ["📋 *Catalogue French Delicatessen*\n"]
+    for p in products[:30]:
+        sku = p.get("default_code") or "—"
+        name = p.get("name", "")
+        price = p.get("list_price", 0)
+        lines.append(f"• [{sku}] {name} — {price:.0f} ฿")
+    lines.append("\n📝 Pour commander : tapez le SKU et la quantité")
+    lines.append("Exemple : *JAM001 x3, SAU002 x2*")
+    return "\n".join(lines)
+
+
+def _line_parse_order(text: str) -> list:
+    """Parse un message comme 'JAM001 x3, SAU002 x2' → [(sku, qty), ...]"""
+    items = []
+    for part in re.split(r"[,;\n]+", text):
+        part = part.strip()
+        m = re.match(r"([A-Za-z0-9_\-]+)\s*[xX×]\s*(\d+)", part)
+        if m:
+            items.append((m.group(1).upper(), int(m.group(2))))
+    return items
+
+
+def _line_create_order(user_id: str, display_name: str, items: list) -> str:
+    """Crée une commande Odoo depuis une liste (sku, qty)."""
+    # Trouver ou créer le client
+    partners = odoo_execute("res.partner", "search_read",
+        [[["comment", "like", f"line:{user_id}"]]],
+        {"fields": ["id", "name"], "limit": 1}
+    )
+    if partners:
+        partner_id = partners[0]["id"]
+    else:
+        partner_id = odoo_execute("res.partner", "create", [{
+            "name": display_name or f"Line {user_id}",
+            "comment": f"line:{user_id}",
+            "customer_rank": 1,
+        }])
+
+    # Numéro FD-P (Pro)
+    fd_number = odoo_execute("ir.sequence", "next_by_code", [[SEQ_CODES["P"]]])
+    if not fd_number:
+        return "❌ Erreur création commande (séquence)."
+
+    order_id = odoo_execute("sale.order", "create", [{
+        "partner_id": partner_id,
+        "name": fd_number,
+        "note": "Commande Line Bot",
+    }])
+
+    # Charger produits
+    all_prods = odoo_execute("product.product", "search_read",
+        [[["active", "=", True]]],
+        {"fields": ["id", "name", "default_code", "list_price", "uom_id"], "limit": 2000,
+         "context": {"lang": "en_US"}}
+    )
+    prod_by_sku = {str(p["default_code"]).strip().upper(): p
+                   for p in all_prods if p.get("default_code")}
+
+    lines_ok, lines_nok = [], []
+    for sku, qty in items:
+        p = prod_by_sku.get(sku)
+        if not p:
+            lines_nok.append(sku)
+            continue
+        uom_id = p["uom_id"][0] if isinstance(p.get("uom_id"), list) else False
+        line_vals = {
+            "order_id": order_id,
+            "product_id": p["id"],
+            "name": p["name"],
+            "product_uom_qty": qty,
+            "price_unit": p["list_price"],
+        }
+        if uom_id:
+            line_vals["product_uom"] = uom_id
+        try:
+            odoo_execute("sale.order.line", "create", [line_vals])
+            lines_ok.append(f"{sku} x{qty}")
+        except Exception:
+            lines_nok.append(sku)
+
+    if lines_ok:
+        try:
+            odoo_execute("sale.order", "action_confirm", [[order_id]])
+        except Exception:
+            pass
+
+    msg = [f"✅ Commande *{fd_number}* créée !"]
+    if lines_ok:
+        msg.append("Produits : " + ", ".join(lines_ok))
+    if lines_nok:
+        msg.append("❓ SKUs non trouvés : " + ", ".join(lines_nok))
+    msg.append("Notre équipe vous contactera pour confirmer la livraison.")
+    return "\n".join(msg)
+
+
+@app.post("/webhook/line")
+async def webhook_line(request: Request):
+    """Webhook LINE — reçoit les messages des clients pro."""
+    try:
+        body = await request.json()
+    except Exception:
+        return {"status": "ignored"}
+
+    for event in body.get("events", []):
+        if event.get("type") != "message":
+            continue
+        if event.get("message", {}).get("type") != "text":
+            continue
+
+        reply_token = event.get("replyToken", "")
+        user_id = event.get("source", {}).get("userId", "")
+        text = event["message"]["text"].strip()
+        text_low = text.lower()
+
+        # Récupérer le nom display via LINE API
+        display_name = ""
+        try:
+            r = requests.get(f"{LINE_API}/profile/{user_id}",
+                headers={"Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}"},
+                timeout=5)
+            display_name = r.json().get("displayName", "")
+        except Exception:
+            pass
+
+        # Commandes menu
+        if text_low in ("catalogue", "catalog", "menu", "สินค้า", "รายการ"):
+            catalogue = _line_get_catalogue()
+            line_reply(reply_token, [line_text(catalogue)])
+
+        elif text_low in ("aide", "help", "ช่วย"):
+            help_msg = (
+                "🇫🇷 *French Delicatessen — Bot commandes B2B*\n\n"
+                "📋 *catalogue* — voir tous les produits\n"
+                "📝 *Commander* — tapez SKU x quantité\n"
+                "   Exemple : JAM001 x3, SAU002 x2\n"
+                "📦 *mes commandes* — voir vos dernières commandes\n"
+                "📞 Contact : @jfbuc"
+            )
+            line_reply(reply_token, [line_text(help_msg)])
+
+        elif text_low in ("mes commandes", "commandes", "orders", "ประวัติ"):
+            partners = odoo_execute("res.partner", "search_read",
+                [[["comment", "like", f"line:{user_id}"]]],
+                {"fields": ["id"], "limit": 1}
+            )
+            if not partners:
+                line_reply(reply_token, [line_text("Aucune commande trouvée. Tapez *catalogue* pour voir nos produits.")])
+            else:
+                orders = odoo_execute("sale.order", "search_read",
+                    [[["partner_id", "=", partners[0]["id"]]]],
+                    {"fields": ["name", "date_order", "amount_total", "state"], "limit": 5,
+                     "order": "date_order desc"}
+                )
+                if not orders:
+                    line_reply(reply_token, [line_text("Aucune commande trouvée.")])
+                else:
+                    lines = ["📦 *Vos dernières commandes :*\n"]
+                    for o in orders:
+                        date = str(o["date_order"])[:10]
+                        lines.append(f"• {o['name']} — {o['amount_total']:.0f} ฿ ({date})")
+                    line_reply(reply_token, [line_text("\n".join(lines))])
+
+        else:
+            # Essayer de parser comme une commande (SKU x qty)
+            items = _line_parse_order(text)
+            if items:
+                result = _line_create_order(user_id, display_name, items)
+                line_reply(reply_token, [line_text(result)])
+            else:
+                line_reply(reply_token, [line_text(
+                    "Bonjour ! 👋\n\n"
+                    "Tapez *catalogue* pour voir nos produits\n"
+                    "Tapez *aide* pour voir toutes les options"
+                )])
+
+    return {"status": "ok"}
 
