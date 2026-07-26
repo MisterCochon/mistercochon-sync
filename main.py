@@ -3629,34 +3629,75 @@ async def webhook_line(request: Request):
         if not partner:
             sess = _line_sessions.get(user_id, {})
 
-            # Registration step 2: waiting for business name
+            # Registration step 2: waiting for company name
             if sess.get("state") == "awaiting_name":
-                biz_name = text.strip()
-                if len(biz_name) < 2:
-                    line_reply(reply_token, [line_text("Please enter your business name (at least 2 characters).")])
-                    continue
-                display = _line_get_display_name(user_id)
-                new_partner_id = odoo_execute("res.partner", "create", [{
-                    "name": biz_name,
-                    "customer_rank": 1,
-                    "comment": f"line:{user_id}\nRegistered via LINE bot — {display}",
-                    "team_id": False,
-                }])
-                _line_sessions.pop(user_id, None)
-                partner = _line_get_partner(user_id)
+                _line_sessions[user_id] = {"state": "awaiting_vat", "company": text.strip()}
                 line_reply(reply_token, [line_text(
-                    f"✅ Welcome, {biz_name}!\n\n"
-                    "Your account has been created.\n"
-                    "Type *menu* to browse our PRO catalog."
+                    f"Company: *{text.strip()}*\n\n"
+                    "Now please enter your VAT / DBD registration number:"
                 )])
+                continue
+
+            # Registration step 3: waiting for VAT number
+            if sess.get("state") == "awaiting_vat":
+                company = sess.get("company", "")
+                vat_input = re.sub(r"\s", "", text.strip())
+                vat_digits = re.sub(r"\D", "", vat_input)
+
+                # Search Odoo: partner whose name matches AND VAT matches
+                all_partners = odoo_execute("res.partner", "search_read",
+                    [[["customer_rank", ">", 0]]],
+                    {"fields": ["id", "name", "vat", "comment"], "limit": 2000}
+                )
+                matched = None
+                for p in (all_partners or []):
+                    pname = (p.get("name") or "").lower()
+                    pvat  = re.sub(r"\D", "", p.get("vat") or "")
+                    name_ok = (company.lower() in pname or pname in company.lower())
+                    vat_ok  = (pvat == vat_digits or pvat.endswith(vat_digits[-5:]) if len(vat_digits) >= 5 else pvat == vat_digits)
+                    if name_ok and vat_ok and pvat:
+                        matched = p
+                        break
+
+                _line_sessions.pop(user_id, None)
+
+                if matched:
+                    # Link LINE user to existing partner
+                    comment = matched.get("comment") or ""
+                    marker = f"line:{user_id}"
+                    if marker not in comment:
+                        odoo_execute("res.partner", "write",
+                            [[matched["id"]], {"comment": (comment + "\n" + marker).strip()}])
+                    partner = _line_get_partner(user_id)
+                    line_reply(reply_token, [line_text(
+                        f"✅ Welcome, {matched['name']}!\n\n"
+                        "Your account has been verified.\n"
+                        "Type *menu* to browse our PRO catalog."
+                    )])
+                else:
+                    # Create new pending partner
+                    display = _line_get_display_name(user_id)
+                    odoo_execute("res.partner", "create", [{
+                        "name": company,
+                        "vat": vat_input if vat_input else False,
+                        "customer_rank": 1,
+                        "comment": f"line:{user_id}\nRegistered via LINE bot — {display}\n⚠️ Pending verification",
+                    }])
+                    partner = _line_get_partner(user_id)
+                    line_reply(reply_token, [line_text(
+                        f"✅ Welcome, {company}!\n\n"
+                        "Your account has been created and is pending verification.\n"
+                        "You can already browse our catalog and place orders.\n\n"
+                        "Type *menu* to get started."
+                    )])
                 continue
 
             # New user: try code or offer NEW registration
             if text.upper() == "NEW":
                 _line_sessions[user_id] = {"state": "awaiting_name"}
                 line_reply(reply_token, [line_text(
-                    "📝 *New account registration*\n\n"
-                    "Please enter your business name:"
+                    "📝 *New client registration*\n\n"
+                    "Please enter your company name:"
                 )])
                 continue
 
