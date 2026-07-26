@@ -3372,11 +3372,27 @@ def _line_get_partner(user_id: str) -> dict | None:
 
 
 def _line_authenticate(code: str, user_id: str, display_name: str) -> tuple:
-    """Try to authenticate user with access code. Returns (ok, partner_name)."""
+    """
+    Try to authenticate user with access code. Returns (ok, partner_name).
+    Accepts: partner ref field OR last 5 digits of VAT number.
+    """
+    code_clean = code.strip().upper()
+    # Search by ref field first
     results = odoo_execute("res.partner", "search_read",
-        [[["ref", "=", code.strip().upper()], ["customer_rank", ">", 0]]],
-        {"fields": ["id", "name", "comment"], "limit": 1}
+        [[["ref", "=", code_clean], ["customer_rank", ">", 0]]],
+        {"fields": ["id", "name", "comment", "vat"], "limit": 1}
     )
+    # If not found by ref, search by last 5 digits of VAT
+    if not results and re.match(r"^\d{5}$", code_clean):
+        all_partners = odoo_execute("res.partner", "search_read",
+            [[["vat", "!=", False], ["customer_rank", ">", 0]]],
+            {"fields": ["id", "name", "comment", "vat"], "limit": 2000}
+        )
+        for p in (all_partners or []):
+            vat = re.sub(r"\D", "", p.get("vat") or "")
+            if vat.endswith(code_clean):
+                results = [p]
+                break
     if not results:
         return False, ""
     partner = results[0]
