@@ -3397,39 +3397,6 @@ def _dbd_verify(reg_number: str, company_name: str) -> tuple:
     return True, "valid"
 
 
-def _line_authenticate(code: str, user_id: str, display_name: str) -> tuple:
-    """
-    Try to authenticate user with access code. Returns (ok, partner_name).
-    Accepts: partner ref field OR last 5 digits of VAT number.
-    """
-    code_clean = code.strip().upper()
-    # Search by ref field first
-    results = odoo_execute("res.partner", "search_read",
-        [[["ref", "=", code_clean], ["customer_rank", ">", 0]]],
-        {"fields": ["id", "name", "comment", "vat"], "limit": 1}
-    )
-    # If not found by ref, search by last 5 digits of VAT
-    if not results and re.match(r"^\d{5}$", code_clean):
-        all_partners = odoo_execute("res.partner", "search_read",
-            [[["vat", "!=", False], ["customer_rank", ">", 0]]],
-            {"fields": ["id", "name", "comment", "vat"], "limit": 2000}
-        )
-        for p in (all_partners or []):
-            vat = re.sub(r"\D", "", p.get("vat") or "")
-            if vat.endswith(code_clean):
-                results = [p]
-                break
-    if not results:
-        return False, ""
-    partner = results[0]
-    comment = partner.get("comment") or ""
-    marker = f"line:{user_id}"
-    if marker not in comment:
-        new_comment = (comment + "\n" + marker).strip()
-        odoo_execute("res.partner", "write", [[partner["id"]], {"comment": new_comment}])
-    return True, partner["name"]
-
-
 # ── Product helpers ───────────────────────────────────────────────────────────
 
 def _line_get_pro_categories() -> list:
@@ -3746,22 +3713,11 @@ async def webhook_line(request: Request):
                 )])
                 continue
 
-            # Try code authentication (last 5 digits of VAT)
-            ok, name = _line_authenticate(text, user_id, "")
-            if ok:
-                partner = _line_get_partner(user_id)
-                display = _line_get_display_name(user_id)
-                line_reply(reply_token, [line_text(
-                    f"✅ Welcome back, {display or name}!\n\n"
-                    "Type *menu* to browse our PRO catalog."
-                )])
-            else:
-                line_reply(reply_token, [line_quick_reply(
-                    "🇫🇷 *French Delicatessen — Professional Portal*\n\n"
-                    "Enter your access code (last 5 digits of your VAT number),\n"
-                    "or tap below to create a new account:",
-                    [("🆕 New client", "NEW"), ("💬 Help", "HELP")]
-                )])
+            line_reply(reply_token, [line_quick_reply(
+                "🇫🇷 *French Delicatessen — Professional Portal*\n\n"
+                "Tap below to create your account or get assistance:",
+                [("🆕 New client", "NEW"), ("💬 Help", "HELP")]
+            )])
             continue
 
         pricelist = partner.get("property_product_pricelist")
@@ -3853,12 +3809,4 @@ async def webhook_line(request: Request):
                 )])
 
     return {"status": "ok"}
-
-
-@app.get("/line-set-client-code/{partner_id}/{code}")
-def line_set_client_code(partner_id: int, code: str):
-    """Set access code (ref field) for a client partner. Admin only."""
-    odoo_execute("res.partner", "write",
-        [[partner_id], {"ref": code.strip().upper()}])
-    return {"status": "ok", "partner_id": partner_id, "code": code.upper()}
 
