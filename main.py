@@ -3398,22 +3398,17 @@ def _dbd_verify(reg_number: str, company_name: str) -> tuple:
 
 
 def _line_quick_login(code: str, user_id: str) -> tuple:
-    """
-    Quick login for existing clients: 5-digit code matched against last 5
-    digits of VAT/DBD number OR phone/mobile. Returns (ok, partner_name).
-    """
+    """Quick login: last 5 digits of VAT/DBD number. Returns (ok, partner_name)."""
     code = re.sub(r"\D", "", code.strip())
     if len(code) != 5:
         return False, ""
     partners = odoo_execute("res.partner", "search_read",
-        [[["customer_rank", ">", 0]]],
-        {"fields": ["id", "name", "vat", "phone", "mobile", "comment"], "limit": 2000}
+        [[["vat", "!=", False], ["customer_rank", ">", 0]]],
+        {"fields": ["id", "name", "vat", "comment"], "limit": 2000}
     )
     for p in (partners or []):
-        vat   = re.sub(r"\D", "", p.get("vat")    or "")
-        phone = re.sub(r"\D", "", p.get("phone")  or "")
-        mob   = re.sub(r"\D", "", p.get("mobile") or "")
-        if code in (vat[-5:], phone[-5:], mob[-5:]) and any((vat, phone, mob)):
+        vat = re.sub(r"\D", "", p.get("vat") or "")
+        if vat.endswith(code):
             comment = p.get("comment") or ""
             marker = f"line:{user_id}"
             if marker not in comment:
@@ -3748,7 +3743,7 @@ async def webhook_line(request: Request):
             else:
                 line_reply(reply_token, [line_quick_reply(
                     "🇫🇷 *French Delicatessen — Professional Portal*\n\n"
-                    "Enter your 5-digit code (last 5 digits of your DBD number or phone),\n"
+                    "Enter your 5-digit code (last 5 digits of your DBD/VAT number),\n"
                     "or tap below:",
                     [("🆕 New client", "NEW"), ("💬 Help", "HELP")]
                 )])
