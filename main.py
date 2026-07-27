@@ -3672,16 +3672,14 @@ async def webhook_line(request: Request):
                             "comment": (
                                 f"line:{user_id}\n"
                                 f"Registered via LINE bot — {display}\n"
-                                f"⚠️ Pending verification — check dbd.go.th reg: {digits}"
+                                f"DBD reg: {digits}"
                             ),
                         }])
                         partner = _line_get_partner(user_id)
                         line_reply(reply_token, [line_text(
                             f"✅ Welcome, {company}!\n\n"
-                            "Your account has been created.\n"
-                            "You can browse our catalog and place orders.\n\n"
-                            "📋 Our team will confirm your PRO pricing shortly.\n"
-                            "Type *menu* to get started."
+                            "Your PRO account is now active.\n"
+                            "Type *menu* to browse our catalog and place orders."
                         )])
                 else:
                     if reason == "invalid_format":
