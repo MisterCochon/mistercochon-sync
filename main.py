@@ -3371,6 +3371,65 @@ def _line_get_partner(user_id: str) -> dict | None:
     return results[0] if results else None
 
 
+def _dbd_verify(reg_number: str, company_name: str) -> tuple:
+    """
+    Verify a Thai company against the DBD (Department of Business Development) registry.
+    reg_number: 13-digit Thai company registration number.
+    Returns (ok, official_name, address_dict) or (False, "", {}).
+    """
+    digits = re.sub(r"\D", "", reg_number)
+    if len(digits) != 13:
+        return False, "", {}
+    try:
+        # DBD Open Data API - juristic person lookup
+        resp = requests.get(
+            f"https://opendata.dbd.go.th/api/juristic/{digits}",
+            timeout=10,
+            headers={"Accept": "application/json", "User-Agent": "Mozilla/5.0"},
+        )
+        if resp.status_code != 200:
+            return False, "", {}
+        data = resp.json()
+
+        # Extract official name (Thai preferred, fallback English)
+        official_th = (data.get("juristic_name_th") or "").strip()
+        official_en = (data.get("juristic_name_en") or "").strip()
+        official_name = official_th or official_en
+
+        if not official_name:
+            return False, "", {}
+
+        # Fuzzy name match (input may be partial or in English)
+        cn = company_name.lower().strip()
+        def name_match(s):
+            s = s.lower()
+            return cn in s or s in cn or any(
+                w in s for w in cn.split() if len(w) > 3
+            )
+        if not (name_match(official_th) or name_match(official_en)):
+            return False, official_name, {}
+
+        # Build address from DBD response
+        addr_parts = []
+        for field in ("address_no", "road", "sub_district", "district", "province", "post_code"):
+            val = (data.get(field) or "").strip()
+            if val:
+                addr_parts.append(val)
+        address = ", ".join(addr_parts)
+
+        return True, official_name, {
+            "street": " ".join(filter(None, [
+                data.get("address_no", ""),
+                data.get("road", ""),
+            ])).strip(),
+            "city": (data.get("district") or data.get("sub_district") or "").strip(),
+            "zip": (data.get("post_code") or "").strip(),
+            "country_code": "TH",
+        }
+    except Exception:
+        return False, "", {}
+
+
 def _line_authenticate(code: str, user_id: str, display_name: str) -> tuple:
     """
     Try to authenticate user with access code. Returns (ok, partner_name).
@@ -3638,57 +3697,44 @@ async def webhook_line(request: Request):
                 )])
                 continue
 
-            # Registration step 3: waiting for VAT number
+            # Registration step 3: waiting for DBD registration number
             if sess.get("state") == "awaiting_vat":
                 company = sess.get("company", "")
-                vat_input = re.sub(r"\s", "", text.strip())
-                vat_digits = re.sub(r"\D", "", vat_input)
-
-                # Search Odoo: partner whose name matches AND VAT matches
-                all_partners = odoo_execute("res.partner", "search_read",
-                    [[["customer_rank", ">", 0]]],
-                    {"fields": ["id", "name", "vat", "comment"], "limit": 2000}
-                )
-                matched = None
-                for p in (all_partners or []):
-                    pname = (p.get("name") or "").lower()
-                    pvat  = re.sub(r"\D", "", p.get("vat") or "")
-                    name_ok = (company.lower() in pname or pname in company.lower())
-                    vat_ok  = (pvat == vat_digits or pvat.endswith(vat_digits[-5:]) if len(vat_digits) >= 5 else pvat == vat_digits)
-                    if name_ok and vat_ok and pvat:
-                        matched = p
-                        break
-
+                reg_input = text.strip()
                 _line_sessions.pop(user_id, None)
 
-                if matched:
-                    # Link LINE user to existing partner
-                    comment = matched.get("comment") or ""
-                    marker = f"line:{user_id}"
-                    if marker not in comment:
-                        odoo_execute("res.partner", "write",
-                            [[matched["id"]], {"comment": (comment + "\n" + marker).strip()}])
+                ok_dbd, official_name, addr = _dbd_verify(reg_input, company)
+
+                if ok_dbd:
+                    # Create new Odoo partner with DBD-verified data
+                    display = _line_get_display_name(user_id)
+                    partner_vals = {
+                        "name": official_name,
+                        "vat": re.sub(r"\D", "", reg_input),
+                        "customer_rank": 1,
+                        "is_company": True,
+                        "country_id": 216,  # Thailand
+                        "comment": f"line:{user_id}\nRegistered via LINE bot — {display}\n✅ DBD verified",
+                    }
+                    if addr.get("street"):
+                        partner_vals["street"] = addr["street"]
+                    if addr.get("city"):
+                        partner_vals["city"] = addr["city"]
+                    if addr.get("zip"):
+                        partner_vals["zip"] = addr["zip"]
+                    odoo_execute("res.partner", "create", [partner_vals])
                     partner = _line_get_partner(user_id)
                     line_reply(reply_token, [line_text(
-                        f"✅ Welcome, {matched['name']}!\n\n"
-                        "Your account has been verified.\n"
+                        f"✅ Welcome, {official_name}!\n\n"
+                        "Your company has been verified with DBD Thailand.\n"
                         "Type *menu* to browse our PRO catalog."
                     )])
                 else:
-                    # Create new pending partner
-                    display = _line_get_display_name(user_id)
-                    odoo_execute("res.partner", "create", [{
-                        "name": company,
-                        "vat": vat_input if vat_input else False,
-                        "customer_rank": 1,
-                        "comment": f"line:{user_id}\nRegistered via LINE bot — {display}\n⚠️ Pending verification",
-                    }])
-                    partner = _line_get_partner(user_id)
-                    line_reply(reply_token, [line_text(
-                        f"✅ Welcome, {company}!\n\n"
-                        "Your account has been created and is pending verification.\n"
-                        "You can already browse our catalog and place orders.\n\n"
-                        "Type *menu* to get started."
+                    line_reply(reply_token, [line_quick_reply(
+                        "❌ We could not verify your company with DBD Thailand.\n\n"
+                        "Please check your company name and registration number, "
+                        "or contact us for assistance:",
+                        [("💬 Contact us", "HELP")]
                     )])
                 continue
 
@@ -3701,7 +3747,17 @@ async def webhook_line(request: Request):
                 )])
                 continue
 
-            # Try code authentication
+            # HELP → direct to human support
+            if text.upper() == "HELP":
+                line_reply(reply_token, [line_text(
+                    "💬 *Need help?*\n\n"
+                    "Please contact us on LINE:\n"
+                    "👤 @jfbuc\n\n"
+                    "We will set up your PRO account manually."
+                )])
+                continue
+
+            # Try code authentication (last 5 digits of VAT)
             ok, name = _line_authenticate(text, user_id, "")
             if ok:
                 partner = _line_get_partner(user_id)
@@ -3713,8 +3769,9 @@ async def webhook_line(request: Request):
             else:
                 line_reply(reply_token, [line_quick_reply(
                     "🇫🇷 *French Delicatessen — Professional Portal*\n\n"
-                    "Enter your access code, or tap below to register as a new client:",
-                    [("🆕 New client", "NEW")]
+                    "Enter your access code (last 5 digits of your VAT number),\n"
+                    "or tap below to create a new account:",
+                    [("🆕 New client", "NEW"), ("💬 Help", "HELP")]
                 )])
             continue
 
