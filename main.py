@@ -3397,6 +3397,32 @@ def _dbd_verify(reg_number: str, company_name: str) -> tuple:
     return True, "valid"
 
 
+def _line_quick_login(code: str, user_id: str) -> tuple:
+    """
+    Quick login for existing clients: 5-digit code matched against last 5
+    digits of VAT/DBD number OR phone/mobile. Returns (ok, partner_name).
+    """
+    code = re.sub(r"\D", "", code.strip())
+    if len(code) != 5:
+        return False, ""
+    partners = odoo_execute("res.partner", "search_read",
+        [[["customer_rank", ">", 0]]],
+        {"fields": ["id", "name", "vat", "phone", "mobile", "comment"], "limit": 2000}
+    )
+    for p in (partners or []):
+        vat   = re.sub(r"\D", "", p.get("vat")    or "")
+        phone = re.sub(r"\D", "", p.get("phone")  or "")
+        mob   = re.sub(r"\D", "", p.get("mobile") or "")
+        if code in (vat[-5:], phone[-5:], mob[-5:]) and any((vat, phone, mob)):
+            comment = p.get("comment") or ""
+            marker = f"line:{user_id}"
+            if marker not in comment:
+                odoo_execute("res.partner", "write",
+                    [[p["id"]], {"comment": (comment + "\n" + marker).strip()}])
+            return True, p["name"]
+    return False, ""
+
+
 # ── Product helpers ───────────────────────────────────────────────────────────
 
 def _line_get_pro_categories() -> list:
@@ -3711,11 +3737,21 @@ async def webhook_line(request: Request):
                 )])
                 continue
 
-            line_reply(reply_token, [line_quick_reply(
-                "🇫🇷 *French Delicatessen — Professional Portal*\n\n"
-                "Tap below to create your account or get assistance:",
-                [("🆕 New client", "NEW"), ("💬 Help", "HELP")]
-            )])
+            # Quick login: 5-digit code (last 5 of DBD/VAT or phone)
+            ok, name = _line_quick_login(text, user_id)
+            if ok:
+                partner = _line_get_partner(user_id)
+                line_reply(reply_token, [line_text(
+                    f"✅ Welcome back, {name}!\n\n"
+                    "Type *menu* to browse our PRO catalog."
+                )])
+            else:
+                line_reply(reply_token, [line_quick_reply(
+                    "🇫🇷 *French Delicatessen — Professional Portal*\n\n"
+                    "Enter your 5-digit code (last 5 digits of your DBD number or phone),\n"
+                    "or tap below:",
+                    [("🆕 New client", "NEW"), ("💬 Help", "HELP")]
+                )])
             continue
 
         pricelist = partner.get("property_product_pricelist")
