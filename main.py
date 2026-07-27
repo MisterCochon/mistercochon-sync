@@ -3421,23 +3421,21 @@ def _line_quick_login(code: str, user_id: str) -> tuple:
 # ── Product helpers ───────────────────────────────────────────────────────────
 
 def _line_get_pro_categories() -> list:
-    """Return list of product categories that have PRO products."""
-    # Get all PRO products and their categories
-    products = odoo_execute("product.product", "search_read",
-        [[["active", "=", True], ["sale_ok", "=", True],
-          ["categ_id.name", "ilike", "pro"]]],
-        {"fields": ["categ_id"], "limit": 500, "context": {"lang": "en_US"}}
+    """Return LINE-* tags that have at least one active product. Returns [(tag_id, label)]."""
+    tags = odoo_execute("product.tag", "search_read",
+        [[["name", "=ilike", "LINE-%"]]],
+        {"fields": ["id", "name"], "limit": 50}
     )
-    seen, cats = set(), []
-    for p in (products or []):
-        cid = p["categ_id"][0] if isinstance(p.get("categ_id"), list) else None
-        cname = p["categ_id"][1] if isinstance(p.get("categ_id"), list) else ""
-        if cid and cid not in seen:
-            seen.add(cid)
-            # Strip "PRO / " prefix for display
-            label = cname.replace("PRO / ", "").replace("Pro / ", "").strip()
-            cats.append((cid, label))
-    return cats
+    result = []
+    for tag in (tags or []):
+        count = odoo_execute("product.product", "search_count",
+            [[["active", "=", True], ["sale_ok", "=", True],
+              ["product_tag_ids", "in", [tag["id"]]]]]
+        )
+        if count:
+            label = tag["name"][5:].strip()  # strip "LINE-" prefix
+            result.append((tag["id"], label))
+    return result
 
 
 def _line_get_ecwid_images() -> dict:
@@ -3771,7 +3769,7 @@ async def webhook_line(request: Request):
             cat_id = int(text.split("__cat_")[1])
             prods = odoo_execute("product.product", "search_read",
                 [[["active", "=", True], ["sale_ok", "=", True],
-                  ["categ_id", "=", cat_id]]],
+                  ["product_tag_ids", "in", [cat_id]]]],
                 {"fields": ["id", "name", "default_code", "list_price"], "limit": 200,
                  "context": {"lang": "en_US"}}
             )
