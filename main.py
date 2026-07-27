@@ -3371,63 +3371,30 @@ def _line_get_partner(user_id: str) -> dict | None:
     return results[0] if results else None
 
 
+def _dbd_check_digit(digits: str) -> bool:
+    """Validate Thai 13-digit company registration number using official check digit formula."""
+    if len(digits) != 13 or not digits.isdigit():
+        return False
+    weights = [13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2]
+    total = sum(int(digits[i]) * weights[i] for i in range(12))
+    check = (11 - (total % 11)) % 11
+    if check >= 10:
+        return False
+    return str(check) == digits[12]
+
+
 def _dbd_verify(reg_number: str, company_name: str) -> tuple:
     """
-    Verify a Thai company against the DBD (Department of Business Development) registry.
-    reg_number: 13-digit Thai company registration number.
-    Returns (ok, official_name, address_dict) or (False, "", {}).
+    Validate Thai company registration number (format + check digit).
+    DBD has no public real-time API — we validate format only.
+    Returns (ok, reason) where reason is "valid"/"invalid_format"/"invalid_check".
     """
     digits = re.sub(r"\D", "", reg_number)
     if len(digits) != 13:
-        return False, "", {}
-    try:
-        # DBD Open Data API - juristic person lookup
-        resp = requests.get(
-            f"https://opendata.dbd.go.th/api/juristic/{digits}",
-            timeout=10,
-            headers={"Accept": "application/json", "User-Agent": "Mozilla/5.0"},
-        )
-        if resp.status_code != 200:
-            return False, "", {}
-        data = resp.json()
-
-        # Extract official name (Thai preferred, fallback English)
-        official_th = (data.get("juristic_name_th") or "").strip()
-        official_en = (data.get("juristic_name_en") or "").strip()
-        official_name = official_th or official_en
-
-        if not official_name:
-            return False, "", {}
-
-        # Fuzzy name match (input may be partial or in English)
-        cn = company_name.lower().strip()
-        def name_match(s):
-            s = s.lower()
-            return cn in s or s in cn or any(
-                w in s for w in cn.split() if len(w) > 3
-            )
-        if not (name_match(official_th) or name_match(official_en)):
-            return False, official_name, {}
-
-        # Build address from DBD response
-        addr_parts = []
-        for field in ("address_no", "road", "sub_district", "district", "province", "post_code"):
-            val = (data.get(field) or "").strip()
-            if val:
-                addr_parts.append(val)
-        address = ", ".join(addr_parts)
-
-        return True, official_name, {
-            "street": " ".join(filter(None, [
-                data.get("address_no", ""),
-                data.get("road", ""),
-            ])).strip(),
-            "city": (data.get("district") or data.get("sub_district") or "").strip(),
-            "zip": (data.get("post_code") or "").strip(),
-            "country_code": "TH",
-        }
-    except Exception:
-        return False, "", {}
+        return False, "invalid_format"
+    if not _dbd_check_digit(digits):
+        return False, "invalid_check"
+    return True, "valid"
 
 
 def _line_authenticate(code: str, user_id: str, display_name: str) -> tuple:
@@ -3701,40 +3668,62 @@ async def webhook_line(request: Request):
             if sess.get("state") == "awaiting_vat":
                 company = sess.get("company", "")
                 reg_input = text.strip()
+                digits = re.sub(r"\D", "", reg_input)
                 _line_sessions.pop(user_id, None)
 
-                ok_dbd, official_name, addr = _dbd_verify(reg_input, company)
+                ok_fmt, reason = _dbd_verify(reg_input, company)
 
-                if ok_dbd:
-                    # Create new Odoo partner with DBD-verified data
+                if ok_fmt:
+                    # Check if this VAT already exists in Odoo
+                    existing = odoo_execute("res.partner", "search_read",
+                        [[["vat", "=", digits], ["customer_rank", ">", 0]]],
+                        {"fields": ["id", "name", "comment"], "limit": 1}
+                    )
                     display = _line_get_display_name(user_id)
-                    partner_vals = {
-                        "name": official_name,
-                        "vat": re.sub(r"\D", "", reg_input),
-                        "customer_rank": 1,
-                        "is_company": True,
-                        "country_id": 216,  # Thailand
-                        "comment": f"line:{user_id}\nRegistered via LINE bot — {display}\n✅ DBD verified",
-                    }
-                    if addr.get("street"):
-                        partner_vals["street"] = addr["street"]
-                    if addr.get("city"):
-                        partner_vals["city"] = addr["city"]
-                    if addr.get("zip"):
-                        partner_vals["zip"] = addr["zip"]
-                    odoo_execute("res.partner", "create", [partner_vals])
-                    partner = _line_get_partner(user_id)
-                    line_reply(reply_token, [line_text(
-                        f"✅ Welcome, {official_name}!\n\n"
-                        "Your company has been verified with DBD Thailand.\n"
-                        "Type *menu* to browse our PRO catalog."
-                    )])
+                    marker = f"line:{user_id}"
+
+                    if existing:
+                        p = existing[0]
+                        comment = p.get("comment") or ""
+                        if marker not in comment:
+                            odoo_execute("res.partner", "write",
+                                [[p["id"]], {"comment": (comment + "\n" + marker).strip()}])
+                        partner = _line_get_partner(user_id)
+                        line_reply(reply_token, [line_text(
+                            f"✅ Welcome, {p['name']}!\n\n"
+                            "Your account has been linked.\n"
+                            "Type *menu* to browse our PRO catalog."
+                        )])
+                    else:
+                        # Create pending partner — admin must verify on dbd.go.th and assign pricelist
+                        odoo_execute("res.partner", "create", [{
+                            "name": company,
+                            "vat": digits,
+                            "customer_rank": 1,
+                            "is_company": True,
+                            "country_id": 216,  # Thailand
+                            "comment": (
+                                f"line:{user_id}\n"
+                                f"Registered via LINE bot — {display}\n"
+                                f"⚠️ Pending verification — check dbd.go.th reg: {digits}"
+                            ),
+                        }])
+                        partner = _line_get_partner(user_id)
+                        line_reply(reply_token, [line_text(
+                            f"✅ Welcome, {company}!\n\n"
+                            "Your account has been created.\n"
+                            "You can browse our catalog and place orders.\n\n"
+                            "📋 Our team will confirm your PRO pricing shortly.\n"
+                            "Type *menu* to get started."
+                        )])
                 else:
+                    if reason == "invalid_format":
+                        msg = "❌ Invalid number format.\nThai DBD registration numbers have 13 digits."
+                    else:
+                        msg = "❌ Invalid registration number.\nPlease check and try again."
                     line_reply(reply_token, [line_quick_reply(
-                        "❌ We could not verify your company with DBD Thailand.\n\n"
-                        "Please check your company name and registration number, "
-                        "or contact us for assistance:",
-                        [("💬 Contact us", "HELP")]
+                        msg + "\n\nNeed help?",
+                        [("🔄 Try again", "NEW"), ("💬 Contact us", "HELP")]
                     )])
                 continue
 
