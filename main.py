@@ -4398,6 +4398,10 @@ async def webhook_line(request: Request):
                 except Exception:
                     pass
 
+        # ── My LINE ID (admin helper) ──────────────────────────────────────
+        elif text == "!myid":
+            line_reply(reply_token, [line_text(f"Your LINE User ID:\n{user_id}")])
+
         # ── Help ──────────────────────────────────────────────────────────
         elif text_low in ("help", "?"):
             line_reply(reply_token, [line_text(
