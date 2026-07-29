@@ -71,6 +71,12 @@ async def _poll_ecwid_orders():
                 if eco_total <= 0:
                     continue
 
+                # Blocage permanent : les commandes avant juillet 2026 sont deja
+                # suivies sur un autre systeme, on ne les importe plus dans Odoo.
+                eco_date = _parse_ecwid_date(eco.get("createDate") or eco.get("updateDate"))
+                if eco_date and eco_date < "2026-07-01":
+                    continue
+
                 ecwid_id  = str(eco.get("id") or eco.get("orderNumber", ""))
                 order_num = str(eco.get("orderNumber") or eco.get("id", ""))
                 ref      = f"ECWID-{ecwid_id}"
@@ -3259,6 +3265,64 @@ def debug_ecwid_order(order_num: str):
             for i in items[:3]
         ],
     }
+
+
+@app.post("/sync-ecwid-products")
+async def sync_ecwid_products(request: Request):
+    """
+    Sync price, category, enabled status for Ecwid products.
+    Body: list of {sku, prix, cat_ecwid, delete}
+    """
+    items = await request.json()
+    if not isinstance(items, list):
+        return {"error": "expected list"}
+
+    # Load all Ecwid products indexed by SKU
+    all_prods, offset = [], 0
+    while True:
+        data = ecwid_get("/products", {"limit": 100, "offset": offset})
+        batch = data.get("items", [])
+        all_prods.extend(batch)
+        if len(batch) < 100:
+            break
+        offset += 100
+    by_sku = {(p.get("sku") or "").strip().upper(): p for p in all_prods if p.get("sku")}
+
+    # Load Ecwid categories
+    cat_data = ecwid_get("/categories").get("items", [])
+    cat_map  = {c["name"].lower(): c["id"] for c in cat_data}
+
+    updated, disabled, skipped = 0, 0, 0
+    for row in items:
+        sku = (row.get("sku") or "").strip().upper()
+        if not sku or sku not in by_sku:
+            skipped += 1
+            continue
+        p   = by_sku[sku]
+        eid = p["id"]
+
+        if row.get("delete"):
+            ecwid_put(f"/products/{eid}", {"enabled": False})
+            disabled += 1
+            continue
+
+        payload = {}
+        prix = row.get("prix")
+        if prix and abs(float(prix) - (p.get("price") or 0)) > 0.01:
+            payload["price"] = float(prix)
+
+        cat_name = (row.get("cat_ecwid") or "").lower()
+        if cat_name:
+            cid = cat_map.get(cat_name)
+            if cid and cid not in (p.get("categoryIds") or []):
+                payload["categoryIds"]      = [cid]
+                payload["defaultCategoryId"] = cid
+
+        if payload:
+            ecwid_put(f"/products/{eid}", payload)
+            updated += 1
+
+    return {"status": "ok", "updated": updated, "disabled": disabled, "skipped": skipped}
 
 
 @app.get("/delete-ecwid-imports")
