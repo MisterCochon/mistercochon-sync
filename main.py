@@ -3970,7 +3970,7 @@ async def webhook_line(request: Request):
                 line_reply(reply_token, [line_text("Type *menu* to browse products.")])
             continue
 
-        # ── Add product to cart ────────────────────────────────────────────
+        # ── Add product to cart: show qty buttons (stateless) ─────────────
         if text.startswith("__add_"):
             sku = text[6:].strip().upper()
             sess = _line_sessions.get(user_id, {})
@@ -3985,42 +3985,57 @@ async def webhook_line(request: Request):
                 prod = results[0] if results else None
             if prod:
                 price = _line_get_client_price(prod["id"], prod.get("list_price", 0), pricelist)
-                _line_sessions[user_id] = {
-                    **sess,
-                    "pending_product": {"sku": sku, "name": prod.get("name", sku),
-                                        "price": price, "product_id": prod["id"]}
-                }
                 short = _shorten_product_name(prod.get("name", sku))
+                # Embed sku+price in each qty button — no session needed
+                price_int = int(round(price))
                 line_reply(reply_token, [line_quick_reply(
-                    f"🛒 *{short}*\n"
+                    f"*{short}*\n"
                     f"Unit price: {price:.0f} ฿\n\n"
-                    f"Enter quantity:",
-                    [("1 unit", "1"), ("2 units", "2"), ("3 units", "3"),
-                     ("5 units", "5"), ("10 units", "10"), ("Cancel", "cancel")]
+                    f"Select quantity:",
+                    [(f"× {q}", f"__aq_{sku}_{price_int}_{q}")
+                     for q in [1, 2, 3, 5, 10]] + [("Cancel", "cancel")]
                 )])
             else:
                 line_reply(reply_token, [line_text(f"Product {sku} not found.")])
             continue
 
-        # ── Quantity input for pending product ─────────────────────────────
-        sess = _line_sessions.get(user_id, {})
-        pending = sess.get("pending_product")
-        if pending and re.match(r"^\d+$", text) and 1 <= int(text) <= 999:
-            qty = int(text)
+        # ── Qty button pressed: __aq_{sku}_{price}_{qty} ──────────────────
+        if text.startswith("__aq_"):
+            parts = text.split("_")
+            # format: __aq_SKU_PRICE_QTY  → parts = ['', '', 'aq', sku, price, qty]
+            try:
+                qty  = int(parts[-1])
+                price_int = int(parts[-2])
+                sku  = "_".join(parts[3:-2]).upper()
+                price = float(price_int)
+            except (ValueError, IndexError):
+                line_reply(reply_token, [line_text("Invalid selection. Please try again.")])
+                continue
+            # Fetch product name
+            results = odoo_execute("product.product", "search_read",
+                [[["default_code", "=", sku], ["active", "=", True]]],
+                {"fields": ["id", "name", "default_code"], "limit": 1,
+                 "context": {"lang": "en_US"}}
+            )
+            prod = results[0] if results else {"name": sku, "default_code": sku, "id": 0}
+            sess = _line_sessions.get(user_id, {})
             cart = list(sess.get("cart", []))
             for item in cart:
-                if item["sku"] == pending["sku"]:
+                if item["sku"] == sku:
                     item["qty"] += qty
                     break
             else:
-                cart.append({**pending, "qty": qty})
-            _line_sessions[user_id] = {**sess, "cart": cart, "pending_product": None}
+                cart.append({"sku": sku, "name": prod.get("name", sku),
+                              "price": price, "product_id": prod.get("id", 0), "qty": qty})
+            _line_sessions[user_id] = {**sess, "cart": cart}
             total = sum(i["price"] * i["qty"] for i in cart)
             cart_text = "\n".join(
-                f"• {i['name'][:28]} x{i['qty']} = {i['price']*i['qty']:.0f} ฿" for i in cart
+                f"• {_shorten_product_name(i['name'])[:30]} ×{i['qty']} = {i['price']*i['qty']:.0f} ฿"
+                for i in cart
             )
+            short = _shorten_product_name(prod.get("name", sku))
             line_reply(reply_token, [line_quick_reply(
-                f"Added: {_shorten_product_name(pending['name'])} × {qty}\n\n"
+                f"Added: {short} × {qty}\n\n"
                 f"── Your order ──────────────\n"
                 f"{cart_text}\n"
                 f"────────────────────────────\n"
