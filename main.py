@@ -3759,25 +3759,15 @@ def _line_create_order(partner: dict, items: list) -> str:
 
     order_id = odoo_execute("sale.order", "create", [order_vals])
 
-    all_prods = odoo_execute("product.product", "search_read",
-        [[["active", "=", True]]],
-        {"fields": ["id", "name", "default_code", "list_price", "uom_id"], "limit": 2000,
-         "context": {"lang": "en_US"}}
-    )
-    prod_by_sku = {str(p["default_code"]).strip().upper(): p
-                   for p in all_prods if p.get("default_code")}
-
     lines_ok, lines_nok = [], []
     for sku, qty in items:
-        p = prod_by_sku.get(sku)
-        if not p:
-            # Fallback: direct lookup in case bulk load missed it
-            hits = odoo_execute("product.product", "search_read",
-                [[["default_code", "=", sku], ["active", "=", True]]],
-                {"fields": ["id", "name", "default_code", "list_price", "uom_id"],
-                 "limit": 1, "context": {"lang": "en_US"}}
-            )
-            p = hits[0] if hits else None
+        # Direct lookup per SKU — more reliable than bulk load
+        hits = odoo_execute("product.product", "search_read",
+            [[["default_code", "=", sku], ["active", "=", True]]],
+            {"fields": ["id", "name", "default_code", "list_price", "uom_id"],
+             "limit": 1, "context": {"lang": "en_US"}}
+        )
+        p = hits[0] if hits else None
         if not p:
             lines_nok.append(sku)
             continue
