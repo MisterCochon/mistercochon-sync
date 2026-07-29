@@ -3267,6 +3267,60 @@ def debug_ecwid_order(order_num: str):
     }
 
 
+@app.post("/create-ecwid-products")
+async def create_ecwid_products(request: Request):
+    """
+    Create new products in Ecwid.
+    Body: list of {name, sku, price, category}
+    """
+    items = await request.json()
+    if not isinstance(items, list):
+        return {"error": "expected list"}
+
+    cat_data = ecwid_get("/categories").get("items", [])
+    cat_map  = {c["name"].lower(): c["id"] for c in cat_data}
+
+    created, skipped, errors = 0, 0, []
+    for row in items:
+        sku  = (row.get("sku") or "").strip()
+        name = (row.get("name") or "").strip()
+        if not sku or not name:
+            skipped += 1
+            continue
+
+        payload = {
+            "name":    name,
+            "sku":     sku,
+            "price":   float(row.get("price") or 0),
+            "enabled": True,
+            "weight":  0,
+        }
+        cat_name = (row.get("category") or "").lower()
+        if cat_name:
+            cid = cat_map.get(cat_name)
+            if not cid:
+                for k, v in cat_map.items():
+                    if cat_name in k or k in cat_name:
+                        cid = v
+                        break
+            if cid:
+                payload["categoryIds"]       = [cid]
+                payload["defaultCategoryId"] = cid
+
+        r = requests.post(
+            f"https://app.ecwid.com/api/v3/{ECWID_STORE_ID}/products",
+            json=payload,
+            headers={"Authorization": f"Bearer {ECWID_TOKEN}", "Content-Type": "application/json"},
+            timeout=30,
+        )
+        if r.status_code in (200, 201):
+            created += 1
+        else:
+            errors.append({"sku": sku, "status": r.status_code, "body": r.text[:200]})
+
+    return {"status": "ok", "created": created, "skipped": skipped, "errors": errors}
+
+
 @app.post("/sync-ecwid-products")
 async def sync_ecwid_products(request: Request):
     """
