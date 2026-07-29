@@ -3241,6 +3241,24 @@ async def webhook_stripe(request: Request):
     return {"status": "ok", "event": event_type, "ecwid_ref": ecwid_ref, "result": result}
 
 
+# ─── LINE Rich Menu setup ────────────────────────────────────────────────────
+
+@app.get("/setup-richmenu")
+def setup_richmenu(secret: str = ""):
+    """Create/replace the LINE Rich Menu. Call once: /setup-richmenu?secret=XXX"""
+    admin_secret = os.getenv("ADMIN_SECRET", "")
+    if not admin_secret or secret != admin_secret:
+        return {"status": "error", "error": "Invalid secret"}
+    try:
+        from setup_richmenu import make_image, delete_existing, create_and_activate
+        img = make_image()
+        delete_existing(LINE_CHANNEL_ACCESS_TOKEN)
+        mid = create_and_activate(LINE_CHANNEL_ACCESS_TOKEN, img)
+        return {"status": "ok", "richMenuId": mid}
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+
+
 # ─── Utilitaires import Ecwid ────────────────────────────────────────────────
 
 @app.get("/debug-ecwid-order/{order_num}")
