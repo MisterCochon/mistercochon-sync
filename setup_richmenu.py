@@ -124,7 +124,7 @@ def draw_icon(d: ImageDraw, cx: int, cy: int, name: str, size: int):
         r = int(s * 0.48)
         d.ellipse([cx - r, cy - r, cx + r, cy + r], outline=c, width=lw)
         try:
-            fq = ImageFont.truetype(FONT_EN_BOLD, int(s * 0.72))
+            fq = ImageFont.truetype(FONT_EN_BOLD, int(s * 0.65))
         except Exception:
             fq = ImageFont.load_default()
         bb = d.textbbox((0, 0), "?", font=fq)
@@ -154,15 +154,15 @@ def make_image() -> Image.Image:
     d   = ImageDraw.Draw(img)
 
     try:
-        f_en = ImageFont.truetype(FONT_EN_BOLD, 46)
+        f_en = ImageFont.truetype(FONT_EN_BOLD, 62)
     except Exception:
         f_en = ImageFont.load_default()
     try:
-        f_th = ImageFont.truetype(FONT_THAI, 36)
+        f_th = ImageFont.truetype(FONT_THAI, 88)
     except Exception:
         f_th = f_en
 
-    ICON_SIZE = 100   # icon fits in this box
+    ICON_SIZE = 150   # icon fits in this box
 
     for (row, col, bg, icon_name, en_label, th_label, _action) in CELLS:
         x0, y0 = col * CW, row * CH
@@ -176,30 +176,29 @@ def make_image() -> Image.Image:
 
         cx = x0 + CW // 2
 
-        # Vertical layout: icon — EN label — TH label
-        # Total content height: ICON_SIZE + gap + en_h + gap + th_h
+        # Vertical layout: icon — TH label (big) — EN label (small)
         en_bb = d.textbbox((0, 0), en_label, font=f_en)
         en_h  = en_bb[3] - en_bb[1]
         th_bb = d.textbbox((0, 0), th_label, font=f_th)
         th_h  = th_bb[3] - th_bb[1]
 
         gap    = 14
-        total  = ICON_SIZE + gap + en_h + gap // 2 + th_h
+        total  = ICON_SIZE + gap + th_h + gap // 2 + en_h
         top    = y0 + (CH - total) // 2
 
         # Icon center
         icon_cy = top + ICON_SIZE // 2
         draw_icon(d, cx, icon_cy, icon_name, ICON_SIZE)
 
-        # English label
-        en_y = top + ICON_SIZE + gap
-        en_w = en_bb[2] - en_bb[0]
-        d.text((cx - en_w // 2, en_y), en_label, font=f_en, fill=WHITE)
-
-        # Thai label
-        th_y = en_y + en_h + gap // 2
+        # Thai label (primary — larger, on top)
+        th_y = top + ICON_SIZE + gap
         th_w = th_bb[2] - th_bb[0]
-        d.text((cx - th_w // 2, th_y), th_label, font=f_th, fill=LIGHT)
+        d.text((cx - th_w // 2, th_y), th_label, font=f_th, fill=WHITE)
+
+        # English label (secondary — smaller, below)
+        en_y = th_y + th_h + gap // 2
+        en_w = en_bb[2] - en_bb[0]
+        d.text((cx - en_w // 2, en_y), en_label, font=f_en, fill=LIGHT)
 
     return img
 
