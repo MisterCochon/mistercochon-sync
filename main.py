@@ -3662,10 +3662,7 @@ def _shorten_product_name(name: str) -> str:
 
 
 def _line_build_carousel(products: list, pricelist, page: int = 0) -> list:
-    """
-    Build LINE carousel template messages (max 10 cards per carousel).
-    Returns list of LINE message dicts.
-    """
+    """Build Flex Message carousel — rich branded cards."""
     PAGE = 10
     start = page * PAGE
     page_prods = products[start:start + PAGE]
@@ -3673,56 +3670,93 @@ def _line_build_carousel(products: list, pricelist, page: int = 0) -> list:
         return [line_text("No products found in this category.")]
 
     img_map = _line_get_ecwid_images()
-    columns = []
+    bubbles = []
 
     for p in page_prods:
-        sku = str(p.get("default_code") or "").strip().upper()
-        name = (p.get("name") or "")
+        sku   = str(p.get("default_code") or "").strip().upper()
+        name  = p.get("name") or ""
         price = _line_get_client_price(p["id"], p.get("list_price", 0), pricelist)
-        img = img_map.get(sku)  # None if no real image
-        desc = str(p.get("description_sale") or "").strip()
+        desc  = str(p.get("description_sale") or "").strip()
+        short = _shorten_product_name(name)
+        img   = img_map.get(sku)
 
-        # Build info lines: price, ref, description
-        info_parts = [f"{price:.0f} ฿"]
-        if sku:
-            info_parts.append(f"Ref: {sku}")
-        if desc:
-            info_parts.append(desc[:60])
-        card_text = "\n".join(info_parts)[:120]
-
-        col = {
-            "title": _shorten_product_name(name),
-            "text": card_text,
-            "actions": [
-                {"type": "postback", "label": "Add to order",
-                 "data": f"__add_{p['id']}_{sku}", "displayText": f"Add: {_shorten_product_name(name)[:30]}"},
-                {"type": "message", "label": "My cart", "text": "cart"},
-            ]
-        }
+        # Header contents
+        header_contents = [
+            {"type": "text", "text": short, "weight": "bold", "size": "md",
+             "color": "#FFFFFF", "wrap": True, "maxLines": 2}
+        ]
         if img:
-            col["thumbnailImageUrl"] = img
+            header_contents.insert(0, {
+                "type": "image", "url": img, "size": "full",
+                "aspectRatio": "20:13", "aspectMode": "cover"
+            })
 
-        columns.append(col)
+        # Body contents
+        body_contents = [
+            {"type": "text", "text": f"{price:,.0f} ฿",
+             "weight": "bold", "size": "xxl", "color": "#C8102E"},
+            {"type": "text", "text": f"Ref: {sku}", "size": "xs",
+             "color": "#888888", "margin": "xs"},
+        ]
+        if desc:
+            body_contents.append({
+                "type": "text", "text": desc[:80], "size": "sm",
+                "color": "#444444", "wrap": True, "margin": "sm"
+            })
 
-    carousel = {
-        "type": "template",
-        "altText": f"French Delicatessen — Products (page {page + 1})",
-        "template": {
-            "type": "carousel",
-            "columns": columns,
+        bubble = {
+            "type": "bubble",
+            "size": "kilo",
+            "header": {
+                "type": "box", "layout": "vertical",
+                "backgroundColor": "#1A3A6B", "paddingAll": "14px",
+                "contents": header_contents
+            },
+            "body": {
+                "type": "box", "layout": "vertical",
+                "paddingAll": "14px", "spacing": "none",
+                "contents": body_contents
+            },
+            "footer": {
+                "type": "box", "layout": "vertical",
+                "paddingAll": "10px", "spacing": "xs",
+                "contents": [
+                    {
+                        "type": "button", "style": "primary",
+                        "color": "#1A3A6B", "height": "sm",
+                        "action": {
+                            "type": "postback", "label": "Add to order",
+                            "data": f"__add_{p['id']}_{sku}",
+                            "displayText": f"Add: {short[:30]}"
+                        }
+                    },
+                    {
+                        "type": "button", "style": "secondary",
+                        "height": "sm",
+                        "action": {"type": "message", "label": "My cart", "text": "cart"}
+                    }
+                ]
+            }
         }
-    }
-    messages = [carousel]
+        bubbles.append(bubble)
 
-    # Navigation: previous / next
+    flex_msg = {
+        "type": "flex",
+        "altText": f"French Delicatessen — Catalog (page {page + 1})",
+        "contents": {"type": "carousel", "contents": bubbles}
+    }
+    messages = [flex_msg]
+
+    # Navigation
     nav = []
     if page > 0:
         nav.append(("◀ Previous", f"__page_{page - 1}"))
     if start + PAGE < len(products):
         nav.append(("Next ▶", f"__page_{page + 1}"))
     if nav:
+        total_pages = ((len(products) - 1) // PAGE) + 1
         messages.append(line_quick_reply(
-            f"Page {page + 1} / {((len(products) - 1) // PAGE) + 1}",
+            f"Page {page + 1} / {total_pages}",
             nav
         ))
 
@@ -3806,6 +3840,81 @@ def _line_create_order(partner: dict, items: list) -> str:
         msg.append("⚠️ SKUs not found: " + ", ".join(lines_nok))
     msg.append("Our team will contact you to confirm delivery. Thank you!")
     return "\n".join(msg)
+
+
+def _line_cart_messages(cart: list, added_name: str = None, added_qty: int = None) -> list:
+    """Return LINE messages showing the cart as a clean Flex bubble."""
+    total = sum(i["price"] * i["qty"] for i in cart)
+    n = len(cart)
+
+    header_text = f"Your Order  ({n} item{'s' if n > 1 else ''})"
+    if added_name and added_qty:
+        header_text = f"Added: {added_name[:28]} ×{added_qty}"
+
+    body_rows = []
+    for i in cart:
+        short = _shorten_product_name(i["name"])[:28]
+        row_total = i["price"] * i["qty"]
+        body_rows.append({
+            "type": "box", "layout": "horizontal", "margin": "sm",
+            "contents": [
+                {"type": "text", "text": f"{short} ×{i['qty']}", "size": "sm",
+                 "color": "#333333", "wrap": True, "flex": 4},
+                {"type": "text", "text": f"{row_total:,.0f} ฿", "size": "sm",
+                 "color": "#333333", "align": "end", "flex": 2}
+            ]
+        })
+
+    body_rows += [
+        {"type": "separator", "margin": "md"},
+        {
+            "type": "box", "layout": "horizontal", "margin": "md",
+            "contents": [
+                {"type": "text", "text": "TOTAL", "weight": "bold", "size": "md",
+                 "color": "#1A3A6B", "flex": 4},
+                {"type": "text", "text": f"{total:,.0f} ฿", "weight": "bold",
+                 "size": "md", "color": "#C8102E", "align": "end", "flex": 2}
+            ]
+        }
+    ]
+
+    bubble = {
+        "type": "bubble",
+        "header": {
+            "type": "box", "layout": "vertical",
+            "backgroundColor": "#1A3A6B", "paddingAll": "14px",
+            "contents": [
+                {"type": "text", "text": header_text, "weight": "bold",
+                 "size": "md", "color": "#FFFFFF", "wrap": True}
+            ]
+        },
+        "body": {
+            "type": "box", "layout": "vertical",
+            "paddingAll": "14px",
+            "contents": body_rows
+        },
+        "footer": {
+            "type": "box", "layout": "vertical",
+            "paddingAll": "10px", "spacing": "xs",
+            "contents": [
+                {
+                    "type": "button", "style": "primary", "height": "sm",
+                    "color": "#1A3A6B",
+                    "action": {"type": "message", "label": "Place order", "text": "checkout"}
+                },
+                {
+                    "type": "button", "style": "secondary", "height": "sm",
+                    "action": {"type": "message", "label": "Continue shopping", "text": "menu"}
+                },
+                {
+                    "type": "button", "style": "secondary", "height": "sm",
+                    "action": {"type": "message", "label": "Clear cart", "text": "cancel"}
+                }
+            ]
+        }
+    }
+    return [{"type": "flex", "altText": f"Your order — {total:,.0f} ฿",
+             "contents": bubble}]
 
 
 # ── Webhook ───────────────────────────────────────────────────────────────────
@@ -4041,21 +4150,8 @@ async def webhook_line(request: Request):
                               "price": price, "product_id": product_id, "qty": qty})
             _line_sessions[user_id] = {**sess, "cart": cart,
                                         "pending_sku": None, "pending_price": None}
-            total = sum(i["price"] * i["qty"] for i in cart)
-            cart_text = "\n".join(
-                f"• {_shorten_product_name(i['name'])[:30]} ×{i['qty']} = {i['price']*i['qty']:.0f} ฿"
-                for i in cart
-            )
-            short = _shorten_product_name(prod.get("name", sku))
-            line_reply(reply_token, [line_quick_reply(
-                f"Added: {short} × {qty}\n\n"
-                f"── Your order ──────────────\n"
-                f"{cart_text}\n"
-                f"────────────────────────────\n"
-                f"Total: {total:.0f} ฿  ({len(cart)} item{'s' if len(cart)>1 else ''})",
-                [("Continue shopping", "menu"), ("Place order", "checkout"),
-                 ("Clear cart", "cancel")]
-            )])
+            short = _shorten_product_name(name)
+            line_reply(reply_token, _line_cart_messages(cart, short, qty))
             continue
 
         # ── Qty button: __aq_{product_id}_{sku}_{price}_{qty} ────────────
@@ -4088,21 +4184,8 @@ async def webhook_line(request: Request):
                 cart.append({"sku": sku, "name": name,
                               "price": price, "product_id": product_id, "qty": qty})
             _line_sessions[user_id] = {**sess, "cart": cart}
-            total = sum(i["price"] * i["qty"] for i in cart)
-            cart_text = "\n".join(
-                f"• {_shorten_product_name(i['name'])[:30]} ×{i['qty']} = {i['price']*i['qty']:.0f} ฿"
-                for i in cart
-            )
             short = _shorten_product_name(name)
-            line_reply(reply_token, [line_quick_reply(
-                f"Added: {short} × {qty}\n\n"
-                f"── Your order ──────────────\n"
-                f"{cart_text}\n"
-                f"────────────────────────────\n"
-                f"Total: {total:.0f} ฿  ({len(cart)} item{'s' if len(cart)>1 else ''})",
-                [("Continue shopping", "menu"), ("Place order", "checkout"),
-                 ("Clear cart", "cancel")]
-            )])
+            line_reply(reply_token, _line_cart_messages(cart, short, qty))
             continue
 
         # ── Cart display ───────────────────────────────────────────────────
@@ -4110,19 +4193,11 @@ async def webhook_line(request: Request):
             cart = _line_sessions.get(user_id, {}).get("cart", [])
             if not cart:
                 line_reply(reply_token, [line_quick_reply(
-                    "🛒 Your cart is empty.",
-                    [("📋 Browse catalog", "menu")]
+                    "Your cart is empty.",
+                    [("Browse catalog", "menu"), ("Reorder last", "reorder")]
                 )])
             else:
-                total = sum(i["price"] * i["qty"] for i in cart)
-                cart_text = "\n".join(
-                    f"• {i['name'][:28]} x{i['qty']} = {i['price']*i['qty']:.0f} ฿" for i in cart
-                )
-                line_reply(reply_token, [line_quick_reply(
-                    f"🛒 *Your cart ({len(cart)} item{'s' if len(cart)>1 else ''} — {total:.0f} ฿):*\n\n{cart_text}",
-                    [("🛍️ Keep shopping", "menu"), ("✅ Confirm order", "checkout"),
-                     ("🗑️ Clear cart", "cancel")]
-                )])
+                line_reply(reply_token, _line_cart_messages(cart))
             continue
 
         # ── Checkout ───────────────────────────────────────────────────────
@@ -4227,7 +4302,62 @@ async def webhook_line(request: Request):
                     state = {"draft": "Draft", "sale": "Confirmed",
                               "done": "Done", "cancel": "Cancelled"}.get(o["state"], o["state"])
                     lines.append(f"• {o['name']} — {o['amount_total']:.0f} ฿ — {state} ({date})")
-                line_reply(reply_token, [line_text("\n".join(lines))])
+                line_reply(reply_token, [line_quick_reply(
+                    "\n".join(lines),
+                    [("Reorder last", "reorder"), ("New order", "menu")]
+                )])
+
+        # ── Reorder last confirmed order ───────────────────────────────────
+        elif text_low in ("reorder", "recommander", "last order"):
+            last_orders = odoo_execute("sale.order", "search_read",
+                [[["partner_id", "=", partner["id"]], ["state", "in", ["sale", "done"]]]],
+                {"fields": ["id", "name", "date_order"], "limit": 1, "order": "date_order desc"}
+            )
+            if not last_orders:
+                line_reply(reply_token, [line_quick_reply(
+                    "No previous confirmed orders found.",
+                    [("Browse catalog", "menu")]
+                )])
+            else:
+                last_order = last_orders[0]
+                order_lines = odoo_execute("sale.order.line", "search_read",
+                    [[["order_id", "=", last_order["id"]]]],
+                    {"fields": ["product_id", "product_uom_qty", "price_unit", "name"], "limit": 50}
+                )
+                if not order_lines:
+                    line_reply(reply_token, [line_quick_reply(
+                        f"Order {last_order['name']} has no items.",
+                        [("Browse catalog", "menu")]
+                    )])
+                else:
+                    pids = [ln["product_id"][0] for ln in order_lines if ln.get("product_id")]
+                    sku_data = odoo_execute("product.product", "search_read",
+                        [[["id", "in", pids]]],
+                        {"fields": ["id", "default_code"], "limit": 100}
+                    )
+                    sku_by_id = {p["id"]: str(p.get("default_code") or "").upper() for p in sku_data}
+                    new_cart = []
+                    for ln in order_lines:
+                        if not ln.get("product_id"):
+                            continue
+                        pid   = ln["product_id"][0]
+                        pname = ln["product_id"][1] if isinstance(ln["product_id"], list) else str(ln["product_id"])
+                        qty   = max(1, int(ln.get("product_uom_qty", 1)))
+                        price = float(ln.get("price_unit", 0))
+                        price = _line_get_client_price(pid, price, pricelist)
+                        sku   = sku_by_id.get(pid, "")
+                        new_cart.append({"product_id": pid, "sku": sku,
+                                          "name": pname, "price": price, "qty": qty})
+                    if new_cart:
+                        sess = _line_sessions.get(user_id, {})
+                        _line_sessions[user_id] = {**sess, "cart": new_cart}
+                        date_str = str(last_order.get("date_order", ""))[:10]
+                        line_reply(reply_token,
+                            [line_text(f"Cart loaded from order {last_order['name']} ({date_str}).")]
+                            + _line_cart_messages(new_cart)
+                        )
+                    else:
+                        line_reply(reply_token, [line_text("Could not load items from last order.")])
 
         # ── Help ──────────────────────────────────────────────────────────
         elif text_low in ("help", "?"):
@@ -4237,8 +4367,9 @@ async def webhook_line(request: Request):
                 "🛒 *cart* — View your current cart\n"
                 "✅ *checkout* — Confirm & place your order\n"
                 "🗑️ *cancel* — Clear your cart\n"
-                "📦 *orders* — View your recent orders\n\n"
-                "Tap *🛒 Add to order* on any product, then choose a quantity.\n"
+                "📦 *orders* — View your recent orders\n"
+                "🔄 *reorder* — Reload your last order into cart\n\n"
+                "Tap *Add to order* on any product, then choose a quantity.\n"
                 "You can add multiple products before checking out.\n\n"
                 "📞 Support: @jfbuc"
             )])
