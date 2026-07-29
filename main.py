@@ -3662,13 +3662,22 @@ def _line_build_carousel(products: list, pricelist, page: int = 0) -> list:
 
     for p in page_prods:
         sku = str(p.get("default_code") or "").strip().upper()
-        name = (p.get("name") or "")[:40]
+        name = (p.get("name") or "")
         price = _line_get_client_price(p["id"], p.get("list_price", 0), pricelist)
         img = img_map.get(sku)  # None if no real image
+        desc = str(p.get("description_sale") or "").strip()
+
+        # Build info lines: price, ref, description
+        info_parts = [f"{price:.0f} ฿"]
+        if sku:
+            info_parts.append(f"Ref: {sku}")
+        if desc:
+            info_parts.append(desc[:60])
+        card_text = "\n".join(info_parts)[:120]
 
         col = {
             "title": _shorten_product_name(name),
-            "text": f"{price:.0f} ฿",
+            "text": card_text,
             "actions": [
                 {"type": "postback", "label": "Add to order",
                  "data": f"__add_{sku}", "displayText": f"Add: {_shorten_product_name(name)[:30]}"},
@@ -4055,7 +4064,7 @@ async def webhook_line(request: Request):
                     domain.append(["product_tag_ids", "in", [line_tag_id]])
             prods = odoo_execute("product.product", "search_read",
                 [domain],
-                {"fields": ["id", "name", "default_code", "list_price"], "limit": 200,
+                {"fields": ["id", "name", "default_code", "list_price", "description_sale"], "limit": 200,
                  "context": {"lang": "en_US"}}
             )
             if not prods:
@@ -4085,7 +4094,7 @@ async def webhook_line(request: Request):
                         domain.append(["product_tag_ids", "in", [line_tag_id]])
                 prods = odoo_execute("product.product", "search_read",
                     [domain],
-                    {"fields": ["id", "name", "default_code", "list_price"], "limit": 200,
+                    {"fields": ["id", "name", "default_code", "list_price", "description_sale"], "limit": 200,
                      "context": {"lang": "en_US"}}
                 )
                 _line_sessions[user_id] = {"category_products": prods, "page": 0}
