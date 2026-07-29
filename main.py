@@ -4377,6 +4377,27 @@ async def webhook_line(request: Request):
                     else:
                         line_reply(reply_token, [line_text("Could not load items from last order.")])
 
+        # ── Contact (human support) ────────────────────────────────────────
+        elif text_low in ("contact", "ติดต่อ", "ติดต่อเรา"):
+            client_name = partner.get("name", "Unknown client")
+            line_reply(reply_token, [line_text(
+                "Our team will contact you shortly.\n\n"
+                "ทีมงานของเราจะติดต่อกลับหาคุณโดยเร็ว\n\n"
+                "📞 LINE: @jfbuc"
+            )])
+            # Notify admin
+            admin_id = os.getenv("LINE_ADMIN_ID", "")
+            if admin_id:
+                try:
+                    requests.post("https://api.line.me/v2/bot/message/push",
+                        headers={"Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}",
+                                 "Content-Type": "application/json"},
+                        json={"to": admin_id, "messages": [{"type": "text",
+                            "text": f"📩 Contact request\nClient: {client_name}\nLINE ID: {user_id}\n\nReply directly in OA Manager."}]},
+                        timeout=5)
+                except Exception:
+                    pass
+
         # ── Help ──────────────────────────────────────────────────────────
         elif text_low in ("help", "?"):
             line_reply(reply_token, [line_text(

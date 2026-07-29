@@ -48,7 +48,7 @@ CELLS = [
     (0, 2, NAVY, "reorder",  "Reorder",          "สั่งซ้ำ",            "reorder"),
     (1, 0, NAVY, "orders",   "My Orders",        "ประวัติคำสั่งซื้อ",  "orders"),
     (1, 1, NAVY, "help",     "Help",             "ช่วยเหลือ",          "help"),
-    (1, 2, RED,  "contact",  "Contact us",       "ติดต่อเรา",          "HELP"),
+    (1, 2, RED,  "contact",  "Contact us",       "ติดต่อเรา",          "contact"),
 ]
 
 
