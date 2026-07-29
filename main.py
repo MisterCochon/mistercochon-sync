@@ -3630,6 +3630,23 @@ def _line_get_client_price(product_id: int, list_price: float, pricelist) -> flo
     return list_price
 
 
+def _shorten_product_name(name: str) -> str:
+    """Shorten Odoo product names for LINE carousel (max 40 chars)."""
+    import re as _re
+    # "Chipolata (weight: 1000 gr / Taste: Herbs)" → "Chipolata 1kg · Herbs"
+    m = _re.match(r"^(.+?)\s*\(weight:\s*(\d+)\s*gr\s*/\s*Taste:\s*(.+?)\)\s*$", name, _re.I)
+    if m:
+        base, weight, taste = m.group(1).strip(), m.group(2), m.group(3).strip()
+        kg = f"{int(weight)//1000}kg" if int(weight) >= 1000 else f"{weight}g"
+        return f"{base} {kg} · {taste}"[:40]
+    # "Chipolata (weight: 300 gr)" → "Chipolata 300g"
+    m2 = _re.match(r"^(.+?)\s*\(weight:\s*(\d+)\s*gr\)\s*$", name, _re.I)
+    if m2:
+        base, weight = m2.group(1).strip(), m2.group(2)
+        return f"{base} {weight}g"[:40]
+    return name[:40]
+
+
 def _line_build_carousel(products: list, pricelist, page: int = 0) -> list:
     """
     Build LINE carousel template messages (max 10 cards per carousel).
@@ -3653,11 +3670,12 @@ def _line_build_carousel(products: list, pricelist, page: int = 0) -> list:
         col = {
             "thumbnailImageUrl": img,
             "imageSize": "cover",
-            "title": name,
+            "title": _shorten_product_name(name),
             "text": f"💰 {price:.0f} ฿",
             "actions": [
-                {"type": "message", "label": "🛒 Add to order", "text": f"__add_{sku}"},
-                {"type": "message", "label": "🛒 My cart",      "text": "cart"},
+                {"type": "postback", "label": "🛒 Add to order",
+                 "data": f"__add_{sku}", "displayText": f"Add: {_shorten_product_name(name)[:30]}"},
+                {"type": "message", "label": "🛒 My cart", "text": "cart"},
             ]
         }
         columns.append(col)
@@ -3779,14 +3797,18 @@ async def webhook_line(request: Request):
         return {"status": "ignored"}
 
     for event in body.get("events", []):
-        if event.get("type") != "message":
-            continue
-        if event.get("message", {}).get("type") != "text":
+        event_type = event.get("type")
+
+        # Accept both text messages and postback events
+        if event_type == "postback":
+            text = event.get("postback", {}).get("data", "").strip()
+        elif event_type == "message" and event.get("message", {}).get("type") == "text":
+            text = event["message"]["text"].strip()
+        else:
             continue
 
         reply_token = event.get("replyToken", "")
         user_id = event.get("source", {}).get("userId", "")
-        text = event["message"]["text"].strip()
         text_low = text.lower()
 
         partner = _line_get_partner(user_id)
