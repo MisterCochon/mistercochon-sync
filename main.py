@@ -3760,28 +3760,33 @@ def _line_create_order(partner: dict, items: list) -> str:
     order_id = odoo_execute("sale.order", "create", [order_vals])
 
     lines_ok, lines_nok = [], []
-    for sku, qty in items:
-        # Direct lookup per SKU — more reliable than bulk load
-        hits = odoo_execute("product.product", "search_read",
-            [[["default_code", "=", sku], ["active", "=", True]]],
-            {"fields": ["id", "name", "default_code", "list_price", "uom_id"],
-             "limit": 1, "context": {"lang": "en_US"}}
-        )
-        p = hits[0] if hits else None
-        if not p:
-            lines_nok.append(sku)
-            continue
-        price = _line_get_client_price(p["id"], p["list_price"], pricelist)
-        uom_id = p["uom_id"][0] if isinstance(p.get("uom_id"), list) else False
+    for item in items:
+        sku        = item["sku"]
+        qty        = item["qty"]
+        product_id = item.get("product_id", 0)
+        price      = item.get("price", 0)
+        name       = item.get("name", sku)
+
+        # Resolve product_id if not stored (fallback)
+        if not product_id:
+            hits = odoo_execute("product.product", "search_read",
+                [[["default_code", "=", sku], ["active", "=", True]]],
+                {"fields": ["id", "list_price"], "limit": 1, "context": {"lang": "en_US"}}
+            )
+            if not hits:
+                lines_nok.append(sku)
+                continue
+            product_id = hits[0]["id"]
+            price = hits[0]["list_price"]
+
+        client_price = _line_get_client_price(product_id, price, pricelist)
         line_vals = {
-            "order_id": order_id,
-            "product_id": p["id"],
-            "name": p["name"],
+            "order_id":        order_id,
+            "product_id":      product_id,
+            "name":            name,
             "product_uom_qty": qty,
-            "price_unit": price,
+            "price_unit":      client_price,
         }
-        if uom_id:
-            line_vals["product_uom"] = uom_id
         try:
             odoo_execute("sale.order.line", "create", [line_vals])
             lines_ok.append(f"{sku} x{qty}")
@@ -4117,8 +4122,7 @@ async def webhook_line(request: Request):
                     [("📋 Browse catalog", "menu")]
                 )])
             else:
-                items = [(i["sku"], i["qty"]) for i in cart]
-                result = _line_create_order(partner, items)
+                result = _line_create_order(partner, cart)
                 sess = _line_sessions.get(user_id, {})
                 _line_sessions[user_id] = {k: v for k, v in sess.items()
                                             if k not in ("cart", "pending_product")}
