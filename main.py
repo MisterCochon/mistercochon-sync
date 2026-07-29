@@ -3990,9 +3990,13 @@ async def webhook_line(request: Request):
                     "pending_product": {"sku": sku, "name": prod.get("name", sku),
                                         "price": price, "product_id": prod["id"]}
                 }
+                short = _shorten_product_name(prod.get("name", sku))
                 line_reply(reply_token, [line_quick_reply(
-                    f"How many *{prod.get('name', sku)[:35]}*?\n(💰 {price:.0f} ฿ each)\n\nOr type any number:",
-                    [("1", "1"), ("2", "2"), ("3", "3"), ("5", "5"), ("10", "10"), ("15", "15")]
+                    f"🛒 *{short}*\n"
+                    f"Unit price: {price:.0f} ฿\n\n"
+                    f"Enter quantity:",
+                    [("1 unit", "1"), ("2 units", "2"), ("3 units", "3"),
+                     ("5 units", "5"), ("10 units", "10"), ("Cancel", "cancel")]
                 )])
             else:
                 line_reply(reply_token, [line_text(f"Product {sku} not found.")])
@@ -4016,10 +4020,13 @@ async def webhook_line(request: Request):
                 f"• {i['name'][:28]} x{i['qty']} = {i['price']*i['qty']:.0f} ฿" for i in cart
             )
             line_reply(reply_token, [line_quick_reply(
-                f"✅ Added {qty}× {pending['name'][:30]}\n\n"
-                f"🛒 Cart ({len(cart)} item{'s' if len(cart)>1 else ''} — {total:.0f} ฿ total):\n{cart_text}",
-                [("🛍️ Keep shopping", "menu"), ("✅ Confirm order", "checkout"),
-                 ("🗑️ Clear cart", "cancel")]
+                f"Added: {_shorten_product_name(pending['name'])} × {qty}\n\n"
+                f"── Your order ──────────────\n"
+                f"{cart_text}\n"
+                f"────────────────────────────\n"
+                f"Total: {total:.0f} ฿  ({len(cart)} item{'s' if len(cart)>1 else ''})",
+                [("Continue shopping", "menu"), ("Place order", "checkout"),
+                 ("Clear cart", "cancel")]
             )])
             continue
 
