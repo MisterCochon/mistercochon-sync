@@ -3673,9 +3673,9 @@ def _line_build_carousel(products: list, pricelist, page: int = 0) -> list:
             "title": _shorten_product_name(name),
             "text": f"💰 {price:.0f} ฿",
             "actions": [
-                {"type": "postback", "label": "🛒 Add to order",
+                {"type": "postback", "label": "Add to order",
                  "data": f"__add_{sku}", "displayText": f"Add: {_shorten_product_name(name)[:30]}"},
-                {"type": "message", "label": "🛒 My cart", "text": "cart"},
+                {"type": "message", "label": "My cart", "text": "cart"},
             ]
         }
         columns.append(col)
