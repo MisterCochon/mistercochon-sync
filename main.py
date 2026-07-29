@@ -3516,10 +3516,11 @@ def _dbd_verify(reg_number: str, company_name: str) -> tuple:
 
 
 def _line_quick_login(code: str, user_id: str) -> tuple:
-    """Quick login: last 5 digits of VAT/DBD number. Returns (ok, partner_name)."""
-    code = re.sub(r"\D", "", code.strip())
-    if len(code) != 5:
+    """Quick login: last 5 digits of VAT/DBD number (accepts full number too). Returns (ok, partner_name)."""
+    digits = re.sub(r"\D", "", code.strip())
+    if len(digits) < 5:
         return False, ""
+    code = digits[-5:]  # always use last 5
     partners = odoo_execute("res.partner", "search_read",
         [[["vat", "!=", False], ["customer_rank", ">", 0]]],
         {"fields": ["id", "name", "vat", "comment"], "limit": 2000}
@@ -3653,11 +3654,10 @@ def _line_build_carousel(products: list, pricelist, page: int = 0) -> list:
             "thumbnailImageUrl": img,
             "imageSize": "cover",
             "title": name,
-            "text": f"{price:.0f} ฿  |  SKU: {sku or '—'}"[:60],
+            "text": f"💰 {price:.0f} ฿",
             "actions": [
-                {"type": "message", "label": "Order 1",  "text": f"{sku} x1"},
-                {"type": "message", "label": "Order 5",  "text": f"{sku} x5"},
-                {"type": "message", "label": "Order 10", "text": f"{sku} x10"},
+                {"type": "message", "label": "🛒 Add to order", "text": f"__add_{sku}"},
+                {"type": "message", "label": "🛒 My cart",      "text": "cart"},
             ]
         }
         columns.append(col)
@@ -3918,6 +3918,107 @@ async def webhook_line(request: Request):
                 line_reply(reply_token, [line_text("Type *menu* to browse products.")])
             continue
 
+        # ── Add product to cart ────────────────────────────────────────────
+        if text.startswith("__add_"):
+            sku = text[6:].strip().upper()
+            sess = _line_sessions.get(user_id, {})
+            prods = sess.get("category_products", [])
+            prod = next((p for p in prods if str(p.get("default_code") or "").upper() == sku), None)
+            if not prod:
+                results = odoo_execute("product.product", "search_read",
+                    [[["default_code", "=", sku], ["active", "=", True]]],
+                    {"fields": ["id", "name", "default_code", "list_price"], "limit": 1,
+                     "context": {"lang": "en_US"}}
+                )
+                prod = results[0] if results else None
+            if prod:
+                price = _line_get_client_price(prod["id"], prod.get("list_price", 0), pricelist)
+                _line_sessions[user_id] = {
+                    **sess,
+                    "pending_product": {"sku": sku, "name": prod.get("name", sku),
+                                        "price": price, "product_id": prod["id"]}
+                }
+                line_reply(reply_token, [line_quick_reply(
+                    f"How many *{prod.get('name', sku)[:35]}*?\n(💰 {price:.0f} ฿ each)\n\nOr type any number:",
+                    [("1", "1"), ("2", "2"), ("3", "3"), ("5", "5"), ("10", "10"), ("15", "15")]
+                )])
+            else:
+                line_reply(reply_token, [line_text(f"Product {sku} not found.")])
+            continue
+
+        # ── Quantity input for pending product ─────────────────────────────
+        sess = _line_sessions.get(user_id, {})
+        pending = sess.get("pending_product")
+        if pending and re.match(r"^\d+$", text) and 1 <= int(text) <= 999:
+            qty = int(text)
+            cart = list(sess.get("cart", []))
+            for item in cart:
+                if item["sku"] == pending["sku"]:
+                    item["qty"] += qty
+                    break
+            else:
+                cart.append({**pending, "qty": qty})
+            _line_sessions[user_id] = {**sess, "cart": cart, "pending_product": None}
+            total = sum(i["price"] * i["qty"] for i in cart)
+            cart_text = "\n".join(
+                f"• {i['name'][:28]} x{i['qty']} = {i['price']*i['qty']:.0f} ฿" for i in cart
+            )
+            line_reply(reply_token, [line_quick_reply(
+                f"✅ Added {qty}× {pending['name'][:30]}\n\n"
+                f"🛒 Cart ({len(cart)} item{'s' if len(cart)>1 else ''} — {total:.0f} ฿ total):\n{cart_text}",
+                [("🛍️ Keep shopping", "menu"), ("✅ Confirm order", "checkout"),
+                 ("🗑️ Clear cart", "cancel")]
+            )])
+            continue
+
+        # ── Cart display ───────────────────────────────────────────────────
+        if text_low in ("cart", "panier", "my cart"):
+            cart = _line_sessions.get(user_id, {}).get("cart", [])
+            if not cart:
+                line_reply(reply_token, [line_quick_reply(
+                    "🛒 Your cart is empty.",
+                    [("📋 Browse catalog", "menu")]
+                )])
+            else:
+                total = sum(i["price"] * i["qty"] for i in cart)
+                cart_text = "\n".join(
+                    f"• {i['name'][:28]} x{i['qty']} = {i['price']*i['qty']:.0f} ฿" for i in cart
+                )
+                line_reply(reply_token, [line_quick_reply(
+                    f"🛒 *Your cart ({len(cart)} item{'s' if len(cart)>1 else ''} — {total:.0f} ฿):*\n\n{cart_text}",
+                    [("🛍️ Keep shopping", "menu"), ("✅ Confirm order", "checkout"),
+                     ("🗑️ Clear cart", "cancel")]
+                )])
+            continue
+
+        # ── Checkout ───────────────────────────────────────────────────────
+        if text_low in ("checkout", "confirm", "order", "commander"):
+            cart = _line_sessions.get(user_id, {}).get("cart", [])
+            if not cart:
+                line_reply(reply_token, [line_quick_reply(
+                    "🛒 Your cart is empty. Browse our catalog first.",
+                    [("📋 Browse catalog", "menu")]
+                )])
+            else:
+                items = [(i["sku"], i["qty"]) for i in cart]
+                result = _line_create_order(partner, items)
+                sess = _line_sessions.get(user_id, {})
+                _line_sessions[user_id] = {k: v for k, v in sess.items()
+                                            if k not in ("cart", "pending_product")}
+                line_reply(reply_token, [line_text(result)])
+            continue
+
+        # ── Cancel / clear cart ────────────────────────────────────────────
+        if text_low in ("cancel", "clear", "annuler"):
+            sess = _line_sessions.get(user_id, {})
+            _line_sessions[user_id] = {k: v for k, v in sess.items()
+                                        if k not in ("cart", "pending_product")}
+            line_reply(reply_token, [line_quick_reply(
+                "🗑️ Cart cleared.",
+                [("📋 Browse catalog", "menu"), ("❓ Help", "help")]
+            )])
+            continue
+
         # ── Category selected ──────────────────────────────────────────────
         if text.startswith("__cat_"):
             cat_id = int(text.split("__cat_")[1])
@@ -3997,11 +4098,14 @@ async def webhook_line(request: Request):
         # ── Help ──────────────────────────────────────────────────────────
         elif text_low in ("help", "?"):
             line_reply(reply_token, [line_text(
-                "🇫🇷 *French Delicatessen B2B Bot*\n\n"
-                "📋 *menu* — Browse product categories\n"
-                "📦 *orders* — View your recent orders\n"
-                "🛒 To order, tap a product button in the catalog\n"
-                "   or type: SKU001 x3, SKU002 x2\n"
+                "🇫🇷 *French Delicatessen — B2B Portal*\n\n"
+                "📋 *menu* — Browse the PRO catalog\n"
+                "🛒 *cart* — View your current cart\n"
+                "✅ *checkout* — Confirm & place your order\n"
+                "🗑️ *cancel* — Clear your cart\n"
+                "📦 *orders* — View your recent orders\n\n"
+                "Tap *🛒 Add to order* on any product, then choose a quantity.\n"
+                "You can add multiple products before checking out.\n\n"
                 "📞 Support: @jfbuc"
             )])
 
@@ -4013,9 +4117,10 @@ async def webhook_line(request: Request):
                 line_reply(reply_token, [line_text(result)])
             else:
                 line_reply(reply_token, [line_quick_reply(
-                    "Hello! What would you like to do?",
-                    [("📋 Browse catalog", "menu"),
-                     ("📦 My orders", "orders"),
+                    "What would you like to do?",
+                    [("📋 Catalog", "menu"),
+                     ("🛒 My cart", "cart"),
+                     ("📦 Orders", "orders"),
                      ("❓ Help", "help")]
                 )])
 
