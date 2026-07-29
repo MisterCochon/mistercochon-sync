@@ -3538,22 +3538,58 @@ def _line_quick_login(code: str, user_id: str) -> tuple:
 
 # ── Product helpers ───────────────────────────────────────────────────────────
 
-def _line_get_pro_categories() -> list:
-    """Return LINE-* tags that have at least one active product. Returns [(tag_id, label)]."""
+def _line_get_line_tag_id() -> int | None:
+    """Return the id of the 'LINE' tag, or None if it doesn't exist."""
     tags = odoo_execute("product.tag", "search_read",
+        [[["name", "=", "LINE"]]],
+        {"fields": ["id"], "limit": 1}
+    )
+    return tags[0]["id"] if tags else None
+
+
+def _line_get_pro_categories() -> list:
+    """Return categories that have at least one LINE-tagged active product.
+
+    Strategy:
+    1. Try LINE-* subcategory tags first (e.g. LINE-Fresh, LINE-Dry).
+       Returns [(tag_id, label)] — __cat_ handler will filter by this tag_id.
+    2. If none, fall back to Odoo internal categories of 'LINE'-tagged products.
+       Returns [(-categ_id, categ_name)] — negative id signals categ mode.
+    """
+    # Try LINE-* subcategory tags
+    sub_tags = odoo_execute("product.tag", "search_read",
         [[["name", "=ilike", "LINE-%"]]],
         {"fields": ["id", "name"], "limit": 50}
     )
     result = []
-    for tag in (tags or []):
+    for tag in (sub_tags or []):
         count = odoo_execute("product.product", "search_count",
             [[["active", "=", True], ["sale_ok", "=", True],
               ["product_tag_ids", "in", [tag["id"]]]]]
         )
         if count:
-            label = tag["name"][5:].strip()  # strip "LINE-" prefix
+            label = tag["name"][5:].strip()
             result.append((tag["id"], label))
-    return result
+    if result:
+        return result
+
+    # Fall back: group LINE products by Odoo category
+    line_tag_id = _line_get_line_tag_id()
+    if not line_tag_id:
+        return []
+    prods = odoo_execute("product.template", "search_read",
+        [[["active", "=", True], ["sale_ok", "=", True],
+          ["product_tag_ids", "in", [line_tag_id]]]],
+        {"fields": ["categ_id"], "limit": 500}
+    )
+    seen, cats = set(), []
+    for p in (prods or []):
+        cid = p["categ_id"][0] if p.get("categ_id") else None
+        label = p["categ_id"][1] if p.get("categ_id") else "Products"
+        if cid and cid not in seen:
+            seen.add(cid)
+            cats.append((-cid, label))   # negative = categ mode
+    return cats
 
 
 def _line_get_ecwid_images() -> dict:
@@ -3885,9 +3921,19 @@ async def webhook_line(request: Request):
         # ── Category selected ──────────────────────────────────────────────
         if text.startswith("__cat_"):
             cat_id = int(text.split("__cat_")[1])
+            line_tag_id = _line_get_line_tag_id()
+            if cat_id > 0:
+                # Mode LINE-* tag: filter by that sub-tag
+                domain = [["active", "=", True], ["sale_ok", "=", True],
+                           ["product_tag_ids", "in", [cat_id]]]
+            else:
+                # Mode Odoo category: filter by categ + LINE tag
+                domain = [["active", "=", True], ["sale_ok", "=", True],
+                           ["categ_id", "=", -cat_id]]
+                if line_tag_id:
+                    domain.append(["product_tag_ids", "in", [line_tag_id]])
             prods = odoo_execute("product.product", "search_read",
-                [[["active", "=", True], ["sale_ok", "=", True],
-                  ["product_tag_ids", "in", [cat_id]]]],
+                [domain],
                 {"fields": ["id", "name", "default_code", "list_price"], "limit": 200,
                  "context": {"lang": "en_US"}}
             )
@@ -3903,6 +3949,26 @@ async def webhook_line(request: Request):
             cats = _line_get_pro_categories()
             if not cats:
                 line_reply(reply_token, [line_text("No PRO products available yet.")])
+                continue
+            # Single category → skip menu, show products directly
+            if len(cats) == 1:
+                cat_id, label = cats[0]
+                line_tag_id = _line_get_line_tag_id()
+                if cat_id > 0:
+                    domain = [["active", "=", True], ["sale_ok", "=", True],
+                               ["product_tag_ids", "in", [cat_id]]]
+                else:
+                    domain = [["active", "=", True], ["sale_ok", "=", True],
+                               ["categ_id", "=", -cat_id]]
+                    if line_tag_id:
+                        domain.append(["product_tag_ids", "in", [line_tag_id]])
+                prods = odoo_execute("product.product", "search_read",
+                    [domain],
+                    {"fields": ["id", "name", "default_code", "list_price"], "limit": 200,
+                     "context": {"lang": "en_US"}}
+                )
+                _line_sessions[user_id] = {"category_products": prods, "page": 0}
+                line_reply(reply_token, _line_build_carousel(prods, pricelist, 0))
                 continue
             quick_items = [(label, f"__cat_{cid}") for cid, label in cats[:13]]
             line_reply(reply_token, [line_quick_reply(
