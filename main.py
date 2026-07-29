@@ -3455,13 +3455,20 @@ def line_text(text: str) -> dict:
 
 
 def line_quick_reply(text: str, items: list) -> dict:
-    """Text message with quick reply buttons. items = [(label, text), ...]"""
+    """Text message with quick reply buttons. items = [(label, text_or_data), ...]
+    If label starts with '__' or text starts with '__', uses postback (hidden from chat).
+    """
+    def _action(lbl, txt):
+        if txt.startswith("__"):
+            return {"type": "postback", "label": lbl[:20], "data": txt, "displayText": lbl[:20]}
+        return {"type": "message", "label": lbl[:20], "text": txt}
+
     return {
         "type": "text",
         "text": text,
         "quickReply": {
             "items": [
-                {"type": "action", "action": {"type": "message", "label": lbl[:20], "text": txt}}
+                {"type": "action", "action": _action(lbl, txt)}
                 for lbl, txt in items[:13]
             ]
         }
