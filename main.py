@@ -3695,7 +3695,7 @@ def _line_build_carousel(products: list, pricelist, page: int = 0) -> list:
             "text": card_text,
             "actions": [
                 {"type": "postback", "label": "Add to order",
-                 "data": f"__add_{sku}", "displayText": f"Add: {_shorten_product_name(name)[:30]}"},
+                 "data": f"__add_{p['id']}_{sku}", "displayText": f"Add: {_shorten_product_name(name)[:30]}"},
                 {"type": "message", "label": "My cart", "text": "cart"},
             ]
         }
@@ -3965,69 +3965,80 @@ async def webhook_line(request: Request):
                 line_reply(reply_token, [line_text("Type *menu* to browse products.")])
             continue
 
-        # ── Add product to cart: show qty buttons (stateless) ─────────────
+        # ── Add product to cart: show qty buttons ─────────────────────────
+        # data format: __add_{product_id}_{sku}
         if text.startswith("__add_"):
-            sku = text[6:].strip().upper()
+            raw = text[6:]
+            # Parse product_id embedded at front: __add_1234_DUCB2100
+            first, _, rest = raw.partition("_")
+            if first.isdigit() and rest:
+                product_id = int(first)
+                sku = rest.upper()
+            else:
+                product_id = 0
+                sku = raw.upper()
+
+            # Get price and name from session cache or Odoo
             sess = _line_sessions.get(user_id, {})
             prods = sess.get("category_products", [])
-            prod = next((p for p in prods if str(p.get("default_code") or "").upper() == sku), None)
-            if not prod:
-                results = odoo_execute("product.product", "search_read",
-                    [[["default_code", "=", sku], ["active", "=", True]]],
-                    {"fields": ["id", "name", "default_code", "list_price"], "limit": 1,
-                     "context": {"lang": "en_US"}}
-                )
-                prod = results[0] if results else None
+            prod = next((p for p in prods if p.get("id") == product_id
+                         or str(p.get("default_code") or "").upper() == sku), None)
             if prod:
+                product_id = product_id or prod["id"]
                 price = _line_get_client_price(prod["id"], prod.get("list_price", 0), pricelist)
-                short = _shorten_product_name(prod.get("name", sku))
-                # Embed sku+price in each qty button — no session needed
-                price_int = int(round(price))
-                line_reply(reply_token, [line_quick_reply(
-                    f"*{short}*\n"
-                    f"Unit price: {price:.0f} ฿\n\n"
-                    f"Select quantity:",
-                    [(f"× {q}", f"__aq_{sku}_{price_int}_{q}")
-                     for q in [1, 2, 3, 5, 10]]
-                    + [("Other qty", f"__cq_{sku}_{price_int}"), ("Cancel", "cancel")]
-                )])
+                name  = prod.get("name", sku)
             else:
-                line_reply(reply_token, [line_text(f"Product {sku} not found.")])
+                price = 0.0
+                name  = sku
+
+            short     = _shorten_product_name(name)
+            price_int = int(round(price))
+            # Embed product_id + sku + price in every button — zero Odoo calls at qty/checkout
+            line_reply(reply_token, [line_quick_reply(
+                f"*{short}*\n"
+                f"Unit price: {price:.0f} ฿\n\n"
+                f"Select quantity:",
+                [(f"× {q}", f"__aq_{product_id}_{sku}_{price_int}_{q}")
+                 for q in [1, 2, 3, 5, 10]]
+                + [("Other qty", f"__cq_{product_id}_{sku}_{price_int}"),
+                   ("Cancel", "cancel")]
+            )])
             continue
 
-        # ── Custom qty: __cq_{sku}_{price} — ask user to type a number ──────
+        # ── Custom qty: __cq_{pid}_{sku}_{price} ──────────────────────────
         if text.startswith("__cq_"):
             parts = text.split("_")
             try:
-                price_int = int(parts[-1])
-                sku = "_".join(parts[3:-1]).upper()
+                price_int  = int(parts[-1])
+                sku        = parts[-2].upper()
+                product_id = int(parts[-3]) if parts[-3].isdigit() else 0
+                name       = sku
             except (ValueError, IndexError):
                 line_reply(reply_token, [line_text("Invalid selection. Please try again.")])
                 continue
             sess = _line_sessions.get(user_id, {})
-            _line_sessions[user_id] = {**sess, "pending_sku": sku, "pending_price": float(price_int)}
+            _line_sessions[user_id] = {**sess,
+                "pending_sku": sku, "pending_price": float(price_int),
+                "pending_pid": product_id, "pending_name": name}
             line_reply(reply_token, [line_text(f"Type the quantity for {sku}:")])
             continue
 
         # ── Free-text qty for custom quantity ──────────────────────────────
         sess = _line_sessions.get(user_id, {})
         if sess.get("pending_sku") and re.match(r"^\d+$", text) and 1 <= int(text) <= 9999:
-            sku   = sess["pending_sku"]
-            price = sess["pending_price"]
-            qty   = int(text)
-            results = odoo_execute("product.product", "search_read",
-                [[["default_code", "=", sku], ["active", "=", True]]],
-                {"fields": ["id", "name"], "limit": 1, "context": {"lang": "en_US"}}
-            )
-            prod = results[0] if results else {"name": sku, "id": 0}
+            sku        = sess["pending_sku"]
+            price      = sess["pending_price"]
+            product_id = sess.get("pending_pid", 0)
+            name       = sess.get("pending_name", sku)
+            qty        = int(text)
             cart = list(sess.get("cart", []))
             for item in cart:
                 if item["sku"] == sku:
                     item["qty"] += qty
                     break
             else:
-                cart.append({"sku": sku, "name": prod.get("name", sku),
-                              "price": price, "product_id": prod.get("id", 0), "qty": qty})
+                cart.append({"sku": sku, "name": name,
+                              "price": price, "product_id": product_id, "qty": qty})
             _line_sessions[user_id] = {**sess, "cart": cart,
                                         "pending_sku": None, "pending_price": None}
             total = sum(i["price"] * i["qty"] for i in cart)
@@ -4047,41 +4058,42 @@ async def webhook_line(request: Request):
             )])
             continue
 
-        # ── Qty button pressed: __aq_{sku}_{price}_{qty} ──────────────────
+        # ── Qty button: __aq_{product_id}_{sku}_{price}_{qty} ────────────
         if text.startswith("__aq_"):
+            # parts: ['','','aq', pid, sku, price, qty]
             parts = text.split("_")
-            # format: __aq_SKU_PRICE_QTY  → parts = ['', '', 'aq', sku, price, qty]
             try:
-                qty  = int(parts[-1])
-                price_int = int(parts[-2])
-                sku  = "_".join(parts[3:-2]).upper()
-                price = float(price_int)
+                qty        = int(parts[-1])
+                price_int  = int(parts[-2])
+                sku        = parts[-3].upper()
+                product_id = int(parts[-4]) if len(parts) >= 7 and parts[-4].isdigit() else 0
+                price      = float(price_int)
             except (ValueError, IndexError):
                 line_reply(reply_token, [line_text("Invalid selection. Please try again.")])
                 continue
-            # Fetch product name
-            results = odoo_execute("product.product", "search_read",
-                [[["default_code", "=", sku], ["active", "=", True]]],
-                {"fields": ["id", "name", "default_code"], "limit": 1,
-                 "context": {"lang": "en_US"}}
-            )
-            prod = results[0] if results else {"name": sku, "default_code": sku, "id": 0}
-            sess = _line_sessions.get(user_id, {})
+            # Get name from session cache — no Odoo call needed
+            sess  = _line_sessions.get(user_id, {})
+            prods = sess.get("category_products", [])
+            prod  = next((p for p in prods if p.get("id") == product_id
+                          or str(p.get("default_code") or "").upper() == sku), None)
+            name  = prod.get("name", sku) if prod else sku
+            if prod and not product_id:
+                product_id = prod["id"]
             cart = list(sess.get("cart", []))
             for item in cart:
                 if item["sku"] == sku:
                     item["qty"] += qty
                     break
             else:
-                cart.append({"sku": sku, "name": prod.get("name", sku),
-                              "price": price, "product_id": prod.get("id", 0), "qty": qty})
+                cart.append({"sku": sku, "name": name,
+                              "price": price, "product_id": product_id, "qty": qty})
             _line_sessions[user_id] = {**sess, "cart": cart}
             total = sum(i["price"] * i["qty"] for i in cart)
             cart_text = "\n".join(
                 f"• {_shorten_product_name(i['name'])[:30]} ×{i['qty']} = {i['price']*i['qty']:.0f} ฿"
                 for i in cart
             )
-            short = _shorten_product_name(prod.get("name", sku))
+            short = _shorten_product_name(name)
             line_reply(reply_token, [line_quick_reply(
                 f"Added: {short} × {qty}\n\n"
                 f"── Your order ──────────────\n"
