@@ -4174,7 +4174,8 @@ async def webhook_line(request: Request):
             if not prods:
                 line_reply(reply_token, [line_text("No products in this category.")])
                 continue
-            _line_sessions[user_id] = {"category_products": prods, "page": 0}
+            _line_sessions[user_id] = {**_line_sessions.get(user_id, {}),
+                                        "category_products": prods, "page": 0}
             line_reply(reply_token, _line_build_carousel(prods, pricelist, 0))
             continue
 
