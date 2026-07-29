@@ -411,12 +411,13 @@ def odoo_execute(model, method, args=None, kwargs=None):
         return models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, model, method, args or [], kwargs or {})
 
 
-def ecwid_get(endpoint, params=None):
+def ecwid_get(endpoint, params=None, timeout=30):
     url = f"https://app.ecwid.com/api/v3/{ECWID_STORE_ID}{endpoint}"
     response = requests.get(
         url,
         headers={"Authorization": f"Bearer {ECWID_TOKEN}"},
-        params=params or {}
+        params=params or {},
+        timeout=timeout
     )
 
     if response.status_code != 200:
@@ -3599,24 +3600,31 @@ def _line_get_pro_categories(extra_tags: list | None = None) -> list:
     return result
 
 
+_ecwid_image_cache: dict = {}
+_ecwid_image_cache_ts: float = 0.0
+
 def _line_get_ecwid_images() -> dict:
-    """Return {sku_upper: image_url} from Ecwid."""
+    """Return {sku_upper: image_url} from Ecwid. Cached for 1 hour."""
+    import time
+    global _ecwid_image_cache, _ecwid_image_cache_ts
+    if time.time() - _ecwid_image_cache_ts < 3600 and _ecwid_image_cache is not None:
+        return _ecwid_image_cache
     img_map = {}
     try:
-        data = ecwid_get("/products", {"limit": 100, "offset": 0})
+        data = ecwid_get("/products", {"limit": 100, "offset": 0}, timeout=3)
         for item in data.get("items", []):
             img = item.get("imageUrl") or item.get("thumbnailUrl") or ""
-            # Main product SKU
             sku = str(item.get("sku") or "").strip().upper()
             if sku and img:
                 img_map[sku] = img
-            # Variants
             for combo in item.get("combinations", []):
                 vsku = str(combo.get("sku") or "").strip().upper()
                 if vsku and img:
                     img_map[vsku] = img
     except Exception:
         pass
+    _ecwid_image_cache = img_map
+    _ecwid_image_cache_ts = time.time()
     return img_map
 
 
