@@ -3548,49 +3548,48 @@ def _line_get_line_tag_id() -> int | None:
     return tags[0]["id"] if tags else None
 
 
-def _line_get_pro_categories() -> list:
-    """Return categories that have at least one LINE-tagged active product.
+def _line_get_pro_categories(extra_tags: list | None = None) -> list:
+    """Return (tag_id, label) pairs for the LINE bot menu.
 
-    Strategy:
-    1. Try LINE-* subcategory tags first (e.g. LINE-Fresh, LINE-Dry).
-       Returns [(tag_id, label)] — __cat_ handler will filter by this tag_id.
-    2. If none, fall back to Odoo internal categories of 'LINE'-tagged products.
-       Returns [(-categ_id, categ_name)] — negative id signals categ mode.
+    Excludes LINE-BELGO and LINE-Dofann from the public menu.
+    Applies a fixed display order. extra_tags allows injecting hidden
+    category tag ids (e.g. for BELGO clients).
     """
-    # Try LINE-* subcategory tags
+    # Fixed display order for public categories
+    PUBLIC_ORDER = [
+        "LINE-Delicatessen",
+        "LINE-Fresh Delicatessen",
+        "LINE-Duck",
+        "LINE-Butchery",
+        "LINE-Premium",
+    ]
+    HIDDEN = {"LINE-BELGO", "LINE-Dofann"}
+
     sub_tags = odoo_execute("product.tag", "search_read",
         [[["name", "=ilike", "LINE-%"]]],
         {"fields": ["id", "name"], "limit": 50}
     )
+    tag_by_name = {t["name"]: t["id"] for t in (sub_tags or [])}
+
     result = []
-    for tag in (sub_tags or []):
+    for name in PUBLIC_ORDER:
+        tid = tag_by_name.get(name)
+        if not tid:
+            continue
         count = odoo_execute("product.product", "search_count",
             [[["active", "=", True], ["sale_ok", "=", True],
-              ["product_tag_ids", "in", [tag["id"]]]]]
+              ["product_tag_ids", "in", [tid]]]]
         )
         if count:
-            label = tag["name"][5:].strip()
-            result.append((tag["id"], label))
-    if result:
-        return result
+            result.append((tid, name[5:].strip()))  # strip "LINE-" prefix
 
-    # Fall back: group LINE products by Odoo category
-    line_tag_id = _line_get_line_tag_id()
-    if not line_tag_id:
-        return []
-    prods = odoo_execute("product.template", "search_read",
-        [[["active", "=", True], ["sale_ok", "=", True],
-          ["product_tag_ids", "in", [line_tag_id]]]],
-        {"fields": ["categ_id"], "limit": 500}
-    )
-    seen, cats = set(), []
-    for p in (prods or []):
-        cid = p["categ_id"][0] if p.get("categ_id") else None
-        label = p["categ_id"][1] if p.get("categ_id") else "Products"
-        if cid and cid not in seen:
-            seen.add(cid)
-            cats.append((-cid, label))   # negative = categ mode
-    return cats
+    # Append any extra hidden-category tags (e.g. BELGO/Dofann products)
+    for tid in (extra_tags or []):
+        t = next((t for t in (sub_tags or []) if t["id"] == tid), None)
+        if t:
+            result.append((tid, t["name"][5:].strip()))
+
+    return result
 
 
 def _line_get_ecwid_images() -> dict:
