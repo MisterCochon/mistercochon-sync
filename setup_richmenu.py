@@ -29,17 +29,10 @@ WHITE  = "#FFFFFF"
 LIGHT  = "#AABBD4"      # muted blue for Thai text
 SEP    = "#2E5096"      # separator line color
 
-# Fonts
-FONT_EN_BOLD = r"C:\Windows\Fonts\Montserrat-Bold.ttf"
-# Try Thai-capable fonts in order
-for _f in [r"C:\Windows\Fonts\LeelawadeeUI-Bold.ttf",
-           r"C:\Windows\Fonts\LeelawadeeUI.ttf",
-           r"C:\Windows\Fonts\Tahoma.ttf"]:
-    if os.path.exists(_f):
-        FONT_THAI = _f
-        break
-else:
-    FONT_THAI = FONT_EN_BOLD
+# Fonts — bundled in fonts/ directory for cross-platform (Windows + Linux/Render)
+_DIR = os.path.dirname(os.path.abspath(__file__))
+FONT_EN_BOLD = os.path.join(_DIR, "fonts", "Montserrat-Bold.ttf")
+FONT_THAI    = os.path.join(_DIR, "fonts", "Tahoma.ttf")
 
 CELLS = [
     # row, col, bg,   icon,      en_label,          th_label,           action
