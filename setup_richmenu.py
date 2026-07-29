@@ -32,7 +32,7 @@ SEP    = "#2E5096"      # separator line color
 # Fonts — bundled in fonts/ directory for cross-platform (Windows + Linux/Render)
 _DIR = os.path.dirname(os.path.abspath(__file__))
 FONT_EN_BOLD = os.path.join(_DIR, "fonts", "Montserrat-Bold.ttf")
-FONT_THAI    = os.path.join(_DIR, "fonts", "Tahoma.ttf")
+FONT_THAI    = os.path.join(_DIR, "fonts", "NotoSansThai.ttf")
 
 CELLS = [
     # row, col, bg,   icon,      en_label,          th_label,           action
