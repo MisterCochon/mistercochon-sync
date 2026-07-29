@@ -3664,19 +3664,20 @@ def _line_build_carousel(products: list, pricelist, page: int = 0) -> list:
         sku = str(p.get("default_code") or "").strip().upper()
         name = (p.get("name") or "")[:40]
         price = _line_get_client_price(p["id"], p.get("list_price", 0), pricelist)
-        img = img_map.get(sku) or LINE_FALLBACK_IMG
+        img = img_map.get(sku)  # None if no real image
 
         col = {
-            "thumbnailImageUrl": img,
-            "imageSize": "cover",
             "title": _shorten_product_name(name),
-            "text": f"💰 {price:.0f} ฿",
+            "text": f"{price:.0f} ฿",
             "actions": [
                 {"type": "postback", "label": "Add to order",
                  "data": f"__add_{sku}", "displayText": f"Add: {_shorten_product_name(name)[:30]}"},
                 {"type": "message", "label": "My cart", "text": "cart"},
             ]
         }
+        if img:
+            col["thumbnailImageUrl"] = img
+
         columns.append(col)
 
     carousel = {
@@ -3685,8 +3686,6 @@ def _line_build_carousel(products: list, pricelist, page: int = 0) -> list:
         "template": {
             "type": "carousel",
             "columns": columns,
-            "imageAspectRatio": "rectangle",
-            "imageSize": "cover",
         }
     }
     messages = [carousel]
