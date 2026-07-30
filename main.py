@@ -3290,13 +3290,29 @@ def debug_reorder(secret: str = "", code: str = ""):
         {"fields": ["product_id", "product_uom_qty", "order_id"], "limit": 200}
     )
     prod_ids = list({ln["product_id"][0] for ln in (lines or []) if ln.get("product_id")})
+    domain = [["id", "in", prod_ids], ["active", "=", True],
+              ["name", "not ilike", "frozen"],
+              ["name", "not ilike", "livraison"],
+              ["name", "not ilike", "delivery"]]
+    prods = odoo_execute("product.product", "search_read",
+        [domain],
+        {"fields": ["id", "name", "default_code", "list_price", "active"],
+         "limit": 100, "context": {"lang": "en_US"}}
+    )
+    # Also check without filters to compare
+    prods_raw = odoo_execute("product.product", "search_read",
+        [[["id", "in", prod_ids]]],
+        {"fields": ["id", "name", "default_code", "list_price", "active"],
+         "limit": 100, "context": {"lang": "en_US"}}
+    )
     return {
         "partner": partner["name"],
         "partner_id": partner["id"],
         "orders": [{"id": o["id"], "name": o["name"], "state": o["state"]} for o in orders],
         "order_line_count": len(lines or []),
         "unique_product_ids": prod_ids,
-        "product_count": len(prod_ids),
+        "products_after_filter": [{"id": p["id"], "name": p["name"], "active": p["active"]} for p in (prods or [])],
+        "products_raw": [{"id": p["id"], "name": p["name"], "active": p["active"], "list_price": p["list_price"]} for p in (prods_raw or [])],
     }
 
 
