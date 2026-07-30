@@ -3618,6 +3618,33 @@ def _line_get_pro_categories(extra_tags: list | None = None) -> list:
     return result
 
 
+def _line_build_cat_flex(cats: list) -> dict:
+    """Build a Flex bubble showing category buttons."""
+    cat_buttons = []
+    for cid, label in cats[:10]:
+        cat_buttons.append({
+            "type": "button", "style": "secondary", "height": "sm",
+            "action": {"type": "postback", "label": label[:40], "data": f"__cat_{cid}"}
+        })
+    return {
+        "type": "flex", "altText": "Select a category",
+        "contents": {
+            "type": "bubble",
+            "header": {
+                "type": "box", "layout": "vertical",
+                "backgroundColor": "#1A3A6B", "paddingAll": "14px",
+                "contents": [{"type": "text", "text": "French Delicatessen PRO",
+                              "weight": "bold", "color": "#FFFFFF", "size": "md"}]
+            },
+            "body": {
+                "type": "box", "layout": "vertical",
+                "paddingAll": "10px", "spacing": "sm",
+                "contents": cat_buttons
+            }
+        }
+    }
+
+
 _ecwid_image_cache: dict = {}
 _ecwid_image_cache_ts: float = 0.0
 
@@ -4101,10 +4128,12 @@ async def webhook_line(request: Request):
             ok, name = _line_quick_login(text, user_id)
             if ok:
                 partner = _line_get_partner(user_id)
-                line_reply(reply_token, [line_text(
-                    f"✅ Welcome back, {name}!\n\n"
-                    "Type *menu* to browse our PRO catalog."
-                )])
+                cats = _line_get_pro_categories()
+                welcome = line_text(f"✅ Welcome back, {name}!")
+                if cats:
+                    line_reply(reply_token, [welcome, _line_build_cat_flex(cats)])
+                else:
+                    line_reply(reply_token, [welcome, line_text("Type *menu* to browse our PRO catalog.")])
             else:
                 line_reply(reply_token, [line_quick_reply(
                     "🇫🇷 *French Delicatessen — Professional Portal*\n\n"
@@ -4381,30 +4410,7 @@ async def webhook_line(request: Request):
                 line_reply(reply_token, _line_build_carousel(prods, pricelist, 0))
                 continue
             # Flex bubble with category buttons — all visible on one screen
-            cat_buttons = []
-            for cid, label in cats[:10]:
-                cat_buttons.append({
-                    "type": "button", "style": "secondary", "height": "sm",
-                    "action": {"type": "postback", "label": label[:40], "data": f"__cat_{cid}"}
-                })
-            cat_flex = {
-                "type": "flex", "altText": "Select a category",
-                "contents": {
-                    "type": "bubble",
-                    "header": {
-                        "type": "box", "layout": "vertical",
-                        "backgroundColor": "#1A3A6B", "paddingAll": "14px",
-                        "contents": [{"type": "text", "text": "French Delicatessen PRO",
-                                      "weight": "bold", "color": "#FFFFFF", "size": "md"}]
-                    },
-                    "body": {
-                        "type": "box", "layout": "vertical",
-                        "paddingAll": "10px", "spacing": "sm",
-                        "contents": cat_buttons
-                    }
-                }
-            }
-            line_reply(reply_token, [cat_flex])
+            line_reply(reply_token, [_line_build_cat_flex(cats)])
 
         # ── My orders ─────────────────────────────────────────────────────
         elif text_low in ("orders", "my orders", "history"):
