@@ -4464,22 +4464,26 @@ async def webhook_line(request: Request):
                         [("Browse catalog", "menu")]
                     )])
                 else:
+                    domain = [["id", "in", prod_ids], ["active", "=", True],
+                              ["sale_ok", "=", True], ["list_price", ">", 0],
+                              ["name", "not ilike", "frozen"],
+                              ["name", "not ilike", "livraison"],
+                              ["name", "not ilike", "delivery"]]
                     prods = odoo_execute("product.product", "search_read",
-                        [[["id", "in", prod_ids], ["active", "=", True]]],
+                        [domain],
                         {"fields": ["id", "name", "default_code", "list_price", "description_sale"],
                          "limit": 100, "context": {"lang": "en_US"}}
                     )
                     if not prods:
                         line_reply(reply_token, [line_quick_reply(
-                            "Products from previous orders are no longer available.",
+                            "No catalog products found in previous orders.",
                             [("Browse catalog", "menu")]
                         )])
                     else:
                         sess = _line_sessions.get(user_id, {})
                         _line_sessions[user_id] = {**sess, "category_products": prods, "page": 0}
                         line_reply(reply_token,
-                            [line_text(f"Your {len(prods)} previously ordered product{'s' if len(prods)>1 else ''}:")]
-                            + _line_build_carousel(prods, pricelist, 0)
+                            _line_build_carousel(prods, pricelist, 0, "Your usual products")
                         )
 
         # ── Contact (human support) ────────────────────────────────────────
