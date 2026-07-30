@@ -4486,7 +4486,6 @@ async def webhook_line(request: Request):
                     )])
                 else:
                     domain = [["id", "in", prod_ids], ["active", "=", True],
-                              ["sale_ok", "=", True], ["list_price", ">", 0],
                               ["name", "not ilike", "frozen"],
                               ["name", "not ilike", "livraison"],
                               ["name", "not ilike", "delivery"]]
