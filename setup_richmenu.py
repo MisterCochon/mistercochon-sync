@@ -175,7 +175,7 @@ def make_image() -> Image.Image:
         th_bb = d.textbbox((0, 0), th_label, font=f_th)
         th_h  = th_bb[3] - th_bb[1]
 
-        gap    = 20
+        gap    = 35
         total  = ICON_SIZE + gap + th_h + gap + en_h
         top    = y0 + (CH - total) // 2
 
@@ -189,7 +189,7 @@ def make_image() -> Image.Image:
         d.text((cx - th_w // 2, th_y), th_label, font=f_th, fill=WHITE)
 
         # English label (secondary — smaller, below)
-        en_y = th_y + th_h + gap
+        en_y = th_y + th_h + gap - 5
         en_w = en_bb[2] - en_bb[0]
         d.text((cx - en_w // 2, en_y), en_label, font=f_en, fill=LIGHT)
 
