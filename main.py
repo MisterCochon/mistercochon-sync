@@ -3679,105 +3679,145 @@ def _shorten_product_name(name: str) -> str:
     return name[:40]
 
 
-def _line_build_carousel(products: list, pricelist, page: int = 0) -> list:
-    """Build Flex Message carousel — rich branded cards."""
-    PAGE = 10
+def _line_build_carousel(products: list, pricelist, page: int = 0,
+                          category_name: str = "") -> list:
+    """Compact scrollable list: one row per product, tap to open detail."""
+    PAGE = 12
     start = page * PAGE
     page_prods = products[start:start + PAGE]
     if not page_prods:
         return [line_text("No products found in this category.")]
 
-    img_map = _line_get_ecwid_images()
-    bubbles = []
+    total_pages = ((len(products) - 1) // PAGE) + 1
+    header_text = (category_name or "Products") + (f"  {page+1}/{total_pages}" if total_pages > 1 else "")
 
+    rows = []
     for p in page_prods:
         sku   = str(p.get("default_code") or "").strip().upper()
-        name  = p.get("name") or ""
+        name  = _shorten_product_name(p.get("name") or "")
         price = _line_get_client_price(p["id"], p.get("list_price", 0), pricelist)
-        desc  = str(p.get("description_sale") or "").strip()
-        short = _shorten_product_name(name)
-        img   = img_map.get(sku)
+        rows.append({
+            "type": "box", "layout": "horizontal",
+            "paddingTop": "10px", "paddingBottom": "10px",
+            "paddingStart": "14px", "paddingEnd": "14px",
+            "action": {"type": "postback", "label": name[:40],
+                       "data": f"__view_{p['id']}_{sku}"},
+            "contents": [
+                {"type": "text", "text": name[:34], "flex": 6, "size": "sm",
+                 "color": "#222222", "wrap": False, "adjustMode": "shrink-to-fit"},
+                {"type": "text", "text": f"{price:,.0f}฿", "flex": 3,
+                 "size": "sm", "weight": "bold", "color": "#C8102E", "align": "end"},
+                {"type": "text", "text": "›", "flex": 1, "size": "xl",
+                 "color": "#1A3A6B", "align": "end"}
+            ]
+        })
+        rows.append({"type": "separator"})
+    if rows and rows[-1].get("type") == "separator":
+        rows.pop()
 
-        # Header contents
-        header_contents = [
-            {"type": "text", "text": short, "weight": "bold", "size": "md",
-             "color": "#FFFFFF", "wrap": True, "maxLines": 2}
-        ]
-        if img:
-            header_contents.insert(0, {
-                "type": "image", "url": img, "size": "full",
-                "aspectRatio": "20:13", "aspectMode": "cover"
-            })
-
-        # Body contents
-        body_contents = [
-            {"type": "text", "text": f"{price:,.0f} ฿",
-             "weight": "bold", "size": "xxl", "color": "#C8102E"},
-            {"type": "text", "text": f"Ref: {sku}", "size": "xs",
-             "color": "#888888", "margin": "xs"},
-        ]
-        if desc:
-            body_contents.append({
-                "type": "text", "text": desc[:80], "size": "sm",
-                "color": "#444444", "wrap": True, "margin": "sm"
-            })
-
-        bubble = {
-            "type": "bubble",
-            "size": "kilo",
-            "header": {
-                "type": "box", "layout": "vertical",
-                "backgroundColor": "#1A3A6B", "paddingAll": "14px",
-                "contents": header_contents
-            },
-            "body": {
-                "type": "box", "layout": "vertical",
-                "paddingAll": "14px", "spacing": "none",
-                "contents": body_contents
-            },
-            "footer": {
-                "type": "box", "layout": "vertical",
-                "paddingAll": "10px", "spacing": "xs",
-                "contents": [
-                    {
-                        "type": "button", "style": "primary",
-                        "color": "#1A3A6B", "height": "sm",
-                        "action": {
-                            "type": "postback", "label": "Add to order",
-                            "data": f"__add_{p['id']}_{sku}"
-                        }
-                    },
-                    {
-                        "type": "button", "style": "secondary",
-                        "height": "sm",
-                        "action": {"type": "message", "label": "My cart", "text": "cart"}
-                    }
-                ]
-            }
-        }
-        bubbles.append(bubble)
-
-    flex_msg = {
-        "type": "flex",
-        "altText": f"French Delicatessen — Catalog (page {page + 1})",
-        "contents": {"type": "carousel", "contents": bubbles}
-    }
-    messages = [flex_msg]
-
-    # Navigation
-    nav = []
+    nav_buttons = []
     if page > 0:
-        nav.append(("◀ Previous", f"__page_{page - 1}"))
+        nav_buttons.append({
+            "type": "button", "style": "secondary", "height": "sm", "flex": 1,
+            "action": {"type": "postback", "label": "◀ Prev", "data": f"__page_{page-1}"}
+        })
     if start + PAGE < len(products):
-        nav.append(("Next ▶", f"__page_{page + 1}"))
-    if nav:
-        total_pages = ((len(products) - 1) // PAGE) + 1
-        messages.append(line_quick_reply(
-            f"Page {page + 1} / {total_pages}",
-            nav
-        ))
+        nav_buttons.append({
+            "type": "button", "style": "secondary", "height": "sm", "flex": 1,
+            "action": {"type": "postback", "label": "Next ▶", "data": f"__page_{page+1}"}
+        })
 
-    return messages
+    footer_contents = []
+    if nav_buttons:
+        footer_contents.append({"type": "box", "layout": "horizontal",
+                                 "spacing": "sm", "contents": nav_buttons})
+    footer_contents += [
+        {"type": "button", "style": "primary", "height": "sm", "color": "#1A3A6B",
+         "action": {"type": "message", "label": "My cart", "text": "cart"}},
+        {"type": "button", "style": "secondary", "height": "sm",
+         "action": {"type": "message", "label": "Categories", "text": "menu"}}
+    ]
+
+    bubble = {
+        "type": "bubble", "size": "mega",
+        "header": {
+            "type": "box", "layout": "vertical",
+            "backgroundColor": "#1A3A6B", "paddingAll": "12px",
+            "contents": [{"type": "text", "text": header_text, "weight": "bold",
+                          "color": "#FFFFFF", "size": "md"}]
+        },
+        "body": {
+            "type": "box", "layout": "vertical",
+            "paddingAll": "0px", "spacing": "none",
+            "contents": rows
+        },
+        "footer": {
+            "type": "box", "layout": "vertical",
+            "paddingAll": "10px", "spacing": "xs",
+            "contents": footer_contents
+        }
+    }
+    return [{"type": "flex", "altText": header_text, "contents": bubble}]
+
+
+def _line_product_detail(p: dict, pricelist, back_page: int = 0) -> list:
+    """Detail bubble for a single product with qty buttons."""
+    sku   = str(p.get("default_code") or "").strip().upper()
+    name  = p.get("name") or sku
+    short = _shorten_product_name(name)
+    price = _line_get_client_price(p["id"], p.get("list_price", 0), pricelist)
+    desc  = str(p.get("description_sale") or "").strip()
+    price_int = int(round(price))
+    pid   = p["id"]
+
+    body_contents = [
+        {"type": "text", "text": f"{price:,.0f} ฿",
+         "weight": "bold", "size": "xxl", "color": "#C8102E"},
+        {"type": "text", "text": f"Ref: {sku}", "size": "xs",
+         "color": "#888888", "margin": "xs"},
+    ]
+    if desc:
+        body_contents.append({"type": "text", "text": desc[:120], "size": "sm",
+                               "color": "#444444", "wrap": True, "margin": "sm"})
+
+    def qty_btn(q):
+        return {"type": "button", "style": "secondary", "height": "sm", "flex": 1,
+                "action": {"type": "postback", "label": f"×{q}",
+                           "data": f"__aq_{pid}_{sku}_{price_int}_{q}"}}
+
+    bubble = {
+        "type": "bubble", "size": "mega",
+        "header": {
+            "type": "box", "layout": "vertical",
+            "backgroundColor": "#1A3A6B", "paddingAll": "14px",
+            "contents": [{"type": "text", "text": short, "weight": "bold",
+                          "color": "#FFFFFF", "size": "md", "wrap": True, "maxLines": 2}]
+        },
+        "body": {
+            "type": "box", "layout": "vertical",
+            "paddingAll": "14px", "spacing": "none",
+            "contents": body_contents
+        },
+        "footer": {
+            "type": "box", "layout": "vertical", "paddingAll": "10px", "spacing": "sm",
+            "contents": [
+                {"type": "text", "text": "Select quantity:", "size": "sm", "color": "#555555"},
+                {"type": "box", "layout": "horizontal", "spacing": "xs",
+                 "contents": [qty_btn(1), qty_btn(2), qty_btn(3)]},
+                {"type": "box", "layout": "horizontal", "spacing": "xs",
+                 "contents": [
+                     qty_btn(5), qty_btn(10),
+                     {"type": "button", "style": "secondary", "height": "sm", "flex": 1,
+                      "action": {"type": "postback", "label": "Other",
+                                 "data": f"__cq_{pid}_{sku}_{price_int}"}}
+                 ]},
+                {"type": "button", "style": "secondary", "height": "sm",
+                 "action": {"type": "postback", "label": "← Back to list",
+                            "data": f"__page_{back_page}"}}
+            ]
+        }
+    }
+    return [{"type": "flex", "altText": short, "contents": bubble}]
 
 
 # ── Order helpers ─────────────────────────────────────────────────────────────
@@ -4091,6 +4131,28 @@ async def webhook_line(request: Request):
                 line_reply(reply_token, [line_text("Type *menu* to browse products.")])
             continue
 
+        # ── Product detail view: __view_{pid}_{sku} ───────────────────────
+        if text.startswith("__view_"):
+            raw = text[7:]
+            first, _, sku = raw.partition("_")
+            product_id = int(first) if first.isdigit() else 0
+            sku = sku.upper()
+            sess = _line_sessions.get(user_id, {})
+            prods = sess.get("category_products", [])
+            prod = next((p for p in prods if p.get("id") == product_id), None)
+            if not prod and product_id:
+                rows = odoo_execute("product.product", "search_read",
+                    [[["id", "=", product_id]]],
+                    {"fields": ["id", "name", "default_code", "list_price", "description_sale"],
+                     "limit": 1, "context": {"lang": "en_US"}})
+                prod = rows[0] if rows else None
+            if not prod:
+                line_reply(reply_token, [line_text("Product not found.")])
+                continue
+            back_page = sess.get("page", 0)
+            line_reply(reply_token, _line_product_detail(prod, pricelist, back_page))
+            continue
+
         # ── Add product to cart: show qty buttons ─────────────────────────
         # data format: __add_{product_id}_{sku}
         if text.startswith("__add_"):
@@ -4168,7 +4230,17 @@ async def webhook_line(request: Request):
             _line_sessions[user_id] = {**sess, "cart": cart,
                                         "pending_sku": None, "pending_price": None}
             short = _shorten_product_name(name)
-            line_reply(reply_token, _line_cart_messages(cart, short, qty))
+            total = sum(i["price"] * i["qty"] for i in cart)
+            confirm_msg = line_text(
+                f"✅ {short} ×{qty} added\n"
+                f"Cart: {len(cart)} item{'s' if len(cart)>1 else ''} — {total:,.0f} ฿"
+            )
+            prods = sess.get("category_products", [])
+            cur_page = sess.get("page", 0)
+            msgs = [confirm_msg]
+            if prods:
+                msgs += _line_build_carousel(prods, pricelist, cur_page)
+            line_reply(reply_token, msgs[:5])
             continue
 
         # ── Qty button: __aq_{product_id}_{sku}_{price}_{qty} ────────────
@@ -4202,7 +4274,18 @@ async def webhook_line(request: Request):
                               "price": price, "product_id": product_id, "qty": qty})
             _line_sessions[user_id] = {**sess, "cart": cart}
             short = _shorten_product_name(name)
-            line_reply(reply_token, _line_cart_messages(cart, short, qty))
+            total = sum(i["price"] * i["qty"] for i in cart)
+            # Confirmation + return to product list
+            confirm_msg = line_text(
+                f"✅ {short} ×{qty} added\n"
+                f"Cart: {len(cart)} item{'s' if len(cart)>1 else ''} — {total:,.0f} ฿"
+            )
+            prods = sess.get("category_products", [])
+            cur_page = sess.get("page", 0)
+            msgs = [confirm_msg]
+            if prods:
+                msgs += _line_build_carousel(prods, pricelist, cur_page)
+            line_reply(reply_token, msgs[:5])
             continue
 
         # ── Cart display ───────────────────────────────────────────────────
