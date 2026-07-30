@@ -4542,14 +4542,14 @@ async def webhook_line(request: Request):
                         [("Browse catalog", "menu")]
                     )])
                 else:
-                    domain = [["id", "in", prod_ids], ["active", "=", True],
+                    domain = [["id", "in", prod_ids],
                               ["name", "not ilike", "frozen"],
                               ["name", "not ilike", "livraison"],
                               ["name", "not ilike", "delivery"]]
                     prods = odoo_execute("product.product", "search_read",
                         [domain],
                         {"fields": ["id", "name", "default_code", "list_price", "description_sale"],
-                         "limit": 100, "context": {"lang": "en_US"}}
+                         "limit": 100, "context": {"lang": "en_US", "active_test": False}}
                     )
                     if not prods:
                         line_reply(reply_token, [line_quick_reply(
@@ -4608,9 +4608,9 @@ async def webhook_line(request: Request):
             if sku_match:
                 raw_sku = sku_match.group(1).upper()
                 prods_found = odoo_execute("product.product", "search_read",
-                    [[["default_code", "=ilike", raw_sku], ["active", "=", True]]],
+                    [[["default_code", "=ilike", raw_sku]]],
                     {"fields": ["id", "name", "default_code", "list_price", "description_sale"],
-                     "limit": 1, "context": {"lang": "en_US"}}
+                     "limit": 1, "context": {"lang": "en_US", "active_test": False}}
                 )
                 if prods_found:
                     p = prods_found[0]
