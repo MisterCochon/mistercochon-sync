@@ -4644,3 +4644,420 @@ async def webhook_line(request: Request):
 
     return {"status": "ok"}
 
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# LINE RETAIL BOT — Mister Cochon (@920gsiph)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+LINE_RETAIL_SECRET = os.getenv("LINE_RETAIL_CHANNEL_SECRET", "")
+LINE_RETAIL_TOKEN  = os.getenv("LINE_RETAIL_ACCESS_TOKEN", "")
+PROMPTPAY_NUMBER   = os.getenv("PROMPTPAY_NUMBER", "0957291373")
+
+_retail_sessions: dict = {}
+
+
+def retail_reply(reply_token: str, messages: list):
+    requests.post("https://api.line.me/v2/bot/message/reply",
+        headers={"Authorization": f"Bearer {LINE_RETAIL_TOKEN}",
+                 "Content-Type": "application/json"},
+        json={"replyToken": reply_token, "messages": messages[:5]},
+        timeout=10)
+
+
+def retail_push(user_id: str, messages: list):
+    requests.post("https://api.line.me/v2/bot/message/push",
+        headers={"Authorization": f"Bearer {LINE_RETAIL_TOKEN}",
+                 "Content-Type": "application/json"},
+        json={"to": user_id, "messages": messages[:5]},
+        timeout=10)
+
+
+def _retail_get_partner(user_id: str) -> dict | None:
+    results = odoo_execute("res.partner", "search_read",
+        [[["comment", "like", f"line_retail:{user_id}"]]],
+        {"fields": ["id", "name", "email", "property_product_pricelist"], "limit": 1}
+    )
+    return results[0] if results else None
+
+
+def _retail_email_login(email: str) -> dict | None:
+    results = odoo_execute("res.partner", "search_read",
+        [[["email", "=ilike", email.strip()], ["customer_rank", ">", 0]]],
+        {"fields": ["id", "name", "email", "comment"], "limit": 1}
+    )
+    return results[0] if results else None
+
+
+def _retail_build_cat_flex(cats: list) -> dict:
+    buttons = []
+    for cid, label in cats[:10]:
+        buttons.append({
+            "type": "button", "style": "secondary", "height": "sm",
+            "action": {"type": "postback", "label": label[:40], "data": f"__rcat_{cid}"}
+        })
+    return {
+        "type": "flex", "altText": "เลือกหมวดหมู่สินค้า",
+        "contents": {
+            "type": "bubble",
+            "header": {
+                "type": "box", "layout": "vertical",
+                "backgroundColor": "#8B0000", "paddingAll": "14px",
+                "contents": [{"type": "text", "text": "🐷 Mister Cochon",
+                              "weight": "bold", "color": "#FFFFFF", "size": "md"}]
+            },
+            "body": {
+                "type": "box", "layout": "vertical",
+                "paddingAll": "10px", "spacing": "sm",
+                "contents": buttons
+            }
+        }
+    }
+
+
+def _retail_checkout_messages(cart: list, partner: dict) -> list:
+    """Generate checkout message with PromptPay info."""
+    total = sum(i["qty"] * i["price"] for i in cart)
+    lines = []
+    for i in cart:
+        lines.append(f"• {i['name'][:30]} ×{i['qty']} = {i['qty']*i['price']:,.0f}฿")
+    order_text = "\n".join(lines)
+    return [
+        {
+            "type": "flex", "altText": f"ยอดชำระ {total:,.0f}฿",
+            "contents": {
+                "type": "bubble",
+                "header": {
+                    "type": "box", "layout": "vertical",
+                    "backgroundColor": "#8B0000", "paddingAll": "14px",
+                    "contents": [{"type": "text", "text": "💳 ชำระเงิน / Payment",
+                                  "weight": "bold", "color": "#FFFFFF", "size": "md"}]
+                },
+                "body": {
+                    "type": "box", "layout": "vertical", "spacing": "md",
+                    "contents": [
+                        {"type": "text", "text": order_text, "wrap": True, "size": "sm", "color": "#333333"},
+                        {"type": "separator"},
+                        {"type": "box", "layout": "horizontal", "contents": [
+                            {"type": "text", "text": "ยอดรวม / Total", "weight": "bold", "flex": 2},
+                            {"type": "text", "text": f"{total:,.0f} ฿", "weight": "bold",
+                             "color": "#C8102E", "align": "end", "flex": 1}
+                        ]},
+                        {"type": "separator"},
+                        {"type": "text", "text": "📱 PromptPay", "weight": "bold", "size": "sm"},
+                        {"type": "text", "text": PROMPTPAY_NUMBER, "size": "xl",
+                         "weight": "bold", "color": "#1A3A6B", "align": "center"},
+                        {"type": "text", "text": "Mister Cochon / French Delicatessen",
+                         "size": "xs", "color": "#888888", "align": "center"},
+                        {"type": "separator"},
+                        {"type": "text", "wrap": True, "size": "xs", "color": "#666666",
+                         "text": "โอนเงินแล้วส่งสลิปในแชทนี้\nAfter payment, send your slip here."}
+                    ]
+                }
+            }
+        }
+    ]
+
+
+@app.post("/webhook/line-retail")
+async def webhook_line_retail(request: Request):
+    body_bytes = await request.body()
+    sig = request.headers.get("X-Line-Signature", "")
+    if LINE_RETAIL_SECRET:
+        import hmac as _hmac, hashlib as _hl, base64 as _b64
+        expected = _b64.b64encode(
+            _hmac.new(LINE_RETAIL_SECRET.encode(), body_bytes, _hl.sha256).digest()
+        ).decode()
+        if not _hmac.compare_digest(sig, expected):
+            return {"status": "invalid signature"}
+
+    body = json.loads(body_bytes)
+
+    for event in body.get("events", []):
+        event_type = event.get("type")
+        reply_token = event.get("replyToken", "")
+        user_id = event.get("source", {}).get("userId", "")
+        sess = _retail_sessions.get(user_id, {})
+
+        # ── Handle image (payment slip) ────────────────────────────────────
+        if event_type == "message" and event.get("message", {}).get("type") == "image":
+            partner = _retail_get_partner(user_id)
+            if partner and sess.get("pending_order_id"):
+                admin_id = os.getenv("LINE_ADMIN_ID", "")
+                order_id = sess["pending_order_id"]
+                order_name = sess.get("pending_order_name", str(order_id))
+                if admin_id:
+                    try:
+                        retail_push(admin_id, [line_text(
+                            f"💳 Slip reçu — {partner['name']}\n"
+                            f"Commande: {order_name}\n"
+                            f"LINE ID: {user_id}"
+                        )])
+                        # Forward the image to admin
+                        msg_id = event["message"]["id"]
+                        retail_push(admin_id, [{"type": "image",
+                            "originalContentUrl": f"https://api-data.line.me/v2/bot/message/{msg_id}/content",
+                            "previewImageUrl": f"https://api-data.line.me/v2/bot/message/{msg_id}/content"
+                        }])
+                    except Exception:
+                        pass
+                _retail_sessions[user_id] = {k: v for k, v in sess.items()
+                                              if k not in ("pending_order_id", "pending_order_name")}
+                retail_reply(reply_token, [line_text(
+                    "✅ ได้รับสลิปแล้ว ขอบคุณครับ!\n"
+                    "We received your payment slip. Thank you!\n\n"
+                    "ทีมงานจะยืนยันออร์เดอร์และจัดส่งสินค้าให้คุณโดยเร็ว\n"
+                    "Our team will confirm your order shortly."
+                )])
+            continue
+
+        # ── Extract text ───────────────────────────────────────────────────
+        if event_type == "postback":
+            text = event.get("postback", {}).get("data", "").strip()
+        elif event_type == "message" and event.get("message", {}).get("type") == "text":
+            text = event["message"]["text"].strip()
+        else:
+            continue
+
+        text_low = text.lower().strip()
+        partner = _retail_get_partner(user_id)
+
+        # ── Not authenticated ──────────────────────────────────────────────
+        if not partner:
+            if sess.get("state") == "awaiting_confirm":
+                if text_low in ("ใช่", "yes", "ยืนยัน", "confirm", "ok", "✅"):
+                    pid = sess["partner_id"]
+                    pname = sess["partner_name"]
+                    p_raw = odoo_execute("res.partner", "read", [[pid], ["comment"]], {})[0]
+                    comment = (p_raw.get("comment") or "") + f"\nline_retail:{user_id}"
+                    odoo_execute("res.partner", "write", [[pid], {"comment": comment.strip()}])
+                    _retail_sessions[user_id] = {}
+                    partner = _retail_get_partner(user_id)
+                    cats = _line_get_pro_categories()
+                    retail_reply(reply_token, [
+                        line_text(f"✅ ยินดีต้อนรับ คุณ{pname}!\nWelcome, {pname}!"),
+                        _retail_build_cat_flex(cats) if cats else line_text("พิมพ์ เมนู เพื่อดูสินค้า")
+                    ])
+                elif text_low in ("ไม่ใช่", "no", "ไม่", "cancel"):
+                    _retail_sessions.pop(user_id, None)
+                    retail_reply(reply_token, [line_text(
+                        "กรุณากรอกอีเมลของคุณอีกครั้ง\nPlease enter your email again."
+                    )])
+                else:
+                    retail_reply(reply_token, [line_text(
+                        "กรุณาพิมพ์ ใช่ หรือ ไม่ใช่\nPlease reply ใช่ (yes) or ไม่ใช่ (no)"
+                    )])
+                continue
+
+            p = _retail_email_login(text)
+            if p:
+                _retail_sessions[user_id] = {
+                    "state": "awaiting_confirm",
+                    "partner_id": p["id"],
+                    "partner_name": p["name"],
+                }
+                retail_reply(reply_token, [line_text(
+                    f"✅ พบบัญชี:\n*{p['name']}*\n\nถูกต้องไหม? Is this you?\n\n"
+                    "ใช่ / Yes   |   ไม่ใช่ / No"
+                )])
+            else:
+                retail_reply(reply_token, [line_text(
+                    "🐷 *Mister Cochon* — French Delicatessen\n\n"
+                    "กรุณากรอกอีเมลที่ลงทะเบียนไว้:\n"
+                    "Please enter your registered email address:"
+                )])
+            continue
+
+        # ── Authenticated ──────────────────────────────────────────────────
+        pricelist_id = partner.get("property_product_pricelist")
+        pricelist = pricelist_id[0] if isinstance(pricelist_id, (list, tuple)) else pricelist_id
+        cart = sess.get("cart", [])
+
+        # ── Logout ────────────────────────────────────────────────────────
+        if text_low in ("logout", "ออกจากระบบ"):
+            p_raw = odoo_execute("res.partner", "read", [[partner["id"]], ["comment"]], {})[0]
+            comment = (p_raw.get("comment") or "").replace(f"line_retail:{user_id}", "").strip()
+            odoo_execute("res.partner", "write", [[partner["id"]], {"comment": comment}])
+            _retail_sessions.pop(user_id, None)
+            retail_reply(reply_token, [line_text(
+                "👋 ออกจากระบบแล้ว\nYou have been logged out.\n\nกรอกอีเมลเพื่อเข้าสู่ระบบใหม่\nEnter your email to log back in."
+            )])
+            continue
+
+        # ── Postback: category selected ────────────────────────────────────
+        if text.startswith("__rcat_"):
+            cat_id = int(text.split("__rcat_")[1])
+            domain = [["active", "=", True], ["sale_ok", "=", True],
+                      ["product_tag_ids", "in", [cat_id]]]
+            prods = odoo_execute("product.product", "search_read",
+                [domain],
+                {"fields": ["id", "name", "default_code", "list_price", "description_sale"],
+                 "limit": 200, "context": {"lang": "th_TH"}}
+            )
+            if not prods:
+                prods = odoo_execute("product.product", "search_read",
+                    [domain],
+                    {"fields": ["id", "name", "default_code", "list_price", "description_sale"],
+                     "limit": 200, "context": {"lang": "en_US"}}
+                )
+            _retail_sessions[user_id] = {**sess, "category_products": prods, "page": 0}
+            retail_reply(reply_token, _line_build_carousel(prods, pricelist, 0))
+            continue
+
+        # ── Postback: view product detail ──────────────────────────────────
+        if text.startswith("__view_"):
+            raw = text[7:]
+            first, _, sku = raw.partition("_")
+            product_id = int(first) if first.isdigit() else 0
+            prods = sess.get("category_products", [])
+            prod = next((p for p in prods if p.get("id") == product_id), None)
+            if not prod:
+                found = odoo_execute("product.product", "search_read",
+                    [[["id", "=", product_id]]],
+                    {"fields": ["id", "name", "default_code", "list_price", "description_sale"],
+                     "limit": 1, "context": {"lang": "en_US"}}
+                )
+                prod = found[0] if found else None
+            if prod:
+                retail_reply(reply_token, _line_product_detail(prod, pricelist, sess.get("page", 0)))
+            continue
+
+        # ── Postback: page navigation ──────────────────────────────────────
+        if text.startswith("__page_"):
+            page = int(text.split("__page_")[1])
+            prods = sess.get("category_products", [])
+            _retail_sessions[user_id] = {**sess, "page": page}
+            retail_reply(reply_token, _line_build_carousel(prods, pricelist, page))
+            continue
+
+        # ── Postback: add to cart (fixed qty) ─────────────────────────────
+        if text.startswith("__aq_"):
+            parts = text[5:].split("_")
+            if len(parts) >= 4:
+                pid, sku, price_int, qty = int(parts[0]), parts[1], int(parts[2]), int(parts[3])
+                price = _line_get_client_price(pid, float(price_int), pricelist)
+                prods = sess.get("category_products", [])
+                prod = next((p for p in prods if p.get("id") == pid), None)
+                name = prod["name"] if prod else sku
+                short = name[:25]
+                existing = next((i for i in cart if i["pid"] == pid), None)
+                if existing:
+                    existing["qty"] += qty
+                else:
+                    cart.append({"pid": pid, "sku": sku, "name": name, "qty": qty, "price": price})
+                total = sum(i["qty"] * i["price"] for i in cart)
+                _retail_sessions[user_id] = {**sess, "cart": cart}
+                cur_page = sess.get("page", 0)
+                confirm_msg = line_text(f"✅ {short} ×{qty} เพิ่มแล้ว\nตะกร้า: {len(cart)} รายการ — {total:,.0f}฿")
+                msgs = [confirm_msg] + _line_build_carousel(prods, pricelist, cur_page)
+                retail_reply(reply_token, msgs[:5])
+            continue
+
+        # ── Postback: custom qty prompt ────────────────────────────────────
+        if text.startswith("__cq_"):
+            parts = text[5:].split("_")
+            if len(parts) >= 3:
+                _retail_sessions[user_id] = {**sess, "state": "awaiting_qty",
+                                              "pending_pid": int(parts[0]),
+                                              "pending_sku": parts[1],
+                                              "pending_price": int(parts[2])}
+                retail_reply(reply_token, [line_text("กรอกจำนวนที่ต้องการ:\nEnter quantity:")])
+            continue
+
+        # ── Awaiting custom qty ────────────────────────────────────────────
+        if sess.get("state") == "awaiting_qty" and text.isdigit():
+            qty = int(text)
+            pid = sess.get("pending_pid")
+            sku = sess.get("pending_sku", "")
+            price = _line_get_client_price(pid, float(sess.get("pending_price", 0)), pricelist)
+            prods = sess.get("category_products", [])
+            prod = next((p for p in prods if p.get("id") == pid), None)
+            name = prod["name"] if prod else sku
+            existing = next((i for i in cart if i["pid"] == pid), None)
+            if existing:
+                existing["qty"] += qty
+            else:
+                cart.append({"pid": pid, "sku": sku, "name": name, "qty": qty, "price": price})
+            total = sum(i["qty"] * i["price"] for i in cart)
+            _retail_sessions[user_id] = {**{k: v for k, v in sess.items()
+                                            if k not in ("state", "pending_pid", "pending_sku", "pending_price")},
+                                          "cart": cart}
+            retail_reply(reply_token, [line_text(
+                f"✅ {name[:25]} ×{qty} เพิ่มแล้ว\nตะกร้า: {len(cart)} รายการ — {total:,.0f}฿"
+            )])
+            continue
+
+        # ── Menu / catalogue ───────────────────────────────────────────────
+        if text_low in ("menu", "เมนู", "สินค้า", "catalog", "ดูสินค้า"):
+            cats = _line_get_pro_categories()
+            if cats:
+                retail_reply(reply_token, [_retail_build_cat_flex(cats)])
+            else:
+                retail_reply(reply_token, [line_text("ไม่พบหมวดหมู่สินค้า\nNo categories found.")])
+
+        # ── Cart ───────────────────────────────────────────────────────────
+        elif text_low in ("cart", "ตะกร้า", "ตะกร้าสินค้า"):
+            if not cart:
+                retail_reply(reply_token, [line_text("ตะกร้าสินค้าว่างเปล่า\nYour cart is empty.")])
+            else:
+                retail_reply(reply_token, _line_cart_messages(cart))
+
+        # ── Checkout ───────────────────────────────────────────────────────
+        elif text_low in ("checkout", "ชำระเงิน", "สั่งซื้อ", "order"):
+            if not cart:
+                retail_reply(reply_token, [line_text("ตะกร้าสินค้าว่างเปล่า\nYour cart is empty.")])
+            else:
+                # Create draft order in Odoo
+                lines_vals = []
+                for item in cart:
+                    price = _line_get_client_price(item["pid"], float(item["price"]), pricelist)
+                    lines_vals.append((0, 0, {
+                        "product_id": item["pid"],
+                        "product_uom_qty": item["qty"],
+                        "price_unit": price,
+                    }))
+                try:
+                    order_id = odoo_execute("sale.order", "create", [{
+                        "partner_id": partner["id"],
+                        "order_line": lines_vals,
+                        "note": f"LINE Retail — {user_id}",
+                    }])
+                    order_name = odoo_execute("sale.order", "read",
+                        [[order_id], ["name"]], {})[0]["name"]
+                    _retail_sessions[user_id] = {**sess,
+                        "pending_order_id": order_id,
+                        "pending_order_name": order_name,
+                        "cart": []}
+                except Exception:
+                    order_id = None
+                    order_name = "—"
+                    _retail_sessions[user_id] = {**sess, "cart": []}
+
+                msgs = _retail_checkout_messages(cart, partner)
+                retail_reply(reply_token, msgs)
+
+        # ── Clear cart ─────────────────────────────────────────────────────
+        elif text_low in ("cancel", "ยกเลิก", "clear", "ล้างตะกร้า"):
+            _retail_sessions[user_id] = {**sess, "cart": []}
+            retail_reply(reply_token, [line_text("🗑️ ล้างตะกร้าแล้ว\nCart cleared.")])
+
+        # ── Help ───────────────────────────────────────────────────────────
+        elif text_low in ("help", "ช่วยเหลือ", "?"):
+            retail_reply(reply_token, [line_text(
+                "🐷 *Mister Cochon — คำสั่งที่ใช้ได้*\n\n"
+                "📋 *เมนู* — ดูสินค้าทั้งหมด\n"
+                "🛒 *ตะกร้า* — ดูตะกร้าสินค้า\n"
+                "💳 *ชำระเงิน* — สั่งซื้อและชำระเงิน\n"
+                "🗑️ *ยกเลิก* — ล้างตะกร้า\n\n"
+                "📞 ติดต่อ: @jfbuc"
+            )])
+
+        # ── Default ────────────────────────────────────────────────────────
+        else:
+            retail_reply(reply_token, [line_quick_reply(
+                "ต้องการทำอะไร? / What would you like to do?",
+                [("📋 สินค้า", "เมนู"), ("🛒 ตะกร้า", "ตะกร้า"),
+                 ("💳 ชำระเงิน", "ชำระเงิน"), ("❓ ช่วยเหลือ", "help")]
+            )])
+
+    return {"status": "ok"}
+
