@@ -203,7 +203,7 @@ def build_richmenu_def() -> dict:
     for (row, col, _bg, _icon, _en, _th, action) in CELLS:
         areas.append({
             "bounds": {"x": col * CW, "y": row * CH, "width": CW, "height": CH},
-            "action": {"type": "message", "text": action}
+            "action": {"type": "postback", "data": action}
         })
     return {
         "size": {"width": W, "height": H},
