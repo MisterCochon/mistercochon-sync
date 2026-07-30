@@ -4536,22 +4536,35 @@ async def webhook_line(request: Request):
             line_reply(reply_token, [line_text(
                 "🇫🇷 *French Delicatessen — B2B Portal*\n\n"
                 "📋 *menu* — Browse the PRO catalog\n"
+                "🔄 *reorder* — Your usual products (last 5 orders)\n"
                 "🛒 *cart* — View your current cart\n"
                 "✅ *checkout* — Confirm & place your order\n"
                 "🗑️ *cancel* — Clear your cart\n"
                 "📦 *orders* — View your recent orders\n"
-                "🔄 *reorder* — Reload your last order into cart\n\n"
-                "Tap *Add to order* on any product, then choose a quantity.\n"
-                "You can add multiple products before checking out.\n\n"
+                "🔍 *FD001* — Search directly by SKU code\n\n"
                 "📞 Support: @jfbuc"
             )])
 
-        # ── Order from text (SKU x qty) ────────────────────────────────────
+        # ── SKU lookup: type a SKU to open product detail ─────────────────
         else:
-            items = _line_parse_order(text)
-            if items:
-                result = _line_create_order(partner, items)
-                line_reply(reply_token, [line_text(result)])
+            sku_match = re.match(r"^([A-Za-z0-9_\-]{2,20})(?:\s+(\d+))?$", text.strip())
+            if sku_match:
+                raw_sku = sku_match.group(1).upper()
+                prods_found = odoo_execute("product.product", "search_read",
+                    [[["default_code", "=ilike", raw_sku], ["active", "=", True]]],
+                    {"fields": ["id", "name", "default_code", "list_price", "description_sale"],
+                     "limit": 1, "context": {"lang": "en_US"}}
+                )
+                if prods_found:
+                    p = prods_found[0]
+                    sess = _line_sessions.get(user_id, {})
+                    back_page = sess.get("page", 0)
+                    line_reply(reply_token, _line_product_detail(p, pricelist, back_page))
+                else:
+                    line_reply(reply_token, [line_quick_reply(
+                        f"❌ SKU *{raw_sku}* not found.\n\nBrowse the catalog to find products:",
+                        [("📋 Catalog", "menu"), ("🛒 My cart", "cart")]
+                    )])
             else:
                 line_reply(reply_token, [line_quick_reply(
                     "What would you like to do?",
