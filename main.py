@@ -4031,6 +4031,21 @@ async def webhook_line(request: Request):
 
         partner = _line_get_partner(user_id)
 
+        # ── Logout ────────────────────────────────────────────────────────
+        if text_low in ("logout", "log out", "déconnexion", "ออกจากระบบ"):
+            if partner:
+                p = odoo_execute("res.partner", "read",
+                    [[partner["id"]], ["comment"]], {})[0]
+                comment = (p.get("comment") or "").replace(f"line:{user_id}", "").strip()
+                odoo_execute("res.partner", "write",
+                    [[partner["id"]], {"comment": comment}])
+            _line_sessions.pop(user_id, None)
+            line_reply(reply_token, [line_quick_reply(
+                "👋 You have been logged out.\n\nEnter your 5-digit code to log back in:",
+                [("🆕 New client", "NEW"), ("💬 Help", "HELP")]
+            )])
+            continue
+
         # ── Not authenticated ──────────────────────────────────────────────
         if not partner:
             sess = _line_sessions.get(user_id, {})
