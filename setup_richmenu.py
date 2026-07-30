@@ -40,7 +40,7 @@ CELLS = [
     (0, 1, NAVY, "cart",     "My Cart",          "ตะกร้าสินค้า",      "cart"),
     (0, 2, NAVY, "reorder",  "Reorder",          "สั่งซ้ำ",            "reorder"),
     (1, 0, NAVY, "orders",   "My Orders",        "ประวัติคำสั่งซื้อ",  "orders"),
-    (1, 1, NAVY, "help",     "Help",             "ช่วยเหลือ",          "help"),
+    (1, 1, NAVY, "search",   "Search SKU",       "ค้นหา SKU",          "search_sku"),
     (1, 2, RED,  "contact",  "Contact us",       "ติดต่อเรา",          "contact"),
 ]
 
@@ -112,17 +112,14 @@ def draw_icon(d: ImageDraw, cx: int, cy: int, name: str, size: int):
             y = by + int(bh * (0.35 + i * 0.2))
             d.line([(bx + lw * 3, y), (bx + bw - lw * 3, y)], fill=c, width=lw // 2 or 1)
 
-    elif name == "help":
-        # Circle with ?
-        r = int(s * 0.48)
-        d.ellipse([cx - r, cy - r, cx + r, cy + r], outline=c, width=lw)
-        try:
-            fq = ImageFont.truetype(FONT_EN_BOLD, int(s * 0.65))
-        except Exception:
-            fq = ImageFont.load_default()
-        bb = d.textbbox((0, 0), "?", font=fq)
-        tw, th = bb[2] - bb[0], bb[3] - bb[1]
-        d.text((cx - tw // 2, cy - th // 2 - th // 8), "?", font=fq, fill=c)
+    elif name == "search":
+        # Magnifying glass
+        r = int(s * 0.32)
+        d.ellipse([cx - r - int(s*0.05), cy - r - int(s*0.05),
+                   cx + r - int(s*0.05), cy + r - int(s*0.05)], outline=c, width=lw)
+        hx = cx + int(r * 0.65)
+        hy = cy + int(r * 0.65)
+        d.line([(hx, hy), (hx + int(s*0.28), hy + int(s*0.28))], fill=c, width=lw + 2)
 
     elif name == "contact":
         # Speech bubble

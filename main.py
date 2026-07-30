@@ -4588,6 +4588,14 @@ async def webhook_line(request: Request):
         elif text == "!myid":
             line_reply(reply_token, [line_text(f"Your LINE User ID:\n{user_id}")])
 
+        # ── SKU search prompt ─────────────────────────────────────────────
+        elif text_low in ("search_sku", "search", "ค้นหา sku"):
+            _line_sessions[user_id] = {**_line_sessions.get(user_id, {}), "state": "awaiting_sku"}
+            line_reply(reply_token, [line_text(
+                "🔍 Type a SKU code to search:\n\n"
+                "Example: JAMB2160 or MNCL2029"
+            )])
+
         # ── Help ──────────────────────────────────────────────────────────
         elif text_low in ("help", "?"):
             line_reply(reply_token, [line_text(
@@ -4604,7 +4612,9 @@ async def webhook_line(request: Request):
 
         # ── SKU lookup: type a SKU to open product detail ─────────────────
         else:
-            sku_match = re.match(r"^([A-Za-z0-9_\-]{2,20})(?:\s+(\d+))?$", text.strip())
+            sess = _line_sessions.get(user_id, {})
+            awaiting_sku = sess.get("state") == "awaiting_sku"
+            sku_match = re.match(r"^([A-Za-z0-9_\-]{2,20})(?:\s+(\d+))?$", text.strip()) if awaiting_sku else None
             if sku_match:
                 raw_sku = sku_match.group(1).upper()
                 prods_found = odoo_execute("product.product", "search_read",
@@ -4616,6 +4626,7 @@ async def webhook_line(request: Request):
                     p = prods_found[0]
                     sess = _line_sessions.get(user_id, {})
                     back_page = sess.get("page", 0)
+                    _line_sessions[user_id] = {k: v for k, v in sess.items() if k != "state"}
                     line_reply(reply_token, _line_product_detail(p, pricelist, back_page))
                 else:
                     line_reply(reply_token, [line_quick_reply(
