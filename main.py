@@ -3259,6 +3259,47 @@ def setup_richmenu(secret: str = ""):
         return {"status": "error", "error": str(e)}
 
 
+@app.get("/debug-reorder")
+def debug_reorder(secret: str = "", code: str = ""):
+    """Debug reorder: show what the bot finds for a client. /debug-reorder?secret=fd2026&code=62101"""
+    admin_secret = os.getenv("ADMIN_SECRET", "")
+    if not admin_secret or secret != admin_secret:
+        return {"status": "error", "error": "Invalid secret"}
+    # Find partner by code (last 5 digits of VAT)
+    partners = odoo_execute("res.partner", "search_read",
+        [[["vat", "!=", False], ["customer_rank", ">", 0]]],
+        {"fields": ["id", "name", "vat"], "limit": 2000}
+    )
+    partner = None
+    for p in (partners or []):
+        vat = re.sub(r"\D", "", p.get("vat") or "")
+        if vat.endswith(code[-5:] if len(code) >= 5 else code):
+            partner = p
+            break
+    if not partner:
+        return {"status": "error", "error": f"Partner not found for code {code}"}
+    orders = odoo_execute("sale.order", "search_read",
+        [[["partner_id", "child_of", partner["id"]], ["state", "in", ["sale", "done"]]]],
+        {"fields": ["id", "name", "state", "date_order"], "limit": 5, "order": "date_order desc"}
+    )
+    if not orders:
+        return {"partner": partner["name"], "orders": [], "note": "No confirmed orders found"}
+    oid_list = [o["id"] for o in orders]
+    lines = odoo_execute("sale.order.line", "search_read",
+        [[["order_id", "in", oid_list]]],
+        {"fields": ["product_id", "product_uom_qty", "order_id"], "limit": 200}
+    )
+    prod_ids = list({ln["product_id"][0] for ln in (lines or []) if ln.get("product_id")})
+    return {
+        "partner": partner["name"],
+        "partner_id": partner["id"],
+        "orders": [{"id": o["id"], "name": o["name"], "state": o["state"]} for o in orders],
+        "order_line_count": len(lines or []),
+        "unique_product_ids": prod_ids,
+        "product_count": len(prod_ids),
+    }
+
+
 # ─── Utilitaires import Ecwid ────────────────────────────────────────────────
 
 @app.get("/debug-ecwid-order/{order_num}")
@@ -4452,7 +4493,7 @@ async def webhook_line(request: Request):
         elif text_low in ("reorder", "recommander", "last order"):
             # Collect unique products from last 5 confirmed orders
             past_orders = odoo_execute("sale.order", "search_read",
-                [[["partner_id", "=", partner["id"]], ["state", "in", ["sale", "done"]]]],
+                [[["partner_id", "child_of", partner["id"]], ["state", "in", ["sale", "done"]]]],
                 {"fields": ["id"], "limit": 5, "order": "date_order desc"}
             )
             if not past_orders:
