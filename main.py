@@ -3479,7 +3479,7 @@ def line_quick_reply(text: str, items: list) -> dict:
     """
     def _action(lbl, txt):
         if txt.startswith("__"):
-            return {"type": "postback", "label": lbl[:20], "data": txt, "displayText": lbl[:20]}
+            return {"type": "postback", "label": lbl[:20], "data": txt}
         return {"type": "message", "label": lbl[:20], "text": txt}
 
     return {
@@ -3744,8 +3744,7 @@ def _line_build_carousel(products: list, pricelist, page: int = 0) -> list:
                         "color": "#1A3A6B", "height": "sm",
                         "action": {
                             "type": "postback", "label": "Add to order",
-                            "data": f"__add_{p['id']}_{sku}",
-                            "displayText": f"Add: {short[:30]}"
+                            "data": f"__add_{p['id']}_{sku}"
                         }
                     },
                     {
@@ -4298,11 +4297,31 @@ async def webhook_line(request: Request):
                 _line_sessions[user_id] = {"category_products": prods, "page": 0}
                 line_reply(reply_token, _line_build_carousel(prods, pricelist, 0))
                 continue
-            quick_items = [(label, f"__cat_{cid}") for cid, label in cats[:13]]
-            line_reply(reply_token, [line_quick_reply(
-                "🇫🇷 *French Delicatessen — PRO Catalog*\n\nSelect a category:",
-                quick_items
-            )])
+            # Flex bubble with category buttons — all visible on one screen
+            cat_buttons = []
+            for cid, label in cats[:10]:
+                cat_buttons.append({
+                    "type": "button", "style": "secondary", "height": "sm",
+                    "action": {"type": "postback", "label": label[:40], "data": f"__cat_{cid}"}
+                })
+            cat_flex = {
+                "type": "flex", "altText": "Select a category",
+                "contents": {
+                    "type": "bubble",
+                    "header": {
+                        "type": "box", "layout": "vertical",
+                        "backgroundColor": "#1A3A6B", "paddingAll": "14px",
+                        "contents": [{"type": "text", "text": "French Delicatessen PRO",
+                                      "weight": "bold", "color": "#FFFFFF", "size": "md"}]
+                    },
+                    "body": {
+                        "type": "box", "layout": "vertical",
+                        "paddingAll": "10px", "spacing": "sm",
+                        "contents": cat_buttons
+                    }
+                }
+            }
+            line_reply(reply_token, [cat_flex])
 
         # ── My orders ─────────────────────────────────────────────────────
         elif text_low in ("orders", "my orders", "history"):
@@ -4325,57 +4344,60 @@ async def webhook_line(request: Request):
                     [("Reorder last", "reorder"), ("New order", "menu")]
                 )])
 
-        # ── Reorder last confirmed order ───────────────────────────────────
+        # ── Reorder: show previously ordered products as carousel ──────────
         elif text_low in ("reorder", "recommander", "last order"):
-            last_orders = odoo_execute("sale.order", "search_read",
+            # Collect unique products from last 5 confirmed orders
+            past_orders = odoo_execute("sale.order", "search_read",
                 [[["partner_id", "=", partner["id"]], ["state", "in", ["sale", "done"]]]],
-                {"fields": ["id", "name", "date_order"], "limit": 1, "order": "date_order desc"}
+                {"fields": ["id"], "limit": 5, "order": "date_order desc"}
             )
-            if not last_orders:
+            if not past_orders:
                 line_reply(reply_token, [line_quick_reply(
-                    "No previous confirmed orders found.",
+                    "No previous orders found.",
                     [("Browse catalog", "menu")]
                 )])
             else:
-                last_order = last_orders[0]
-                order_lines = odoo_execute("sale.order.line", "search_read",
-                    [[["order_id", "=", last_order["id"]]]],
-                    {"fields": ["product_id", "product_uom_qty", "price_unit", "name"], "limit": 50}
+                oid_list = [o["id"] for o in past_orders]
+                all_lines = odoo_execute("sale.order.line", "search_read",
+                    [[["order_id", "in", oid_list]]],
+                    {"fields": ["product_id", "product_uom_qty"], "limit": 200}
                 )
-                if not order_lines:
+                # Deduplicate products, keep max qty ordered
+                seen, prod_ids = {}, []
+                for ln in all_lines:
+                    if not ln.get("product_id"):
+                        continue
+                    pid = ln["product_id"][0]
+                    qty = int(ln.get("product_uom_qty", 1))
+                    if pid not in seen:
+                        seen[pid] = qty
+                        prod_ids.append(pid)
+                    else:
+                        seen[pid] = max(seen[pid], qty)
+
+                if not prod_ids:
                     line_reply(reply_token, [line_quick_reply(
-                        f"Order {last_order['name']} has no items.",
+                        "No products found in previous orders.",
                         [("Browse catalog", "menu")]
                     )])
                 else:
-                    pids = [ln["product_id"][0] for ln in order_lines if ln.get("product_id")]
-                    sku_data = odoo_execute("product.product", "search_read",
-                        [[["id", "in", pids]]],
-                        {"fields": ["id", "default_code"], "limit": 100}
+                    prods = odoo_execute("product.product", "search_read",
+                        [[["id", "in", prod_ids], ["active", "=", True]]],
+                        {"fields": ["id", "name", "default_code", "list_price", "description_sale"],
+                         "limit": 100, "context": {"lang": "en_US"}}
                     )
-                    sku_by_id = {p["id"]: str(p.get("default_code") or "").upper() for p in sku_data}
-                    new_cart = []
-                    for ln in order_lines:
-                        if not ln.get("product_id"):
-                            continue
-                        pid   = ln["product_id"][0]
-                        pname = ln["product_id"][1] if isinstance(ln["product_id"], list) else str(ln["product_id"])
-                        qty   = max(1, int(ln.get("product_uom_qty", 1)))
-                        price = float(ln.get("price_unit", 0))
-                        price = _line_get_client_price(pid, price, pricelist)
-                        sku   = sku_by_id.get(pid, "")
-                        new_cart.append({"product_id": pid, "sku": sku,
-                                          "name": pname, "price": price, "qty": qty})
-                    if new_cart:
-                        sess = _line_sessions.get(user_id, {})
-                        _line_sessions[user_id] = {**sess, "cart": new_cart}
-                        date_str = str(last_order.get("date_order", ""))[:10]
-                        line_reply(reply_token,
-                            [line_text(f"Cart loaded from order {last_order['name']} ({date_str}).")]
-                            + _line_cart_messages(new_cart)
-                        )
+                    if not prods:
+                        line_reply(reply_token, [line_quick_reply(
+                            "Products from previous orders are no longer available.",
+                            [("Browse catalog", "menu")]
+                        )])
                     else:
-                        line_reply(reply_token, [line_text("Could not load items from last order.")])
+                        sess = _line_sessions.get(user_id, {})
+                        _line_sessions[user_id] = {**sess, "category_products": prods, "page": 0}
+                        line_reply(reply_token,
+                            [line_text(f"Your {len(prods)} previously ordered product{'s' if len(prods)>1 else ''}:")]
+                            + _line_build_carousel(prods, pricelist, 0)
+                        )
 
         # ── Contact (human support) ────────────────────────────────────────
         elif text_low in ("contact", "ติดต่อ", "ติดต่อเรา"):
