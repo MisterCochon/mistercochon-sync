@@ -4805,87 +4805,8 @@ async def webhook_line_retail(request: Request):
         user_id = event.get("source", {}).get("userId", "")
         sess = _retail_sessions.get(user_id, {})
 
-        # ── Handle image (payment slip) ────────────────────────────────────
+        # ── Handle image (ignored — payment via Stripe QR) ─────────────────
         if event_type == "message" and event.get("message", {}).get("type") == "image":
-            partner = _retail_get_partner(user_id)
-            if partner and sess.get("pending_order_id"):
-                msg_id = event["message"]["id"]
-                order_id = sess["pending_order_id"]
-                order_name = sess.get("pending_order_name", str(order_id))
-                expected_total = sess.get("pending_total", 0)
-                admin_id = os.getenv("LINE_ADMIN_ID", "")
-                slipok_key = os.getenv("SLIPOKME_API_KEY", "")
-
-                slip_ok = False
-                slip_amount = 0
-                slip_msg = ""
-
-                if slipok_key:
-                    try:
-                        # Download image from LINE
-                        img_resp = requests.get(
-                            f"https://api-data.line.me/v2/bot/message/{msg_id}/content",
-                            headers={"Authorization": f"Bearer {LINE_RETAIL_TOKEN}"},
-                            timeout=15
-                        )
-                        # Send to slip.ok.me for verification
-                        verify_resp = requests.post(
-                            "https://slip.ok.me/api/v1/slip",
-                            headers={"x-authorization": slipok_key},
-                            files={"files": ("slip.jpg", img_resp.content, "image/jpeg")},
-                            timeout=15
-                        )
-                        vdata = verify_resp.json()
-                        if vdata.get("success"):
-                            d = vdata.get("data", {})
-                            slip_amount = float(d.get("amount", 0))
-                            receiver_proxy = d.get("receiver", {}).get("proxy", {}).get("value", "")
-                            pp_clean = PROMPTPAY_NUMBER.lstrip("0")
-                            if pp_clean in receiver_proxy or PROMPTPAY_NUMBER in receiver_proxy:
-                                if expected_total == 0 or abs(slip_amount - expected_total) < 1:
-                                    slip_ok = True
-                                    slip_msg = f"✅ ยืนยันสลิป {slip_amount:,.0f}฿ — ถูกต้อง!"
-                                else:
-                                    slip_msg = f"⚠️ จำนวนเงินไม่ตรง: สลิป {slip_amount:,.0f}฿ แต่ยอด {expected_total:,.0f}฿"
-                            else:
-                                slip_msg = "⚠️ PromptPay ปลายทางไม่ตรง กรุณาตรวจสอบ"
-                        else:
-                            slip_msg = "⚠️ อ่านสลิปไม่ได้ ส่งไปให้ทีมงานตรวจสอบ"
-                    except Exception:
-                        slip_msg = "⚠️ ตรวจสอบสลิปไม่ได้ ส่งไปให้ทีมงานตรวจสอบ"
-
-                if slip_ok:
-                    # Auto-confirm order in Odoo
-                    try:
-                        odoo_execute("sale.order", "action_confirm", [[order_id]])
-                    except Exception:
-                        pass
-                    _retail_sessions[user_id] = {k: v for k, v in sess.items()
-                        if k not in ("pending_order_id", "pending_order_name", "pending_total")}
-                    retail_reply(reply_token, [line_text(
-                        f"✅ {slip_msg}\n\nคำสั่งซื้อ {order_name} ยืนยันแล้ว!\n"
-                        "Order confirmed! ขอบคุณครับ 🐷"
-                    )])
-                else:
-                    # Forward to admin for manual check
-                    if admin_id:
-                        try:
-                            retail_push(admin_id, [line_text(
-                                f"💳 Slip reçu — {partner['name']}\n"
-                                f"Commande: {order_name}\n{slip_msg}"
-                            )])
-                            retail_push(admin_id, [{"type": "image",
-                                "originalContentUrl": f"https://api-data.line.me/v2/bot/message/{msg_id}/content",
-                                "previewImageUrl": f"https://api-data.line.me/v2/bot/message/{msg_id}/content"
-                            }])
-                        except Exception:
-                            pass
-                    _retail_sessions[user_id] = {k: v for k, v in sess.items()
-                        if k not in ("pending_order_id", "pending_order_name", "pending_total")}
-                    retail_reply(reply_token, [line_text(
-                        f"{slip_msg}\n\nได้รับสลิปแล้ว ทีมงานจะยืนยันภายใน 1 ชั่วโมง\n"
-                        "Slip received. Team will confirm within 1 hour."
-                    )])
             continue
 
         # ── Extract text ───────────────────────────────────────────────────
@@ -5085,28 +5006,33 @@ async def webhook_line_retail(request: Request):
                      ("💳 บัตรเครดิต", "__pay_card")]
                 )])
 
-        # ── Pay via PromptPay ──────────────────────────────────────────────
+        # ── Pay via PromptPay (Stripe) ─────────────────────────────────────
         elif text == "__pay_promptpay":
             if not cart:
                 retail_reply(reply_token, [line_text("ตะกร้าสินค้าว่างเปล่า\nYour cart is empty.")])
+            elif not STRIPE_SECRET_KEY:
+                retail_reply(reply_token, [line_text("❌ Stripe not configured.")])
             else:
-                lines_vals = []
-                for item in cart:
-                    price = _line_get_client_price(item["pid"], float(item["price"]), pricelist)
-                    lines_vals.append((0, 0, {"product_id": item["pid"],
-                        "product_uom_qty": item["qty"], "price_unit": price}))
+                total = sum(i["qty"] * i["price"] for i in cart)
                 try:
-                    order_id = odoo_execute("sale.order", "create", [{
-                        "partner_id": partner["id"], "order_line": lines_vals,
-                        "note": f"LINE Retail PromptPay — {user_id}"}])
-                    order_name = odoo_execute("sale.order", "read",
-                        [[order_id], ["name"]], {})[0]["name"]
-                    total_pp = sum(i["qty"] * i["price"] for i in cart)
-                    _retail_sessions[user_id] = {**sess, "pending_order_id": order_id,
-                        "pending_order_name": order_name, "pending_total": total_pp, "cart": []}
-                except Exception:
-                    _retail_sessions[user_id] = {**sess, "cart": []}
-                retail_reply(reply_token, _retail_checkout_messages(cart, partner))
+                    intent = _stripe.PaymentIntent.create(
+                        amount=int(total * 100),
+                        currency="thb",
+                        payment_method_types=["promptpay"],
+                        metadata={"line_user_id": user_id, "partner_id": str(partner["id"]),
+                                  "cart": json.dumps([{"pid": i["pid"], "name": i["name"],
+                                      "qty": i["qty"], "price": i["price"]} for i in cart])},
+                    )
+                    qr_url = intent["next_action"]["promptpay_display_qr_code"]["image_url_png"]
+                    _retail_sessions[user_id] = {**sess, "stripe_cart": cart,
+                        "stripe_intent_id": intent["id"], "cart": []}
+                    retail_reply(reply_token, [
+                        line_text(f"📱 สแกน QR PromptPay เพื่อชำระ {total:,.0f}฿\n"
+                                  f"Scan to pay {total:,.0f}฿ via PromptPay"),
+                        {"type": "image", "originalContentUrl": qr_url, "previewImageUrl": qr_url}
+                    ])
+                except Exception as e:
+                    retail_reply(reply_token, [line_text(f"❌ Error: {str(e)[:100]}")])
 
         # ── Pay via Stripe Card ────────────────────────────────────────────
         elif text == "__pay_card":
@@ -5183,30 +5109,48 @@ async def webhook_stripe(request: Request):
     except Exception:
         return {"status": "invalid"}
 
-    if event.get("type") == "checkout.session.completed":
-        session = event["data"]["object"]
-        user_id = session.get("metadata", {}).get("line_user_id", "")
-        partner_id = int(session.get("metadata", {}).get("partner_id", 0))
-        sess = _retail_sessions.get(user_id, {})
-        cart = sess.get("stripe_cart", [])
-        if cart and partner_id:
-            lines_vals = [(0, 0, {"product_id": i["pid"],
-                "product_uom_qty": i["qty"], "price_unit": i["price"]}) for i in cart]
+    def _stripe_confirm_order(meta: dict, cart: list):
+        user_id = meta.get("line_user_id", "")
+        partner_id = int(meta.get("partner_id", 0) or 0)
+        if not cart:
             try:
-                order_id = odoo_execute("sale.order", "create", [{
-                    "partner_id": partner_id, "order_line": lines_vals,
-                    "note": f"LINE Retail Stripe — {user_id}"}])
-                odoo_execute("sale.order", "action_confirm", [[order_id]])
-                order_name = odoo_execute("sale.order", "read",
-                    [[order_id], ["name"]], {})[0]["name"]
+                cart = json.loads(meta.get("cart", "[]"))
             except Exception:
-                order_name = "—"
-            _retail_sessions[user_id] = {k: v for k, v in sess.items()
-                if k not in ("stripe_cart", "stripe_session_id")}
-            if user_id:
-                retail_push(user_id, [line_text(
-                    f"✅ ชำระเงินสำเร็จ!\nPayment confirmed!\n\nคำสั่งซื้อ: {order_name}\nขอบคุณครับ 🐷"
-                )])
+                cart = []
+        sess = _retail_sessions.get(user_id, {})
+        if not cart:
+            cart = sess.get("stripe_cart", [])
+        if not cart or not partner_id:
+            return
+        lines_vals = [(0, 0, {"product_id": i["pid"],
+            "product_uom_qty": i["qty"], "price_unit": i["price"]}) for i in cart]
+        try:
+            order_id = odoo_execute("sale.order", "create", [{
+                "partner_id": partner_id, "order_line": lines_vals,
+                "note": f"LINE Retail Stripe — {user_id}"}])
+            odoo_execute("sale.order", "action_confirm", [[order_id]])
+            order_name = odoo_execute("sale.order", "read",
+                [[order_id], ["name"]], {})[0]["name"]
+        except Exception:
+            order_name = "—"
+        _retail_sessions[user_id] = {k: v for k, v in sess.items()
+            if k not in ("stripe_cart", "stripe_session_id", "stripe_intent_id")}
+        if user_id:
+            retail_push(user_id, [line_text(
+                f"✅ ชำระเงินสำเร็จ!\nPayment confirmed!\n\nคำสั่งซื้อ: {order_name}\nขอบคุณครับ 🐷"
+            )])
+
+    etype = event.get("type", "")
+    obj = event.get("data", {}).get("object", {})
+    meta = obj.get("metadata", {})
+
+    if etype == "checkout.session.completed":
+        sess_cart = _retail_sessions.get(meta.get("line_user_id", ""), {}).get("stripe_cart", [])
+        _stripe_confirm_order(meta, sess_cart)
+
+    elif etype == "payment_intent.succeeded":
+        _stripe_confirm_order(meta, [])
+
     return {"status": "ok"}
 
 
