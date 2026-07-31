@@ -3634,13 +3634,13 @@ def _line_get_line_tag_id() -> int | None:
 
 
 def _line_get_pro_categories(extra_tags: list | None = None) -> list:
-    """Return (tag_id, label) pairs for the LINE bot menu.
+    """Return (id, label) pairs for the LINE B2B bot menu.
 
-    Excludes LINE-BELGO and LINE-Dofann from the public menu.
-    Applies a fixed display order. extra_tags allows injecting hidden
-    category tag ids (e.g. for BELGO clients).
+    Positive id  → product tag (LINE-* tags in Odoo).
+    Negative id  → product category (-categ_id), used as fallback when no
+                   LINE-* tags are configured in Odoo.
+    extra_tags allows injecting hidden tag ids (e.g. BELGO/Dofann).
     """
-    # Fixed display order for public categories
     PUBLIC_ORDER = [
         "LINE-Delicatessen",
         "LINE-Fresh Delicatessen",
@@ -3648,7 +3648,6 @@ def _line_get_pro_categories(extra_tags: list | None = None) -> list:
         "LINE-Butchery",
         "LINE-Premium",
     ]
-    HIDDEN = {"LINE-BELGO", "LINE-Dofann"}
 
     sub_tags = odoo_execute("product.tag", "search_read",
         [[["name", "=ilike", "LINE-%"]]],
@@ -3666,13 +3665,33 @@ def _line_get_pro_categories(extra_tags: list | None = None) -> list:
               ["product_tag_ids", "in", [tid]]]]
         )
         if count:
-            result.append((tid, name[5:].strip()))  # strip "LINE-" prefix
+            result.append((tid, name[5:].strip()))
 
     # Append any extra hidden-category tags (e.g. BELGO/Dofann products)
     for tid in (extra_tags or []):
         t = next((t for t in (sub_tags or []) if t["id"] == tid), None)
         if t:
             result.append((tid, t["name"][5:].strip()))
+
+    # Fallback: no LINE-* tags configured → use Odoo product categories
+    if not result:
+        EXCLUDE = {"all", "tous", "all products", "deliveries", "livraisons",
+                   "matieres premieres", "matières premières",
+                   "expense", "expenses", "default", "internal"}
+        cats = odoo_execute("product.category", "search_read",
+            [[]],
+            {"fields": ["id", "name"], "limit": 100}
+        )
+        for c in (cats or []):
+            if c["name"].lower() in EXCLUDE:
+                continue
+            count = odoo_execute("product.product", "search_count",
+                [[["active", "=", True], ["sale_ok", "=", True],
+                  ["categ_id", "=", c["id"]]]]
+            )
+            if count:
+                result.append((-c["id"], c["name"]))
+        result = result[:10]
 
     return result
 
