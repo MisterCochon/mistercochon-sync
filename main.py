@@ -4809,32 +4809,83 @@ async def webhook_line_retail(request: Request):
         if event_type == "message" and event.get("message", {}).get("type") == "image":
             partner = _retail_get_partner(user_id)
             if partner and sess.get("pending_order_id"):
-                admin_id = os.getenv("LINE_ADMIN_ID", "")
+                msg_id = event["message"]["id"]
                 order_id = sess["pending_order_id"]
                 order_name = sess.get("pending_order_name", str(order_id))
-                if admin_id:
+                expected_total = sess.get("pending_total", 0)
+                admin_id = os.getenv("LINE_ADMIN_ID", "")
+                slipok_key = os.getenv("SLIPOKME_API_KEY", "")
+
+                slip_ok = False
+                slip_amount = 0
+                slip_msg = ""
+
+                if slipok_key:
                     try:
-                        retail_push(admin_id, [line_text(
-                            f"💳 Slip reçu — {partner['name']}\n"
-                            f"Commande: {order_name}\n"
-                            f"LINE ID: {user_id}"
-                        )])
-                        # Forward the image to admin
-                        msg_id = event["message"]["id"]
-                        retail_push(admin_id, [{"type": "image",
-                            "originalContentUrl": f"https://api-data.line.me/v2/bot/message/{msg_id}/content",
-                            "previewImageUrl": f"https://api-data.line.me/v2/bot/message/{msg_id}/content"
-                        }])
+                        # Download image from LINE
+                        img_resp = requests.get(
+                            f"https://api-data.line.me/v2/bot/message/{msg_id}/content",
+                            headers={"Authorization": f"Bearer {LINE_RETAIL_TOKEN}"},
+                            timeout=15
+                        )
+                        # Send to slip.ok.me for verification
+                        verify_resp = requests.post(
+                            "https://slip.ok.me/api/v1/slip",
+                            headers={"x-authorization": slipok_key},
+                            files={"files": ("slip.jpg", img_resp.content, "image/jpeg")},
+                            timeout=15
+                        )
+                        vdata = verify_resp.json()
+                        if vdata.get("success"):
+                            d = vdata.get("data", {})
+                            slip_amount = float(d.get("amount", 0))
+                            receiver_proxy = d.get("receiver", {}).get("proxy", {}).get("value", "")
+                            pp_clean = PROMPTPAY_NUMBER.lstrip("0")
+                            if pp_clean in receiver_proxy or PROMPTPAY_NUMBER in receiver_proxy:
+                                if expected_total == 0 or abs(slip_amount - expected_total) < 1:
+                                    slip_ok = True
+                                    slip_msg = f"✅ ยืนยันสลิป {slip_amount:,.0f}฿ — ถูกต้อง!"
+                                else:
+                                    slip_msg = f"⚠️ จำนวนเงินไม่ตรง: สลิป {slip_amount:,.0f}฿ แต่ยอด {expected_total:,.0f}฿"
+                            else:
+                                slip_msg = "⚠️ PromptPay ปลายทางไม่ตรง กรุณาตรวจสอบ"
+                        else:
+                            slip_msg = "⚠️ อ่านสลิปไม่ได้ ส่งไปให้ทีมงานตรวจสอบ"
+                    except Exception:
+                        slip_msg = "⚠️ ตรวจสอบสลิปไม่ได้ ส่งไปให้ทีมงานตรวจสอบ"
+
+                if slip_ok:
+                    # Auto-confirm order in Odoo
+                    try:
+                        odoo_execute("sale.order", "action_confirm", [[order_id]])
                     except Exception:
                         pass
-                _retail_sessions[user_id] = {k: v for k, v in sess.items()
-                                              if k not in ("pending_order_id", "pending_order_name")}
-                retail_reply(reply_token, [line_text(
-                    "✅ ได้รับสลิปแล้ว ขอบคุณครับ!\n"
-                    "We received your payment slip. Thank you!\n\n"
-                    "ทีมงานจะยืนยันออร์เดอร์และจัดส่งสินค้าให้คุณโดยเร็ว\n"
-                    "Our team will confirm your order shortly."
-                )])
+                    _retail_sessions[user_id] = {k: v for k, v in sess.items()
+                        if k not in ("pending_order_id", "pending_order_name", "pending_total")}
+                    retail_reply(reply_token, [line_text(
+                        f"✅ {slip_msg}\n\nคำสั่งซื้อ {order_name} ยืนยันแล้ว!\n"
+                        "Order confirmed! ขอบคุณครับ 🐷"
+                    )])
+                else:
+                    # Forward to admin for manual check
+                    if admin_id:
+                        try:
+                            retail_push(admin_id, [line_text(
+                                f"💳 Slip reçu — {partner['name']}\n"
+                                f"Commande: {order_name}\n{slip_msg}"
+                            )])
+                            retail_push(admin_id, [{"type": "image",
+                                "originalContentUrl": f"https://api-data.line.me/v2/bot/message/{msg_id}/content",
+                                "previewImageUrl": f"https://api-data.line.me/v2/bot/message/{msg_id}/content"
+                            }])
+                        except Exception:
+                            pass
+                    _retail_sessions[user_id] = {k: v for k, v in sess.items()
+                        if k not in ("pending_order_id", "pending_order_name", "pending_total")}
+                    retail_reply(reply_token, [line_text(
+                        f"{slip_msg}\n\nได้รับสลิปแล้ว ทีมงานจะยืนยันภายใน 1 ชั่วโมง\n"
+                        "Slip received. Team will confirm within 1 hour."
+                    )])
             continue
 
         # ── Extract text ───────────────────────────────────────────────────
@@ -5050,8 +5101,9 @@ async def webhook_line_retail(request: Request):
                         "note": f"LINE Retail PromptPay — {user_id}"}])
                     order_name = odoo_execute("sale.order", "read",
                         [[order_id], ["name"]], {})[0]["name"]
+                    total_pp = sum(i["qty"] * i["price"] for i in cart)
                     _retail_sessions[user_id] = {**sess, "pending_order_id": order_id,
-                        "pending_order_name": order_name, "cart": []}
+                        "pending_order_name": order_name, "pending_total": total_pp, "cart": []}
                 except Exception:
                     _retail_sessions[user_id] = {**sess, "cart": []}
                 retail_reply(reply_token, _retail_checkout_messages(cart, partner))
