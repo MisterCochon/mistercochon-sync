@@ -4688,6 +4688,23 @@ def _retail_email_login(email: str) -> dict | None:
     return results[0] if results else None
 
 
+def _retail_get_categories() -> list:
+    """Return (categ_id, label) pairs from Odoo internal product categories that have active products."""
+    cats = odoo_execute("product.category", "search_read",
+        [[["parent_id", "!=", False]]],
+        {"fields": ["id", "name", "complete_name"], "limit": 50}
+    )
+    result = []
+    for c in (cats or []):
+        count = odoo_execute("product.product", "search_count",
+            [[["active", "=", True], ["sale_ok", "=", True],
+              ["categ_id", "=", c["id"]]]]
+        )
+        if count:
+            result.append((c["id"], c["name"]))
+    return result[:10]
+
+
 def _retail_build_cat_flex(cats: list) -> dict:
     buttons = []
     for cid, label in cats[:10]:
@@ -4825,7 +4842,7 @@ async def webhook_line_retail(request: Request):
                     odoo_execute("res.partner", "write", [[pid], {"comment": comment.strip()}])
                     _retail_sessions[user_id] = {}
                     partner = _retail_get_partner(user_id)
-                    cats = _line_get_pro_categories()
+                    cats = _retail_get_categories()
                     retail_reply(reply_token, [
                         line_text(f"✅ ยินดีต้อนรับ คุณ{pname}!\nWelcome, {pname}!"),
                         _retail_build_cat_flex(cats) if cats else line_text("พิมพ์ เมนู เพื่อดูสินค้า")
@@ -4880,18 +4897,12 @@ async def webhook_line_retail(request: Request):
         if text.startswith("__rcat_"):
             cat_id = int(text.split("__rcat_")[1])
             domain = [["active", "=", True], ["sale_ok", "=", True],
-                      ["product_tag_ids", "in", [cat_id]]]
+                      ["categ_id", "=", cat_id]]
             prods = odoo_execute("product.product", "search_read",
                 [domain],
                 {"fields": ["id", "name", "default_code", "list_price", "description_sale"],
-                 "limit": 200, "context": {"lang": "th_TH"}}
+                 "limit": 200, "context": {"lang": "en_US"}}
             )
-            if not prods:
-                prods = odoo_execute("product.product", "search_read",
-                    [domain],
-                    {"fields": ["id", "name", "default_code", "list_price", "description_sale"],
-                     "limit": 200, "context": {"lang": "en_US"}}
-                )
             _retail_sessions[user_id] = {**sess, "category_products": prods, "page": 0}
             retail_reply(reply_token, _line_build_carousel(prods, pricelist, 0))
             continue
@@ -4981,7 +4992,7 @@ async def webhook_line_retail(request: Request):
 
         # ── Menu / catalogue ───────────────────────────────────────────────
         if text_low in ("menu", "เมนู", "สินค้า", "catalog", "ดูสินค้า"):
-            cats = _line_get_pro_categories()
+            cats = _retail_get_categories()
             if cats:
                 retail_reply(reply_token, [_retail_build_cat_flex(cats)])
             else:
