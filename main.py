@@ -4694,12 +4694,15 @@ def _retail_get_categories() -> list:
         [[]],
         {"fields": ["id", "name"], "limit": 100}
     )
+    EXCLUDE = {"all", "tous", "all products", "deliveries", "livraisons",
+               "matieres premieres", "matières premières", "pro", "expense",
+               "expenses", "default", "internal"}
     result = []
     for c in (cats or []):
-        if c["name"].lower() in ("all", "tous", "all products"):
+        if c["name"].lower() in EXCLUDE:
             continue
         count = odoo_execute("product.product", "search_count",
-            [[["active", "=", True], ["categ_id", "=", c["id"]]]]
+            [[["active", "=", True], ["sale_ok", "=", True], ["categ_id", "=", c["id"]]]]
         )
         if count:
             result.append((c["id"], c["name"]))
