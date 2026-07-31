@@ -5023,6 +5023,12 @@ async def webhook_line_retail(request: Request):
                                   "cart": json.dumps([{"pid": i["pid"], "name": i["name"],
                                       "qty": i["qty"], "price": i["price"]} for i in cart])},
                     )
+                    # Confirm with promptpay payment method to generate QR code
+                    intent = _stripe.PaymentIntent.confirm(
+                        intent["id"],
+                        payment_method_data={"type": "promptpay"},
+                        return_url=f"{RENDER_URL}/payment-success?user={user_id}",
+                    )
                     qr_url = intent["next_action"]["promptpay_display_qr_code"]["image_url_png"]
                     _retail_sessions[user_id] = {**sess, "stripe_cart": cart,
                         "stripe_intent_id": intent["id"], "cart": []}
