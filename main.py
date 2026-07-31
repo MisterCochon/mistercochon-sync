@@ -2,9 +2,11 @@ import os
 import csv
 import io
 import re
+import json
 import asyncio
 import requests
 import xmlrpc.client
+import stripe as _stripe
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, UploadFile, File, Request
 from pydantic import BaseModel
@@ -4649,9 +4651,13 @@ async def webhook_line(request: Request):
 # LINE RETAIL BOT — Mister Cochon (@920gsiph)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-LINE_RETAIL_SECRET = os.getenv("LINE_RETAIL_CHANNEL_SECRET", "")
-LINE_RETAIL_TOKEN  = os.getenv("LINE_RETAIL_ACCESS_TOKEN", "")
-PROMPTPAY_NUMBER   = os.getenv("PROMPTPAY_NUMBER", "0957291373")
+LINE_RETAIL_SECRET  = os.getenv("LINE_RETAIL_CHANNEL_SECRET", "")
+LINE_RETAIL_TOKEN   = os.getenv("LINE_RETAIL_ACCESS_TOKEN", "")
+PROMPTPAY_NUMBER    = os.getenv("PROMPTPAY_NUMBER", "0957291373")
+STRIPE_SECRET_KEY   = os.getenv("STRIPE_SECRET_KEY", "")
+if STRIPE_SECRET_KEY:
+    _stripe.api_key = STRIPE_SECRET_KEY
+RENDER_URL = os.getenv("RENDER_EXTERNAL_URL", "https://mistercochon-backend.onrender.com")
 
 _retail_sessions: dict = {}
 
@@ -5016,39 +5022,73 @@ async def webhook_line_retail(request: Request):
             else:
                 retail_reply(reply_token, _line_cart_messages(cart))
 
-        # ── Checkout ───────────────────────────────────────────────────────
+        # ── Checkout: choose payment method ────────────────────────────────
         elif text_low in ("checkout", "ชำระเงิน", "สั่งซื้อ", "order"):
             if not cart:
                 retail_reply(reply_token, [line_text("ตะกร้าสินค้าว่างเปล่า\nYour cart is empty.")])
             else:
-                # Create draft order in Odoo
+                total = sum(i["qty"] * i["price"] for i in cart)
+                retail_reply(reply_token, [line_quick_reply(
+                    f"ยอดรวม {total:,.0f}฿ — เลือกวิธีชำระเงิน\nTotal {total:,.0f}฿ — Choose payment:",
+                    [("📱 PromptPay", "__pay_promptpay"),
+                     ("💳 บัตรเครดิต", "__pay_card")]
+                )])
+
+        # ── Pay via PromptPay ──────────────────────────────────────────────
+        elif text == "__pay_promptpay":
+            if not cart:
+                retail_reply(reply_token, [line_text("ตะกร้าสินค้าว่างเปล่า\nYour cart is empty.")])
+            else:
                 lines_vals = []
                 for item in cart:
                     price = _line_get_client_price(item["pid"], float(item["price"]), pricelist)
-                    lines_vals.append((0, 0, {
-                        "product_id": item["pid"],
-                        "product_uom_qty": item["qty"],
-                        "price_unit": price,
-                    }))
+                    lines_vals.append((0, 0, {"product_id": item["pid"],
+                        "product_uom_qty": item["qty"], "price_unit": price}))
                 try:
                     order_id = odoo_execute("sale.order", "create", [{
-                        "partner_id": partner["id"],
-                        "order_line": lines_vals,
-                        "note": f"LINE Retail — {user_id}",
-                    }])
+                        "partner_id": partner["id"], "order_line": lines_vals,
+                        "note": f"LINE Retail PromptPay — {user_id}"}])
                     order_name = odoo_execute("sale.order", "read",
                         [[order_id], ["name"]], {})[0]["name"]
-                    _retail_sessions[user_id] = {**sess,
-                        "pending_order_id": order_id,
-                        "pending_order_name": order_name,
-                        "cart": []}
+                    _retail_sessions[user_id] = {**sess, "pending_order_id": order_id,
+                        "pending_order_name": order_name, "cart": []}
                 except Exception:
-                    order_id = None
-                    order_name = "—"
                     _retail_sessions[user_id] = {**sess, "cart": []}
+                retail_reply(reply_token, _retail_checkout_messages(cart, partner))
 
-                msgs = _retail_checkout_messages(cart, partner)
-                retail_reply(reply_token, msgs)
+        # ── Pay via Stripe Card ────────────────────────────────────────────
+        elif text == "__pay_card":
+            if not cart:
+                retail_reply(reply_token, [line_text("ตะกร้าสินค้าว่างเปล่า\nYour cart is empty.")])
+            elif not STRIPE_SECRET_KEY:
+                retail_reply(reply_token, [line_text("❌ Stripe not configured.")])
+            else:
+                total = sum(i["qty"] * i["price"] for i in cart)
+                line_items = []
+                for item in cart:
+                    price = _line_get_client_price(item["pid"], float(item["price"]), pricelist)
+                    line_items.append({
+                        "price_data": {"currency": "thb",
+                            "unit_amount": int(price * 100),
+                            "product_data": {"name": item["name"][:80]}},
+                        "quantity": item["qty"],
+                    })
+                try:
+                    session = _stripe.checkout.Session.create(
+                        payment_method_types=["card"],
+                        line_items=line_items,
+                        mode="payment",
+                        success_url=f"{RENDER_URL}/payment-success?user={user_id}",
+                        cancel_url=f"{RENDER_URL}/payment-cancel?user={user_id}",
+                        metadata={"line_user_id": user_id, "partner_id": str(partner["id"])},
+                    )
+                    _retail_sessions[user_id] = {**sess, "stripe_cart": cart,
+                        "stripe_session_id": session.id}
+                    retail_reply(reply_token, [line_text(
+                        f"💳 ชำระเงินด้วยบัตร {total:,.0f}฿\nPay {total:,.0f}฿ by card:\n\n{session.url}"
+                    )])
+                except Exception as e:
+                    retail_reply(reply_token, [line_text(f"❌ Stripe error: {str(e)[:100]}")])
 
         # ── Clear cart ─────────────────────────────────────────────────────
         elif text_low in ("cancel", "ยกเลิก", "clear", "ล้างตะกร้า"):
@@ -5075,4 +5115,64 @@ async def webhook_line_retail(request: Request):
             )])
 
     return {"status": "ok"}
+
+
+# ── Stripe webhook ─────────────────────────────────────────────────────────────
+@app.post("/webhook/stripe")
+async def webhook_stripe(request: Request):
+    payload = await request.body()
+    sig_header = request.headers.get("stripe-signature", "")
+    stripe_webhook_secret = os.getenv("STRIPE_WEBHOOK_SECRET", "")
+    try:
+        if stripe_webhook_secret:
+            event = _stripe.Webhook.construct_event(payload, sig_header, stripe_webhook_secret)
+        else:
+            event = json.loads(payload)
+    except Exception:
+        return {"status": "invalid"}
+
+    if event.get("type") == "checkout.session.completed":
+        session = event["data"]["object"]
+        user_id = session.get("metadata", {}).get("line_user_id", "")
+        partner_id = int(session.get("metadata", {}).get("partner_id", 0))
+        sess = _retail_sessions.get(user_id, {})
+        cart = sess.get("stripe_cart", [])
+        if cart and partner_id:
+            lines_vals = [(0, 0, {"product_id": i["pid"],
+                "product_uom_qty": i["qty"], "price_unit": i["price"]}) for i in cart]
+            try:
+                order_id = odoo_execute("sale.order", "create", [{
+                    "partner_id": partner_id, "order_line": lines_vals,
+                    "note": f"LINE Retail Stripe — {user_id}"}])
+                odoo_execute("sale.order", "action_confirm", [[order_id]])
+                order_name = odoo_execute("sale.order", "read",
+                    [[order_id], ["name"]], {})[0]["name"]
+            except Exception:
+                order_name = "—"
+            _retail_sessions[user_id] = {k: v for k, v in sess.items()
+                if k not in ("stripe_cart", "stripe_session_id")}
+            if user_id:
+                retail_push(user_id, [line_text(
+                    f"✅ ชำระเงินสำเร็จ!\nPayment confirmed!\n\nคำสั่งซื้อ: {order_name}\nขอบคุณครับ 🐷"
+                )])
+    return {"status": "ok"}
+
+
+from fastapi.responses import HTMLResponse
+
+@app.get("/payment-success")
+async def payment_success():
+    return HTMLResponse("""
+    <html><body style="font-family:sans-serif;text-align:center;padding:40px">
+    <h1 style="color:#2e7d32">✅ ชำระเงินสำเร็จ! Payment successful!</h1>
+    <p>กลับไปที่ LINE เพื่อดูยืนยันคำสั่งซื้อ<br>Return to LINE to see your order confirmation.</p>
+    </body></html>""")
+
+@app.get("/payment-cancel")
+async def payment_cancel():
+    return HTMLResponse("""
+    <html><body style="font-family:sans-serif;text-align:center;padding:40px">
+    <h1 style="color:#c62828">❌ ยกเลิกการชำระเงิน / Payment cancelled</h1>
+    <p>กลับไปที่ LINE / Return to LINE.</p>
+    </body></html>""")
 
