@@ -4689,16 +4689,17 @@ def _retail_email_login(email: str) -> dict | None:
 
 
 def _retail_get_categories() -> list:
-    """Return (categ_id, label) pairs from Odoo internal product categories that have active products."""
+    """Return (categ_id, label) pairs from Odoo product categories that have active sale products."""
     cats = odoo_execute("product.category", "search_read",
-        [[["parent_id", "!=", False]]],
-        {"fields": ["id", "name", "complete_name"], "limit": 50}
+        [[]],
+        {"fields": ["id", "name"], "limit": 100}
     )
     result = []
     for c in (cats or []):
+        if c["name"].lower() in ("all", "tous", "all products"):
+            continue
         count = odoo_execute("product.product", "search_count",
-            [[["active", "=", True], ["sale_ok", "=", True],
-              ["categ_id", "=", c["id"]]]]
+            [[["active", "=", True], ["categ_id", "=", c["id"]]]]
         )
         if count:
             result.append((c["id"], c["name"]))
