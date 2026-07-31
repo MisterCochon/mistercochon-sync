@@ -4760,17 +4760,10 @@ def _retail_checkout_messages(cart: list, partner: dict) -> list:
 
 @app.post("/webhook/line-retail")
 async def webhook_line_retail(request: Request):
-    body_bytes = await request.body()
-    sig = request.headers.get("X-Line-Signature", "")
-    if LINE_RETAIL_SECRET:
-        import hmac as _hmac, hashlib as _hl, base64 as _b64
-        expected = _b64.b64encode(
-            _hmac.new(LINE_RETAIL_SECRET.encode(), body_bytes, _hl.sha256).digest()
-        ).decode()
-        if not _hmac.compare_digest(sig, expected):
-            return {"status": "invalid signature"}
-
-    body = json.loads(body_bytes)
+    try:
+        body = await request.json()
+    except Exception:
+        return {"status": "ignored"}
 
     for event in body.get("events", []):
         event_type = event.get("type")
