@@ -4736,12 +4736,14 @@ def _retail_build_cat_flex(cats: list) -> dict:
 
 
 def _retail_checkout_messages(cart: list, partner: dict) -> list:
-    """Generate checkout message with PromptPay info."""
+    """Generate checkout message with PromptPay info and QR code."""
     total = sum(i["qty"] * i["price"] for i in cart)
     lines = []
     for i in cart:
         lines.append(f"• {i['name'][:30]} ×{i['qty']} = {i['qty']*i['price']:,.0f}฿")
     order_text = "\n".join(lines)
+    # PromptPay QR code with amount via promptpay.io
+    qr_url = f"https://promptpay.io/{PROMPTPAY_NUMBER}/{int(total)}.png"
     return [
         {
             "type": "flex", "altText": f"ยอดชำระ {total:,.0f}฿",
@@ -4771,10 +4773,15 @@ def _retail_checkout_messages(cart: list, partner: dict) -> list:
                          "size": "xs", "color": "#888888", "align": "center"},
                         {"type": "separator"},
                         {"type": "text", "wrap": True, "size": "xs", "color": "#666666",
-                         "text": "โอนเงินแล้วส่งสลิปในแชทนี้\nAfter payment, send your slip here."}
+                         "text": "สแกน QR หรือโอนผ่านเบอร์โทร\nScan QR or transfer via phone number\nแล้วส่งสลิปในแชทนี้ / Then send slip here."}
                     ]
                 }
             }
+        },
+        {
+            "type": "image",
+            "originalContentUrl": qr_url,
+            "previewImageUrl": qr_url
         }
     ]
 
