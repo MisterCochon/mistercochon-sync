@@ -3240,7 +3240,17 @@ async def webhook_stripe(request: Request):
         }
 
     result = _mark_order_paid_odoo(str(ecwid_ref), stripe_id)
-    return {"status": "ok", "event": event_type, "ecwid_ref": ecwid_ref, "result": result}
+
+    # Marquer aussi la commande comme payée dans Ecwid
+    ecwid_result = {}
+    try:
+        ecwid_put(f"/orders/{ecwid_ref}", {"paymentStatus": "PAID"})
+        ecwid_result = {"ecwid_updated": True}
+    except Exception as e:
+        ecwid_result = {"ecwid_updated": False, "error": str(e)}
+
+    return {"status": "ok", "event": event_type, "ecwid_ref": ecwid_ref,
+            "result": result, "ecwid": ecwid_result}
 
 
 # ─── LINE Rich Menu setup ────────────────────────────────────────────────────
