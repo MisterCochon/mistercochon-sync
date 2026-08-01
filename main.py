@@ -5197,3 +5197,119 @@ async def payment_cancel():
     <p>กลับไปที่ LINE / Return to LINE.</p>
     </body></html>""")
 
+
+# ─── PromptPay Stripe — Page de paiement Ecwid ───────────────────────────────
+
+@app.get("/pay/{order_number}")
+async def pay_ecwid_promptpay(order_number: str):
+    """Page de paiement PromptPay Stripe pour commande Ecwid."""
+    if not STRIPE_SECRET_KEY:
+        return HTMLResponse("<h2 style='font-family:sans-serif;padding:40px;color:red'>Stripe non configuré</h2>", status_code=500)
+
+    # Récupérer la commande Ecwid
+    data = ecwid_get("/orders", {"orderNumber": order_number, "limit": 1})
+    if not data or not data.get("items"):
+        return HTMLResponse("<h1 style='font-family:sans-serif;padding:40px'>Commande introuvable</h1>", status_code=404)
+
+    eco = data["items"][0]
+    total = float(eco.get("total", 0))
+    amount = int(total * 100)
+    customer_name = (eco.get("billingPerson") or {}).get("name", "")
+    payment_status = eco.get("paymentStatus", "")
+
+    if payment_status == "PAID":
+        return HTMLResponse(f"""<!DOCTYPE html><html><head><meta charset=UTF-8>
+        <meta name=viewport content="width=device-width,initial-scale=1">
+        <title>Déjà payée</title></head>
+        <body style="font-family:sans-serif;text-align:center;padding:60px;background:#f4f4f4">
+        <div style="background:#fff;border-radius:12px;padding:32px;max-width:400px;margin:0 auto">
+        <div style="font-size:60px">✅</div>
+        <h2 style="color:#1a7a40;margin:16px 0">Commande #{order_number} payée</h2>
+        <p>Merci pour votre paiement !</p>
+        </div></body></html>""")
+
+    # Créer PaymentIntent Stripe PromptPay
+    try:
+        intent = _stripe.PaymentIntent.create(
+            amount=amount,
+            currency="thb",
+            payment_method_types=["promptpay"],
+            metadata={"ecwid_order_id": order_number},
+            description=f"Commande Ecwid #{order_number}",
+        )
+        confirmed = _stripe.PaymentIntent.confirm(
+            intent.id,
+            payment_method_data={"type": "promptpay"},
+            return_url=f"{RENDER_URL}/payment-success?order={order_number}",
+        )
+        qr_data = (confirmed.next_action or {}).get("promptpay_display_qr_code", {})
+        qr_image = qr_data.get("image_url_png", "")
+        amount_display = f"{total:,.0f}"
+    except Exception as e:
+        return HTMLResponse(f"<h2 style='font-family:sans-serif;padding:40px;color:red'>Erreur: {e}</h2>", status_code=500)
+
+    return HTMLResponse(f"""<!DOCTYPE html>
+<html lang="fr"><head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
+<title>Payer commande #{order_number}</title>
+<style>
+*{{box-sizing:border-box;margin:0;padding:0}}
+body{{font-family:-apple-system,BlinkMacSystemFont,sans-serif;background:#f4f4f4;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:16px}}
+.card{{background:#fff;border-radius:16px;padding:28px 24px;max-width:420px;width:100%;box-shadow:0 4px 20px rgba(0,0,0,.1);text-align:center}}
+.logo{{color:#c8102e;font-size:20px;font-weight:800;margin-bottom:4px}}
+.order{{color:#888;font-size:13px;margin-bottom:20px}}
+.amount{{font-size:32px;font-weight:800;color:#222;margin-bottom:6px}}
+.currency{{font-size:16px;color:#888;margin-bottom:20px}}
+.qr-wrap{{background:#f8f8f8;border-radius:12px;padding:16px;margin-bottom:20px;display:inline-block}}
+.qr-wrap img{{width:220px;height:220px;display:block}}
+.steps{{text-align:left;background:#fff8f0;border-radius:10px;padding:14px 16px;margin-bottom:20px}}
+.steps h3{{font-size:13px;font-weight:700;color:#e65c00;margin-bottom:8px}}
+.steps ol{{padding-left:18px;font-size:13px;color:#555;line-height:1.8}}
+.waiting{{color:#888;font-size:13px;display:flex;align-items:center;justify-content:center;gap:8px}}
+.dot{{width:8px;height:8px;background:#c8102e;border-radius:50%;animation:pulse 1.2s infinite}}
+@keyframes pulse{{0%,100%{{opacity:1}}50%{{opacity:.3}}}}
+</style>
+</head>
+<body>
+<div class="card">
+  <div class="logo">🐷 Mister Cochon</div>
+  <div class="order">Commande #{order_number}{f" — {customer_name}" if customer_name else ""}</div>
+  <div class="amount">฿{amount_display}</div>
+  <div class="currency">Montant total TTC</div>
+  <div class="qr-wrap">
+    <img src="{qr_image}" alt="QR PromptPay"/>
+  </div>
+  <div class="steps">
+    <h3>Comment payer / How to pay:</h3>
+    <ol>
+      <li>Ouvrez votre app bancaire / Open your banking app</li>
+      <li>Scannez le QR / Scan the QR code</li>
+      <li>Vérifiez ฿{amount_display} et confirmez / Verify and confirm</li>
+      <li>Cette page se met à jour automatiquement</li>
+    </ol>
+  </div>
+  <div class="waiting"><div class="dot"></div> En attente de paiement / Waiting for payment...</div>
+</div>
+<script>
+setInterval(async function(){{
+  try{{
+    var r = await fetch('/check-payment/{order_number}');
+    var d = await r.json();
+    if(d.paid){{
+      document.body.innerHTML = '<div style="text-align:center;padding:60px;font-family:sans-serif"><div style="font-size:80px">✅</div><h2 style="color:#1a7a40;margin:20px 0">Paiement reçu ! / Payment received!</h2><p>Merci, commande #{order_number} confirmée.</p></div>';
+    }}
+  }}catch(e){{}}
+}}, 5000);
+</script>
+</body></html>""")
+
+
+@app.get("/check-payment/{order_number}")
+async def check_ecwid_payment(order_number: str):
+    """Vérifie si une commande Ecwid est marquée PAID."""
+    data = ecwid_get("/orders", {"orderNumber": order_number, "limit": 1})
+    if not data or not data.get("items"):
+        return {"paid": False}
+    return {"paid": data["items"][0].get("paymentStatus") == "PAID"}
+
