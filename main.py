@@ -309,6 +309,9 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
+from fastapi.middleware.cors import CORSMiddleware
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
 VERSION = "2026-06-23-v50-customer-by-name"
 
 # Enregistrer la police Thai au démarrage
