@@ -5323,3 +5323,52 @@ async def check_ecwid_payment(order_number: str):
         return {"paid": False}
     return {"paid": data["items"][0].get("paymentStatus") == "PAID"}
 
+
+@app.get("/qr")
+async def create_promptpay_qr(amount: float = 0):
+    """Crée un PaymentIntent Stripe PromptPay et retourne l'URL du QR."""
+    from fastapi.responses import JSONResponse
+    if not STRIPE_SECRET_KEY:
+        return JSONResponse({"error": "Stripe non configuré"}, status_code=500)
+    if amount <= 0:
+        return JSONResponse({"error": "Montant invalide"}, status_code=400)
+    try:
+        int_amount = int(round(amount * 100))
+        intent = _stripe.PaymentIntent.create(
+            amount=int_amount,
+            currency="thb",
+            payment_method_types=["promptpay"],
+            metadata={"source": "ecwid_checkout"},
+        )
+        confirmed = _stripe.PaymentIntent.confirm(
+            intent.id,
+            payment_method_data={"type": "promptpay"},
+            return_url=f"{RENDER_URL}/payment-success",
+        )
+        qr_data = (confirmed.next_action or {}).get("promptpay_display_qr_code", {})
+        qr_url = qr_data.get("image_url_png", "")
+        intent_id = confirmed.id
+        return JSONResponse({
+            "qr_url": qr_url,
+            "intent_id": intent_id,
+            "amount": amount,
+        }, headers={"Access-Control-Allow-Origin": "*"})
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500, headers={"Access-Control-Allow-Origin": "*"})
+
+
+@app.get("/check-intent/{intent_id}")
+async def check_stripe_intent(intent_id: str):
+    """Vérifie si un PaymentIntent Stripe est payé."""
+    from fastapi.responses import JSONResponse
+    if not STRIPE_SECRET_KEY:
+        return JSONResponse({"paid": False}, headers={"Access-Control-Allow-Origin": "*"})
+    try:
+        intent = _stripe.PaymentIntent.retrieve(intent_id)
+        return JSONResponse(
+            {"paid": intent.status == "succeeded"},
+            headers={"Access-Control-Allow-Origin": "*"}
+        )
+    except Exception as e:
+        return JSONResponse({"paid": False, "error": str(e)}, headers={"Access-Control-Allow-Origin": "*"})
+
