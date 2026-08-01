@@ -5342,7 +5342,7 @@ async def create_promptpay_qr(amount: float = 0):
         )
         confirmed = _stripe.PaymentIntent.confirm(
             intent.id,
-            payment_method_data={"type": "promptpay"},
+            payment_method_data={"type": "promptpay", "billing_details": {"email": "customer@mistercochon.com"}},
             return_url=f"{RENDER_URL}/payment-success",
         )
         qr_data = (confirmed.next_action or {}).get("promptpay_display_qr_code", {})
