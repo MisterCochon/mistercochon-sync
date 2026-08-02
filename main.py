@@ -5056,9 +5056,11 @@ async def webhook_line_retail(request: Request):
                                       "qty": i["qty"], "price": i["price"]} for i in cart])},
                     )
                     # Confirm with promptpay payment method to generate QR code
+                    partner_email = partner.get("email") or f"{user_id}@line.mistercochon.com"
                     intent = _stripe.PaymentIntent.confirm(
                         intent["id"],
-                        payment_method_data={"type": "promptpay"},
+                        payment_method_data={"type": "promptpay",
+                                             "billing_details": {"email": partner_email}},
                         return_url=f"{RENDER_URL}/payment-success?user={user_id}",
                     )
                     qr_url = intent["next_action"]["promptpay_display_qr_code"]["image_url_png"]
@@ -5256,7 +5258,8 @@ async def pay_ecwid_promptpay(order_number: str):
         )
         confirmed = _stripe.PaymentIntent.confirm(
             intent.id,
-            payment_method_data={"type": "promptpay"},
+            payment_method_data={"type": "promptpay",
+                                 "billing_details": {"email": f"order{order_number}@mistercochon.com"}},
             return_url=f"{RENDER_URL}/payment-success?order={order_number}",
         )
         qr_data = (confirmed.next_action or {}).get("promptpay_display_qr_code", {})
