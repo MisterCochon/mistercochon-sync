@@ -3182,69 +3182,83 @@ def _mark_order_paid_odoo(ecwid_order_ref: str, stripe_payment_id: str):
 
 @app.post("/webhook/stripe")
 async def webhook_stripe(request: Request):
-    """
-    Webhook Stripe — appelé automatiquement par Stripe après un paiement réussi.
-    Enregistrer l'URL dans Stripe Dashboard → Developers → Webhooks
-    URL : https://mistercochon-backend.onrender.com/webhook/stripe
-    Événements : payment_intent.succeeded, checkout.session.completed
-
-    Cherche la commande Ecwid/Odoo via les metadata Stripe (order_id ou ecwid_order_id).
-    """
+    """Unified Stripe webhook — handles Ecwid orders AND LINE retail payments."""
     payload = await request.body()
     sig_header = request.headers.get("stripe-signature", "")
 
-    # Vérification signature Stripe (si secret configuré)
+    # Signature verification
     if STRIPE_WEBHOOK_SECRET:
         try:
-            import hmac, hashlib, time
-            parts = {p.split("=")[0]: p.split("=")[1]
-                     for p in sig_header.split(",") if "=" in p}
-            ts = parts.get("t", "0")
-            v1 = parts.get("v1", "")
-            signed = f"{ts}.{payload.decode()}"
-            expected = hmac.new(
-                STRIPE_WEBHOOK_SECRET.encode(),
-                signed.encode(),
-                hashlib.sha256
-            ).hexdigest()
-            if not hmac.compare_digest(expected, v1):
-                return {"status": "error", "reason": "signature invalide"}
+            event = _stripe.Webhook.construct_event(payload, sig_header, STRIPE_WEBHOOK_SECRET)
         except Exception:
-            pass
-
-    try:
-        event = await request.json() if not payload else __import__("json").loads(payload)
-    except Exception:
-        return {"status": "error", "reason": "JSON invalide"}
+            return {"status": "error", "reason": "signature invalide"}
+    else:
+        try:
+            event = json.loads(payload)
+        except Exception:
+            return {"status": "error", "reason": "JSON invalide"}
 
     event_type = event.get("type", "")
     data_obj   = event.get("data", {}).get("object", {})
+    metadata   = data_obj.get("metadata") or {}
+    stripe_id  = data_obj.get("id", "")
 
-    # Extraire référence commande Ecwid depuis metadata Stripe
-    metadata = data_obj.get("metadata") or {}
+    if event_type not in ("payment_intent.succeeded", "checkout.session.completed",
+                          "charge.succeeded"):
+        return {"status": "ignored", "event": event_type}
+
+    # ── LINE Retail payment ────────────────────────────────────────────────────
+    line_user_id = metadata.get("line_user_id", "")
+    if line_user_id:
+        def _confirm_retail(meta: dict, cart: list):
+            user_id   = meta.get("line_user_id", "")
+            partner_id = int(meta.get("partner_id", 0) or 0)
+            if not cart:
+                try:
+                    cart = json.loads(meta.get("cart", "[]"))
+                except Exception:
+                    cart = []
+            if not cart:
+                cart = _retail_sessions.get(user_id, {}).get("stripe_cart", [])
+            if not cart or not partner_id:
+                return
+            lines_vals = [(0, 0, {"product_id": i["pid"],
+                "product_uom_qty": i["qty"], "price_unit": i["price"]}) for i in cart]
+            try:
+                order_id = odoo_execute("sale.order", "create", [{
+                    "partner_id": partner_id, "order_line": lines_vals,
+                    "note": f"LINE Retail Stripe — {user_id}"}])
+                odoo_execute("sale.order", "action_confirm", [[order_id]])
+                order_name = odoo_execute("sale.order", "read",
+                    [[order_id], ["name"]])[0]["name"]
+            except Exception:
+                order_name = "—"
+            sess = _retail_sessions.get(user_id, {})
+            _retail_sessions[user_id] = {k: v for k, v in sess.items()
+                if k not in ("stripe_cart", "stripe_session_id", "stripe_intent_id")}
+            if user_id:
+                retail_push(user_id, [line_text(
+                    f"✅ ชำระเงินสำเร็จ!\nPayment confirmed!\n\nคำสั่งซื้อ: {order_name}\nขอบคุณครับ 🐷"
+                )])
+
+        if event_type == "checkout.session.completed":
+            sess_cart = _retail_sessions.get(line_user_id, {}).get("stripe_cart", [])
+            _confirm_retail(metadata, sess_cart)
+        else:
+            _confirm_retail(metadata, [])
+        return {"status": "ok", "source": "line_retail"}
+
+    # ── Ecwid / B2B order ─────────────────────────────────────────────────────
     ecwid_ref = (
         metadata.get("ecwid_order_id") or
         metadata.get("order_id") or
         metadata.get("orderNumber") or
         data_obj.get("description") or ""
     )
-    stripe_id = data_obj.get("id", "")
-
-    if event_type not in ("payment_intent.succeeded", "checkout.session.completed",
-                          "charge.succeeded"):
-        return {"status": "ignored", "event": event_type}
-
     if not ecwid_ref:
-        return {
-            "status": "ignored",
-            "reason": "Pas de référence commande dans les metadata Stripe",
-            "stripe_id": stripe_id,
-            "metadata": metadata,
-        }
+        return {"status": "ignored", "reason": "no order ref", "stripe_id": stripe_id}
 
     result = _mark_order_paid_odoo(str(ecwid_ref), stripe_id)
-
-    # Marquer aussi la commande comme payée dans Ecwid
     ecwid_result = {}
     try:
         ecwid_put(f"/orders/{ecwid_ref}", {"paymentStatus": "PAID"})
@@ -3252,8 +3266,8 @@ async def webhook_stripe(request: Request):
     except Exception as e:
         ecwid_result = {"ecwid_updated": False, "error": str(e)}
 
-    return {"status": "ok", "event": event_type, "ecwid_ref": ecwid_ref,
-            "result": result, "ecwid": ecwid_result}
+    return {"status": "ok", "source": "ecwid", "event": event_type,
+            "ecwid_ref": ecwid_ref, "result": result, "ecwid": ecwid_result}
 
 
 # ─── LINE Rich Menu setup ────────────────────────────────────────────────────
@@ -5135,63 +5149,6 @@ async def webhook_line_retail(request: Request):
     return {"status": "ok"}
 
 
-# ── Stripe webhook ─────────────────────────────────────────────────────────────
-@app.post("/webhook/stripe")
-async def webhook_stripe(request: Request):
-    payload = await request.body()
-    sig_header = request.headers.get("stripe-signature", "")
-    stripe_webhook_secret = os.getenv("STRIPE_WEBHOOK_SECRET", "")
-    try:
-        if stripe_webhook_secret:
-            event = _stripe.Webhook.construct_event(payload, sig_header, stripe_webhook_secret)
-        else:
-            event = json.loads(payload)
-    except Exception:
-        return {"status": "invalid"}
-
-    def _stripe_confirm_order(meta: dict, cart: list):
-        user_id = meta.get("line_user_id", "")
-        partner_id = int(meta.get("partner_id", 0) or 0)
-        if not cart:
-            try:
-                cart = json.loads(meta.get("cart", "[]"))
-            except Exception:
-                cart = []
-        sess = _retail_sessions.get(user_id, {})
-        if not cart:
-            cart = sess.get("stripe_cart", [])
-        if not cart or not partner_id:
-            return
-        lines_vals = [(0, 0, {"product_id": i["pid"],
-            "product_uom_qty": i["qty"], "price_unit": i["price"]}) for i in cart]
-        try:
-            order_id = odoo_execute("sale.order", "create", [{
-                "partner_id": partner_id, "order_line": lines_vals,
-                "note": f"LINE Retail Stripe — {user_id}"}])
-            odoo_execute("sale.order", "action_confirm", [[order_id]])
-            order_name = odoo_execute("sale.order", "read",
-                [[order_id], ["name"]], {})[0]["name"]
-        except Exception:
-            order_name = "—"
-        _retail_sessions[user_id] = {k: v for k, v in sess.items()
-            if k not in ("stripe_cart", "stripe_session_id", "stripe_intent_id")}
-        if user_id:
-            retail_push(user_id, [line_text(
-                f"✅ ชำระเงินสำเร็จ!\nPayment confirmed!\n\nคำสั่งซื้อ: {order_name}\nขอบคุณครับ 🐷"
-            )])
-
-    etype = event.get("type", "")
-    obj = event.get("data", {}).get("object", {})
-    meta = obj.get("metadata", {})
-
-    if etype == "checkout.session.completed":
-        sess_cart = _retail_sessions.get(meta.get("line_user_id", ""), {}).get("stripe_cart", [])
-        _stripe_confirm_order(meta, sess_cart)
-
-    elif etype == "payment_intent.succeeded":
-        _stripe_confirm_order(meta, [])
-
-    return {"status": "ok"}
 
 
 from fastapi.responses import HTMLResponse
