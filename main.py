@@ -3288,6 +3288,23 @@ def setup_richmenu(secret: str = ""):
         return {"status": "error", "error": str(e)}
 
 
+@app.get("/setup-richmenu-retail")
+def setup_richmenu_retail(secret: str = ""):
+    """Create/replace the Mister Cochon retail Rich Menu. Call once: /setup-richmenu-retail?secret=XXX"""
+    admin_secret = os.getenv("ADMIN_SECRET", "")
+    if not admin_secret or secret != admin_secret:
+        return {"status": "error", "error": "Invalid secret"}
+    try:
+        from setup_richmenu_retail import make_image, delete_existing, create_and_activate
+        retail_token = os.getenv("LINE_RETAIL_ACCESS_TOKEN", "")
+        img = make_image()
+        delete_existing(retail_token)
+        mid = create_and_activate(retail_token, img)
+        return {"status": "ok", "richMenuId": mid}
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+
+
 @app.get("/debug-reorder")
 def debug_reorder(secret: str = "", code: str = ""):
     """Debug reorder: show what the bot finds for a client. /debug-reorder?secret=fd2026&code=62101"""
