@@ -5219,12 +5219,16 @@ async def pay_ecwid_promptpay(order_number: str):
     if not STRIPE_SECRET_KEY:
         return HTMLResponse("<h2 style='font-family:sans-serif;padding:40px;color:red'>Stripe non configuré</h2>", status_code=500)
 
-    # Récupérer la commande Ecwid
-    data = ecwid_get("/orders", {"orderNumber": order_number, "limit": 1})
-    if not data or not data.get("items"):
+    # Récupérer la commande Ecwid (ID numérique ou orderNumber)
+    eco = None
+    if str(order_number).isdigit():
+        eco = ecwid_get(f"/orders/{order_number}")
+    if not eco:
+        data = ecwid_get("/orders", {"orderNumber": order_number, "limit": 1})
+        if data and data.get("items"):
+            eco = data["items"][0]
+    if not eco:
         return HTMLResponse("<h1 style='font-family:sans-serif;padding:40px'>Commande introuvable</h1>", status_code=404)
-
-    eco = data["items"][0]
     total = float(eco.get("total", 0))
     amount = int(total * 100)
     customer_name = (eco.get("billingPerson") or {}).get("name", "")
