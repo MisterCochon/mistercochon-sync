@@ -3230,7 +3230,7 @@ async def webhook_stripe(request: Request):
                     "note": f"LINE Retail Stripe — {user_id}"}])
                 odoo_execute("sale.order", "action_confirm", [[order_id]])
                 order_name = odoo_execute("sale.order", "read",
-                    [[order_id], ["name"]])[0]["name"]
+                    [[order_id]], {"fields": ["name"]})[0]["name"]
             except Exception:
                 order_name = "—"
             sess = _retail_sessions.get(user_id, {})
