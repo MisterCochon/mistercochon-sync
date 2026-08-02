@@ -3225,12 +3225,21 @@ async def webhook_stripe(request: Request):
             lines_vals = [(0, 0, {"product_id": i["pid"],
                 "product_uom_qty": i["qty"], "price_unit": i["price"]}) for i in cart]
             try:
-                order_id = odoo_execute("sale.order", "create", [{
-                    "partner_id": partner_id, "order_line": lines_vals,
-                    "note": f"LINE Retail Stripe — {user_id}"}])
-                odoo_execute("sale.order", "action_confirm", [[order_id]])
-                order_name = odoo_execute("sale.order", "read",
-                    [[order_id]], {"fields": ["name"]})[0]["name"]
+                intent_id = meta.get("stripe_intent_id", "") or obj.get("id", "")
+                note = f"LINE Retail Stripe — {intent_id or user_id}"
+                # Anti-doublon: ne pas créer si cet intent existe déjà
+                existing = odoo_execute("sale.order", "search_read",
+                    [[["note", "=", note]]],
+                    {"fields": ["name"], "limit": 1})
+                if existing:
+                    order_name = existing[0]["name"]
+                else:
+                    order_id = odoo_execute("sale.order", "create", [{
+                        "partner_id": partner_id, "order_line": lines_vals,
+                        "note": note}])
+                    odoo_execute("sale.order", "action_confirm", [[order_id]])
+                    order_name = odoo_execute("sale.order", "read",
+                        [[order_id]], {"fields": ["name"]})[0]["name"]
             except Exception:
                 order_name = "—"
             sess = _retail_sessions.get(user_id, {})
