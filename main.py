@@ -3120,7 +3120,7 @@ def _mark_order_paid_odoo(ecwid_order_ref: str, stripe_payment_id: str):
     """Cherche la commande Odoo par ref Ecwid et enregistre le paiement."""
     log = []
     orders = odoo_execute("sale.order", "search_read",
-        [[["client_order_ref", "=", ecwid_order_ref]]],
+        [["|", ["client_order_ref", "=", ecwid_order_ref], ["name", "=", ecwid_order_ref]]],
         {"fields": ["id", "name", "amount_total", "invoice_ids", "partner_id", "state"], "limit": 1}
     )
     if not orders:
