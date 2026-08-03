@@ -3282,15 +3282,86 @@ async def webhook_stripe(request: Request):
 # ─── Ecwid PromptPay payment page ────────────────────────────────────────────
 
 @app.get("/pay/promptpay")
-async def pay_ecwid_promptpay(order_id: str, request: Request):
-    """Render a PromptPay QR payment page for an Ecwid order."""
+async def pay_ecwid_promptpay(request: Request, order_id: str = ""):
+    """Render a PromptPay QR payment page for an Ecwid order.
+    Without order_id: show a form to enter the order number.
+    With order_id: fetch order from Ecwid and show QR code."""
     from fastapi.responses import HTMLResponse as _HR
+
+    # No order_id → show lookup form
+    if not order_id:
+        return _HR("""<!DOCTYPE html>
+<html lang="th">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>PromptPay — Mister Cochon</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: 'Segoe UI', Arial, sans-serif; background: #1a1a1a; color: #fff;
+         display: flex; align-items: center; justify-content: center; min-height: 100vh; padding: 24px; }
+  .card { background: #fff; color: #222; border-radius: 16px; padding: 40px 28px;
+          max-width: 380px; width: 100%; text-align: center; box-shadow: 0 8px 32px rgba(0,0,0,.4); }
+  .logo { font-size: 48px; margin-bottom: 4px; }
+  .brand { color: #6B0000; font-size: 12px; font-weight: 700; letter-spacing: 2px;
+           text-transform: uppercase; margin-bottom: 28px; }
+  h2 { font-size: 20px; margin-bottom: 8px; color: #111; }
+  p  { color: #666; font-size: 14px; line-height: 1.6; margin-bottom: 24px; }
+  input { width: 100%; padding: 14px 16px; border: 2px solid #ddd; border-radius: 10px;
+          font-size: 20px; text-align: center; letter-spacing: 2px; margin-bottom: 16px;
+          outline: none; }
+  input:focus { border-color: #6B0000; }
+  button { width: 100%; padding: 14px; background: #6B0000; color: #fff; border: none;
+           border-radius: 10px; font-size: 16px; font-weight: 700; cursor: pointer; }
+  button:hover { background: #8B0000; }
+</style>
+</head>
+<body>
+<div class="card">
+  <div class="logo">🐷</div>
+  <div class="brand">Mister Cochon</div>
+  <h2>Payer par PromptPay</h2>
+  <p>Entrez votre numéro de commande<br>(visible sur la page de confirmation)<br>
+  กรอกหมายเลขคำสั่งซื้อของคุณ</p>
+  <form onsubmit="go(event)">
+    <input type="text" id="oid" placeholder="ex: 12345" autofocus inputmode="numeric">
+    <button type="submit">Générer le QR Code →</button>
+  </form>
+</div>
+<script>
+function go(e) {
+  e.preventDefault();
+  const v = document.getElementById('oid').value.trim();
+  if (v) window.location.href = '/pay/promptpay?order_id=' + encodeURIComponent(v);
+}
+</script>
+</body>
+</html>""")
+
     if not _stripe:
         return _HR("<h2 style='font-family:sans-serif;padding:40px;color:red'>Stripe non configuré</h2>", status_code=500)
 
     order = ecwid_get(f"/orders/{order_id}")
     if not order:
-        return _HR("<h2 style='font-family:sans-serif;padding:40px'>Commande introuvable</h2>", status_code=404)
+        return _HR(f"""<!DOCTYPE html>
+<html lang="th"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Commande introuvable</title>
+<style>
+  body {{ font-family: 'Segoe UI', Arial, sans-serif; background: #1a1a1a;
+         display: flex; align-items: center; justify-content: center; min-height: 100vh; }}
+  .card {{ background: #fff; border-radius: 16px; padding: 40px 28px; max-width: 380px;
+           text-align: center; box-shadow: 0 8px 32px rgba(0,0,0,.4); }}
+  h2 {{ color: #c00; margin-bottom: 12px; }}
+  p  {{ color: #555; margin-bottom: 24px; }}
+  a  {{ display: inline-block; padding: 12px 24px; background: #6B0000; color: #fff;
+        border-radius: 8px; text-decoration: none; font-weight: 700; }}
+</style></head>
+<body><div class="card">
+  <div style="font-size:48px;margin-bottom:12px">❌</div>
+  <h2>Commande introuvable</h2>
+  <p>Numéro «{order_id}» introuvable.<br>Vérifiez et réessayez.</p>
+  <a href="/pay/promptpay">← Réessayer</a>
+</div></body></html>""", status_code=404)
 
     total     = float(order.get("total", 0))
     customer_email = order.get("email") or f"order{order_id}@mistercochon.com"
