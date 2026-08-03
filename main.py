@@ -3284,11 +3284,11 @@ async def webhook_stripe(request: Request):
 @app.get("/pay/promptpay")
 async def pay_ecwid_promptpay(request: Request, order_id: str = ""):
     """Render a PromptPay QR payment page for an Ecwid order.
-    Without order_id: show a form to enter the order number.
+    Without order_id: show email lookup form to find latest pending order.
     With order_id: fetch order from Ecwid and show QR code."""
     from fastapi.responses import HTMLResponse as _HR
 
-    # No order_id → show lookup form
+    # No order_id → show phone number lookup form
     if not order_id:
         return _HR("""<!DOCTYPE html>
 <html lang="th">
@@ -3301,19 +3301,19 @@ async def pay_ecwid_promptpay(request: Request, order_id: str = ""):
   body { font-family: 'Segoe UI', Arial, sans-serif; background: #1a1a1a; color: #fff;
          display: flex; align-items: center; justify-content: center; min-height: 100vh; padding: 24px; }
   .card { background: #fff; color: #222; border-radius: 16px; padding: 40px 28px;
-          max-width: 380px; width: 100%; text-align: center; box-shadow: 0 8px 32px rgba(0,0,0,.4); }
+          max-width: 400px; width: 100%; text-align: center; box-shadow: 0 8px 32px rgba(0,0,0,.4); }
   .logo { font-size: 48px; margin-bottom: 4px; }
   .brand { color: #6B0000; font-size: 12px; font-weight: 700; letter-spacing: 2px;
            text-transform: uppercase; margin-bottom: 28px; }
   h2 { font-size: 20px; margin-bottom: 8px; color: #111; }
-  p  { color: #666; font-size: 14px; line-height: 1.6; margin-bottom: 24px; }
+  p  { color: #666; font-size: 14px; line-height: 1.6; margin-bottom: 20px; }
   input { width: 100%; padding: 14px 16px; border: 2px solid #ddd; border-radius: 10px;
-          font-size: 20px; text-align: center; letter-spacing: 2px; margin-bottom: 16px;
-          outline: none; }
+          font-size: 20px; text-align: center; letter-spacing: 2px; margin-bottom: 16px; outline: none; }
   input:focus { border-color: #6B0000; }
   button { width: 100%; padding: 14px; background: #6B0000; color: #fff; border: none;
            border-radius: 10px; font-size: 16px; font-weight: 700; cursor: pointer; }
   button:hover { background: #8B0000; }
+  #msg { margin-top: 14px; font-size: 13px; color: #c00; min-height: 20px; }
 </style>
 </head>
 <body>
@@ -3321,18 +3321,40 @@ async def pay_ecwid_promptpay(request: Request, order_id: str = ""):
   <div class="logo">🐷</div>
   <div class="brand">Mister Cochon</div>
   <h2>Payer par PromptPay</h2>
-  <p>Entrez votre numéro de commande<br>(visible sur la page de confirmation)<br>
-  กรอกหมายเลขคำสั่งซื้อของคุณ</p>
+  <p>Entrez votre numéro de téléphone<br>
+     กรอกหมายเลขโทรศัพท์ของคุณ<br>
+     Enter your phone number</p>
   <form onsubmit="go(event)">
-    <input type="text" id="oid" placeholder="ex: 12345" autofocus inputmode="numeric">
-    <button type="submit">Générer le QR Code →</button>
+    <input type="tel" id="ph" placeholder="0812345678" autofocus inputmode="tel">
+    <button type="submit" id="btn">Trouver ma commande →</button>
   </form>
+  <div id="msg"></div>
 </div>
 <script>
-function go(e) {
+async function go(e) {
   e.preventDefault();
-  const v = document.getElementById('oid').value.trim();
-  if (v) window.location.href = '/pay/promptpay?order_id=' + encodeURIComponent(v);
+  const phone = document.getElementById('ph').value.trim();
+  if (!phone) return;
+  const btn = document.getElementById('btn');
+  const msg = document.getElementById('msg');
+  btn.textContent = '⏳ Recherche…';
+  btn.disabled = true;
+  msg.textContent = '';
+  try {
+    const r = await fetch('/pay/lookup?phone=' + encodeURIComponent(phone));
+    const d = await r.json();
+    if (d.order_id) {
+      window.location.href = '/pay/promptpay?order_id=' + d.order_id;
+    } else {
+      msg.textContent = d.error || 'Aucune commande en attente trouvée pour ce numéro.';
+      btn.textContent = 'Trouver ma commande →';
+      btn.disabled = false;
+    }
+  } catch(err) {
+    msg.textContent = 'Erreur réseau, réessayez.';
+    btn.textContent = 'Trouver ma commande →';
+    btn.disabled = false;
+  }
 }
 </script>
 </body>
@@ -3455,6 +3477,44 @@ const iv = setInterval(async () => {{
 </body>
 </html>"""
     return _HR(html)
+
+
+@app.get("/pay/lookup")
+async def pay_lookup(phone: str = "", email: str = ""):
+    """Find the most recent AWAITING_PAYMENT PromptPay order by phone or email."""
+    if not phone and not email:
+        return {"error": "phone or email required"}
+
+    # Normalize phone: keep digits only for comparison
+    def norm_phone(p: str) -> str:
+        return re.sub(r"\D", "", p or "")
+
+    phone_digits = norm_phone(phone)
+
+    # Fetch recent pending orders from Ecwid
+    params: dict = {"paymentStatus": "AWAITING_PAYMENT", "limit": 50,
+                    "sortBy": "DATE_PLACED_DESC"}
+    if email:
+        params["email"] = email
+
+    orders = ecwid_get("/orders", params=params) or {}
+    items  = orders.get("items") or []
+
+    for o in items:
+        if phone_digits:
+            # Check phone in billing/shipping address
+            bill_phone = norm_phone(o.get("billingPerson", {}).get("phone", ""))
+            ship_phone = norm_phone(o.get("shippingPerson", {}).get("phone", ""))
+            if phone_digits not in (bill_phone, ship_phone):
+                # Also try last-digit match (e.g. 0812345678 vs +66812345678)
+                if not (bill_phone.endswith(phone_digits[-9:]) or
+                        ship_phone.endswith(phone_digits[-9:])):
+                    continue
+        order_id = o.get("orderNumber") or o.get("id")
+        if order_id:
+            return {"order_id": str(order_id), "total": o.get("total"), "currency": o.get("currency")}
+
+    return {"error": "Aucune commande en attente trouvée. Vérifiez votre numéro."}
 
 
 @app.get("/pay/promptpay/status")
