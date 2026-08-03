@@ -3585,6 +3585,90 @@ var s=20,iv=setInterval(function(){{
 </html>""")
 
 
+# ─── Auto-cancel unpaid PromptPay orders ─────────────────────────────────────
+
+@app.get("/admin/cancel-old-orders")
+def cancel_old_orders(secret: str = ""):
+    """Cancel AWAITING_PAYMENT PromptPay orders older than 2 hours in Ecwid + Odoo.
+    Call via cron every 30 min: /admin/cancel-old-orders?secret=XXX"""
+    import time as _time
+    admin_secret = os.getenv("ADMIN_SECRET", "")
+    if not admin_secret or secret != admin_secret:
+        return {"status": "error", "error": "Invalid secret"}
+
+    now = int(_time.time())
+    two_hours_ago = now - 7200
+
+    # Fetch AWAITING_PAYMENT orders created before 2h ago
+    orders_data = ecwid_get("/orders", params={
+        "paymentStatus": "AWAITING_PAYMENT",
+        "limit": 100,
+        "sortBy": "DATE_PLACED_DESC",
+        "createdTo": two_hours_ago,
+    }) or {}
+
+    items = orders_data.get("items") or []
+
+    # Filter PromptPay orders only
+    promptpay_items = [
+        o for o in items
+        if "promptpay" in (o.get("paymentMethod") or "").lower()
+        or "promptpay" in (o.get("paymentMethodTitle") or "").lower()
+    ]
+
+    cancelled = []
+    errors = []
+
+    for order in promptpay_items:
+        ecwid_num = order.get("orderNumber") or order.get("id")
+        vendor_num = order.get("vendorOrderNumber") or order.get("referenceTransactionId") or ""
+        odoo_ref = f"ECWID-{vendor_num}" if vendor_num else str(ecwid_num)
+
+        # 1. Cancel in Ecwid
+        try:
+            ecwid_put(f"/orders/{ecwid_num}", {"paymentStatus": "CANCELLED"})
+            ecwid_ok = True
+        except Exception as e:
+            ecwid_ok = False
+            errors.append({"order": ecwid_num, "step": "ecwid", "error": str(e)})
+
+        # 2. Cancel in Odoo
+        odoo_ok = False
+        try:
+            odoo_orders = odoo_execute("sale.order", "search_read",
+                [[["client_order_ref", "=", odoo_ref], ["state", "not in", ["cancel", "done"]]]],
+                {"fields": ["id", "name", "state"], "limit": 1}
+            )
+            if odoo_orders:
+                odoo_id = odoo_orders[0]["id"]
+                odoo_execute("sale.order", "action_cancel", [[odoo_id]])
+                odoo_ok = True
+                try:
+                    odoo_execute("sale.order", "message_post", [[odoo_id]], {
+                        "body": "Commande annulée automatiquement : PromptPay non payé dans les 2h.",
+                        "message_type": "comment",
+                        "subtype_xmlid": "mail.mt_note",
+                    })
+                except Exception:
+                    pass
+        except Exception as e:
+            errors.append({"order": ecwid_num, "step": "odoo", "error": str(e)})
+
+        cancelled.append({
+            "ecwid_order": ecwid_num,
+            "odoo_ref": odoo_ref,
+            "ecwid_cancelled": ecwid_ok,
+            "odoo_cancelled": odoo_ok,
+        })
+
+    return {
+        "status": "ok",
+        "checked": len(promptpay_items),
+        "cancelled": cancelled,
+        "errors": errors,
+    }
+
+
 # ─── LINE Rich Menu setup ────────────────────────────────────────────────────
 
 @app.get("/setup-richmenu")
