@@ -3138,29 +3138,54 @@ def _mark_order_paid_odoo(ecwid_order_ref: str, stripe_payment_id: str):
         except Exception as e:
             log.append(f"confirm error: {e}")
 
-    # Chercher ou créer la facture (Odoo 17+: wizard sale.advance.payment.inv)
+    # Chercher une facture existante ou en créer une directement
     invoice_ids = order.get("invoice_ids") or []
     if not invoice_ids:
         try:
-            ctx = {"active_ids": [order_id], "active_model": "sale.order", "active_id": order_id}
-            wiz_id = odoo_execute("sale.advance.payment.inv", "create",
-                [{"advance_payment_method": "delivered"}],
-                {"context": ctx})
-            if isinstance(wiz_id, list):
-                wiz_id = wiz_id[0]
-            odoo_execute("sale.advance.payment.inv", "create_invoices",
-                [[wiz_id]], {"context": ctx})
-            log.append(f"invoice wizard executed (wiz_id={wiz_id})")
+            lines = odoo_execute("sale.order.line", "search_read",
+                [[["order_id", "=", order_id], ["product_id", "!=", False]]],
+                {"fields": ["product_id", "product_uom_qty", "price_unit", "name", "tax_id", "discount"]}
+            )
+            inv_lines = []
+            for l in lines:
+                pid = l["product_id"]
+                if isinstance(pid, list):
+                    pid = pid[0]
+                tax_ids = []
+                for t in (l.get("tax_id") or []):
+                    tax_ids.append(t if isinstance(t, int) else t["id"])
+                inv_lines.append((0, 0, {
+                    "product_id": pid,
+                    "quantity": l["product_uom_qty"],
+                    "price_unit": l["price_unit"],
+                    "name": l["name"],
+                    "discount": l.get("discount", 0),
+                    "tax_ids": [(6, 0, tax_ids)],
+                }))
+            partner_id = order["partner_id"]
+            if isinstance(partner_id, list):
+                partner_id = partner_id[0]
+            inv_id = odoo_execute("account.move", "create", [{
+                "move_type": "out_invoice",
+                "partner_id": partner_id,
+                "invoice_origin": order["name"],
+                "invoice_line_ids": inv_lines,
+            }])
+            if isinstance(inv_id, list):
+                inv_id = inv_id[0]
+            invoice_ids = [inv_id]
+            log.append(f"invoice created directly: {inv_id}")
         except Exception as e:
-            log.append(f"invoice wizard error: {e}")
+            log.append(f"invoice direct create error: {e}")
 
-    # Re-fetch invoice_ids
-    try:
-        fresh = odoo_execute("sale.order", "read", [[order_id]], {"fields": ["invoice_ids"]})[0]
-        invoice_ids = fresh.get("invoice_ids") or []
-        log.append(f"invoice_ids after wizard: {invoice_ids}")
-    except Exception as e:
-        log.append(f"re-fetch error: {e}")
+    # Re-fetch au cas où
+    if not invoice_ids:
+        try:
+            fresh = odoo_execute("sale.order", "read", [[order_id]], {"fields": ["invoice_ids"]})[0]
+            invoice_ids = fresh.get("invoice_ids") or []
+            log.append(f"invoice_ids re-fetched: {invoice_ids}")
+        except Exception as e:
+            log.append(f"re-fetch error: {e}")
 
     if invoice_ids:
         inv_id = invoice_ids[0]
