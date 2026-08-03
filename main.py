@@ -3118,66 +3118,100 @@ async def webhook_ecwid(request: Request):
 
 def _mark_order_paid_odoo(ecwid_order_ref: str, stripe_payment_id: str):
     """Cherche la commande Odoo par ref Ecwid et enregistre le paiement."""
+    log = []
     orders = odoo_execute("sale.order", "search_read",
         [[["client_order_ref", "=", ecwid_order_ref]]],
-        {"fields": ["id", "name", "amount_total", "invoice_ids", "partner_id"], "limit": 1}
+        {"fields": ["id", "name", "amount_total", "invoice_ids", "partner_id", "state"], "limit": 1}
     )
     if not orders:
-        return {"found": False}
+        return {"found": False, "ref": ecwid_order_ref}
 
     order = orders[0]
     order_id = order["id"]
+    log.append(f"order found: {order['name']} state={order['state']}")
 
-    # Créer la facture si pas encore créée
+    # Confirmer la commande si encore en brouillon
+    if order["state"] in ("draft", "sent"):
+        try:
+            odoo_execute("sale.order", "action_confirm", [[order_id]])
+            log.append("order confirmed")
+        except Exception as e:
+            log.append(f"confirm error: {e}")
+
+    # Chercher ou créer la facture
     invoice_ids = order.get("invoice_ids") or []
     if not invoice_ids:
         try:
-            odoo_execute("sale.order", "action_lock", [[order_id]])
-        except Exception:
-            pass
-        try:
-            invoice_ids = odoo_execute("sale.order", "action_invoice_create", [[order_id]])
-            if not isinstance(invoice_ids, list):
-                invoice_ids = [invoice_ids]
-        except Exception:
-            pass
+            result = odoo_execute("sale.order", "action_invoice_create", [[order_id]])
+            # Odoo 16 returns an action dict; Odoo 14 returns list of IDs
+            if isinstance(result, list):
+                invoice_ids = result
+            elif isinstance(result, int):
+                invoice_ids = [result]
+            elif isinstance(result, dict):
+                # Extract IDs from action domain: [('id','in',[...])]
+                domain = result.get("domain") or []
+                for clause in domain:
+                    if isinstance(clause, (list, tuple)) and len(clause) == 3 and clause[0] == "id":
+                        ids = clause[2]
+                        invoice_ids = ids if isinstance(ids, list) else [ids]
+            log.append(f"invoice created: {invoice_ids}")
+        except Exception as e:
+            log.append(f"invoice create error: {e}")
+
+    # Re-fetch invoice_ids in case they were created outside this call
+    if not invoice_ids:
+        fresh = odoo_execute("sale.order", "read", [[order_id]], {"fields": ["invoice_ids"]})[0]
+        invoice_ids = fresh.get("invoice_ids") or []
+        log.append(f"invoice re-fetched: {invoice_ids}")
 
     if invoice_ids:
         inv_id = invoice_ids[0]
-        # Confirmer la facture
+        # Confirmer la facture (passer de draft à posted)
         try:
-            odoo_execute("account.move", "action_post", [[inv_id]])
-        except Exception:
-            pass
-        # Enregistrer le paiement
+            inv_state = odoo_execute("account.move", "read", [[inv_id]], {"fields": ["state"]})[0]["state"]
+            if inv_state == "draft":
+                odoo_execute("account.move", "action_post", [[inv_id]])
+                log.append("invoice posted")
+            else:
+                log.append(f"invoice already {inv_state}")
+        except Exception as e:
+            log.append(f"post error: {e}")
+
+        # Enregistrer le paiement via le wizard
         try:
             journals = odoo_execute("account.journal", "search_read",
                 [[["type", "=", "bank"]]],
                 {"fields": ["id", "name"], "limit": 1}
             )
             if journals:
-                payment_vals = {
-                    "move_id": inv_id,
-                    "journal_id": journals[0]["id"],
-                    "payment_method_line_id": False,
-                    "amount": order["amount_total"],
-                    "currency_id": False,
-                }
-                odoo_execute("account.payment.register", "create", [payment_vals])
-        except Exception:
-            pass
+                journal_id = journals[0]["id"]
+                ctx = {"active_model": "account.move", "active_ids": [inv_id]}
+                wizard_id = odoo_execute("account.payment.register", "create",
+                    [{"journal_id": journal_id}],
+                    {"context": ctx})
+                if isinstance(wizard_id, list):
+                    wizard_id = wizard_id[0]
+                odoo_execute("account.payment.register", "action_create_payments",
+                    [[wizard_id]],
+                    {"context": ctx})
+                log.append(f"payment registered via wizard {wizard_id}")
+        except Exception as e:
+            log.append(f"payment error: {e}")
+    else:
+        log.append("no invoice found — cannot register payment")
 
-    # Ajouter note Stripe en internal note
+    # Note interne
     try:
         odoo_execute("sale.order", "message_post", [[order_id]], {
-            "body": f"Paiement Stripe confirmé : {stripe_payment_id}",
+            "body": f"Paiement PromptPay Stripe confirmé : {stripe_payment_id}",
             "message_type": "comment",
             "subtype_xmlid": "mail.mt_note",
         })
-    except Exception:
-        pass
+    except Exception as e:
+        log.append(f"note error: {e}")
 
-    return {"found": True, "order": order["name"], "invoiced": bool(invoice_ids)}
+    return {"found": True, "order": order["name"], "invoiced": bool(invoice_ids), "log": log}
 
 
 @app.post("/webhook/stripe")
