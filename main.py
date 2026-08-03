@@ -3284,14 +3284,56 @@ async def webhook_stripe(request: Request):
 # ─── Ecwid PromptPay payment page ────────────────────────────────────────────
 
 @app.get("/pay/promptpay")
-async def pay_ecwid_promptpay(request: Request, order_id: str = ""):
+async def pay_ecwid_promptpay(request: Request, order_id: str = "", confirmed: str = ""):
     """Render a PromptPay QR payment page for an Ecwid order.
-    Without order_id: show email lookup form to find latest pending order.
+    Without order_id: show confirmation step, then phone lookup form.
     With order_id: fetch order from Ecwid and show QR code."""
     from fastapi.responses import HTMLResponse as _HR
 
-    # No order_id → show phone number lookup form
+    # No order_id → step 1: confirm order placed, step 2: phone lookup
     if not order_id:
+        # Step 1: confirmation page
+        if not confirmed:
+            return _HR("""<!DOCTYPE html>
+<html lang="th">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>PromptPay — Mister Cochon</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: 'Segoe UI', Arial, sans-serif; background: #1a1a1a; color: #fff;
+         display: flex; align-items: center; justify-content: center; min-height: 100vh; padding: 24px; }
+  .card { background: #fff; color: #222; border-radius: 16px; padding: 40px 28px;
+          max-width: 400px; width: 100%; text-align: center; box-shadow: 0 8px 32px rgba(0,0,0,.4); }
+  .brand { color: #6B0000; font-size: 22px; font-weight: 900; letter-spacing: 3px;
+           text-transform: uppercase; margin-bottom: 28px; margin-top: 8px; }
+  h2 { font-size: 20px; margin-bottom: 12px; color: #111; }
+  p  { color: #666; font-size: 14px; line-height: 1.7; margin-bottom: 28px; }
+  .btn-yes { display:block; width:100%; padding:14px; background:#6B0000; color:#fff; border:none;
+             border-radius:10px; font-size:16px; font-weight:700; cursor:pointer; text-decoration:none;
+             margin-bottom:12px; }
+  .btn-yes:hover { background:#8B0000; }
+  .btn-no  { display:block; width:100%; padding:14px; background:#f0f0f0; color:#555; border:none;
+             border-radius:10px; font-size:15px; font-weight:600; cursor:pointer; text-decoration:none; }
+  .btn-no:hover { background:#e0e0e0; }
+</style>
+</head>
+<body>
+<div class="card">
+  <div class="brand">Mister Cochon</div>
+  <h2>Payer par PromptPay</h2>
+  <p>Avez-vous bien cliqué sur<br>
+     <strong>"Place Order"</strong> sur la page précédente ?<br><br>
+     กดปุ่ม <strong>"Place Order"</strong> แล้วหรือยัง?<br><br>
+     Did you click <strong>"Place Order"</strong> first?</p>
+  <a class="btn-yes" href="/pay/promptpay?confirmed=1">✅ Oui, ma commande est passée →</a>
+  <a class="btn-no"  href="javascript:history.back()">← Non, retour</a>
+</div>
+</body>
+</html>""")
+
+        # Step 2: phone number lookup form
         return _HR("""<!DOCTYPE html>
 <html lang="th">
 <head>
