@@ -3747,6 +3747,19 @@ def cancel_old_orders(secret: str = ""):
 
 # ─── LINE Rich Menu setup ────────────────────────────────────────────────────
 
+@app.get("/debug/mark-paid")
+def debug_mark_paid(secret: str = "", odoo_ref: str = ""):
+    """Test Odoo payment marking without real Stripe payment.
+    Usage: /debug/mark-paid?secret=XXX&odoo_ref=ECWID-FDFHNY6"""
+    admin_secret = os.getenv("ADMIN_SECRET", "")
+    if not admin_secret or secret != admin_secret:
+        return {"status": "error", "error": "Invalid secret"}
+    if not odoo_ref:
+        return {"status": "error", "error": "odoo_ref required (ex: ECWID-FDFHNY6)"}
+    result = _mark_order_paid_odoo(odoo_ref, "TEST-STRIPE-ID")
+    return {"status": "ok", "result": result}
+
+
 @app.get("/setup-richmenu")
 def setup_richmenu(secret: str = ""):
     """Create/replace the LINE Rich Menu. Call once: /setup-richmenu?secret=XXX"""
