@@ -3279,6 +3279,154 @@ async def webhook_stripe(request: Request):
             "ecwid_ref": ecwid_ref, "result": result, "ecwid": ecwid_result}
 
 
+# ─── Ecwid PromptPay payment page ────────────────────────────────────────────
+
+@app.get("/pay/promptpay")
+async def pay_ecwid_promptpay(order_id: str, request: Request):
+    """Render a PromptPay QR payment page for an Ecwid order."""
+    from fastapi.responses import HTMLResponse as _HR
+    if not _stripe:
+        return _HR("<h2 style='font-family:sans-serif;padding:40px;color:red'>Stripe non configuré</h2>", status_code=500)
+
+    order = ecwid_get(f"/orders/{order_id}")
+    if not order:
+        return _HR("<h2 style='font-family:sans-serif;padding:40px'>Commande introuvable</h2>", status_code=404)
+
+    total     = float(order.get("total", 0))
+    customer_email = order.get("email") or f"order{order_id}@mistercochon.com"
+    order_num = order.get("orderNumber") or order_id
+
+    try:
+        intent = _stripe.PaymentIntent.create(
+            amount=int(round(total * 100)),
+            currency="thb",
+            payment_method_types=["promptpay"],
+            metadata={"ecwid_order_id": str(order_id)},
+        )
+        intent = _stripe.PaymentIntent.confirm(
+            intent["id"],
+            payment_method_data={
+                "type": "promptpay",
+                "billing_details": {"email": customer_email},
+            },
+            return_url=f"{RENDER_URL}/pay/success?order_id={order_id}",
+        )
+    except Exception as e:
+        return _HR(f"<h2 style='font-family:sans-serif;padding:40px;color:red'>Erreur: {e}</h2>", status_code=500)
+
+    qr_data  = (intent.get("next_action") or {}).get("promptpay_display_qr_code") or {}
+    qr_png   = qr_data.get("image_url_png", "")
+    intent_id = intent.get("id", "")
+
+    html = f"""<!DOCTYPE html>
+<html lang="th">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>PromptPay — Mister Cochon</title>
+<style>
+  * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+  body {{ font-family: 'Segoe UI', Arial, sans-serif; background: #1a1a1a; color: #fff;
+         display: flex; flex-direction: column; align-items: center;
+         justify-content: center; min-height: 100vh; padding: 24px; }}
+  .card {{ background: #fff; color: #222; border-radius: 16px; padding: 32px 24px;
+           max-width: 380px; width: 100%; text-align: center; box-shadow: 0 8px 32px rgba(0,0,0,.4); }}
+  .logo {{ font-size: 42px; margin-bottom: 4px; }}
+  .brand {{ color: #6B0000; font-size: 13px; font-weight: 700; letter-spacing: 2px;
+            text-transform: uppercase; margin-bottom: 20px; }}
+  .amount {{ font-size: 36px; font-weight: 700; color: #111; margin-bottom: 4px; }}
+  .order  {{ font-size: 13px; color: #888; margin-bottom: 20px; }}
+  .qr {{ width: 240px; height: 240px; border: 2px solid #eee; border-radius: 12px;
+         object-fit: contain; margin-bottom: 16px; }}
+  .instr {{ font-size: 13px; color: #555; line-height: 1.6; margin-bottom: 20px; }}
+  .status {{ padding: 10px 20px; border-radius: 20px; font-size: 13px; font-weight: 600;
+             background: #FFF3CD; color: #856404; display: inline-block; }}
+  .status.ok {{ background: #D1FAE5; color: #065F46; }}
+  .timer {{ font-size: 11px; color: #aaa; margin-top: 16px; }}
+</style>
+</head>
+<body>
+<div class="card">
+  <div class="logo">🐷</div>
+  <div class="brand">Mister Cochon</div>
+  <div class="amount">฿{total:,.2f}</div>
+  <div class="order">คำสั่งซื้อ #{order_num} / Order #{order_num}</div>
+  {"<img class='qr' src='" + qr_png + "' alt='PromptPay QR'>" if qr_png else "<p style='color:red'>QR code unavailable</p>"}
+  <div class="instr">
+    เปิดแอปธนาคารของคุณ → สแกน QR → ชำระเงิน<br>
+    Open your bank app → Scan QR → Pay
+  </div>
+  <div class="status" id="st">⏳ รอการชำระเงิน / Waiting for payment…</div>
+  <div class="timer" id="timer"></div>
+</div>
+<script>
+const INTENT = "{intent_id}";
+const ORDER  = "{order_id}";
+let elapsed = 0;
+const iv = setInterval(async () => {{
+  elapsed += 5;
+  const m = String(Math.floor(elapsed/60)).padStart(2,'0');
+  const s = String(elapsed%60).padStart(2,'0');
+  document.getElementById('timer').textContent = 'Temps écoulé: ' + m + ':' + s;
+  try {{
+    const r = await fetch('/pay/promptpay/status?intent_id=' + INTENT);
+    const d = await r.json();
+    if (d.status === 'succeeded') {{
+      clearInterval(iv);
+      const el = document.getElementById('st');
+      el.textContent = '✅ ชำระเงินสำเร็จ! / Payment successful!';
+      el.className = 'status ok';
+      setTimeout(() => window.location.href = '/pay/success?order_id=' + ORDER, 2500);
+    }}
+  }} catch(e) {{}}
+}}, 5000);
+</script>
+</body>
+</html>"""
+    return _HR(html)
+
+
+@app.get("/pay/promptpay/status")
+async def pay_promptpay_status(intent_id: str):
+    """Poll Stripe PaymentIntent status (for AJAX polling on payment page)."""
+    if not _stripe:
+        return {"status": "error"}
+    try:
+        intent = _stripe.PaymentIntent.retrieve(intent_id)
+        return {"status": intent.get("status", "unknown")}
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+
+
+@app.get("/pay/success")
+async def pay_success_page(order_id: str = ""):
+    from fastapi.responses import HTMLResponse as _HR
+    return _HR(f"""<!DOCTYPE html>
+<html lang="th">
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Paiement confirmé</title>
+<style>
+  body {{ font-family: 'Segoe UI', Arial, sans-serif; background: #1a1a1a; color: #fff;
+         display: flex; align-items: center; justify-content: center; min-height: 100vh; }}
+  .card {{ background: #fff; color: #222; border-radius: 16px; padding: 40px 32px;
+           max-width: 360px; text-align: center; box-shadow: 0 8px 32px rgba(0,0,0,.4); }}
+  h1 {{ color: #065F46; font-size: 28px; margin-bottom: 12px; }}
+  p  {{ color: #555; line-height: 1.7; }}
+</style>
+</head>
+<body>
+<div class="card">
+  <div style="font-size:64px;margin-bottom:16px">✅</div>
+  <h1>ชำระเงินสำเร็จ!</h1>
+  <p>Payment Successful!<br>
+  {"คำสั่งซื้อ #" + str(order_id) + "<br>" if order_id else ""}
+  ขอบคุณที่ใช้บริการ Mister Cochon 🐷<br>
+  Thank you for your order!</p>
+</div>
+</body>
+</html>""")
+
+
 # ─── LINE Rich Menu setup ────────────────────────────────────────────────────
 
 @app.get("/setup-richmenu")
