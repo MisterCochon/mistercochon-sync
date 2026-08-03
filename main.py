@@ -3302,9 +3302,8 @@ async def pay_ecwid_promptpay(request: Request, order_id: str = ""):
          display: flex; align-items: center; justify-content: center; min-height: 100vh; padding: 24px; }
   .card { background: #fff; color: #222; border-radius: 16px; padding: 40px 28px;
           max-width: 400px; width: 100%; text-align: center; box-shadow: 0 8px 32px rgba(0,0,0,.4); }
-  .logo { font-size: 48px; margin-bottom: 4px; }
-  .brand { color: #6B0000; font-size: 12px; font-weight: 700; letter-spacing: 2px;
-           text-transform: uppercase; margin-bottom: 28px; }
+  .brand { color: #6B0000; font-size: 22px; font-weight: 900; letter-spacing: 3px;
+           text-transform: uppercase; margin-bottom: 28px; margin-top: 8px; }
   h2 { font-size: 20px; margin-bottom: 8px; color: #111; }
   p  { color: #666; font-size: 14px; line-height: 1.6; margin-bottom: 20px; }
   input { width: 100%; padding: 14px 16px; border: 2px solid #ddd; border-radius: 10px;
@@ -3318,7 +3317,6 @@ async def pay_ecwid_promptpay(request: Request, order_id: str = ""):
 </head>
 <body>
 <div class="card">
-  <div class="logo">🐷</div>
   <div class="brand">Mister Cochon</div>
   <h2>Payer par PromptPay</h2>
   <p>Entrez votre numéro de téléphone<br>
