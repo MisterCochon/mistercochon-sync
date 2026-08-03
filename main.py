@@ -3841,6 +3841,75 @@ def debug_ecwid_order(order_id: str = "", secret: str = ""):
     }
 
 
+@app.get("/admin/tag-pro-products")
+def admin_tag_pro_products(secret: str = ""):
+    """Ajoute le tag LINE-Gamme Tradition à tous les produits de catégorie PRO.
+    Usage: /admin/tag-pro-products?secret=XXX"""
+    admin_secret = os.getenv("ADMIN_SECRET", "")
+    if not admin_secret or secret != admin_secret:
+        return {"status": "error", "error": "Invalid secret"}
+
+    tag_ids = odoo_execute("product.tag", "search", [[["name", "=", "LINE-Gamme Tradition"]]])
+    if not tag_ids:
+        return {"status": "error", "error": "Tag 'LINE-Gamme Tradition' introuvable dans Odoo"}
+    tag_id = tag_ids[0]
+
+    cat_ids = odoo_execute("product.category", "search", [[["name", "=", "PRO"]]])
+    if not cat_ids:
+        return {"status": "error", "error": "Catégorie PRO introuvable"}
+
+    prod_ids = odoo_execute("product.template", "search", [[["categ_id", "in", cat_ids]]])
+    if not prod_ids:
+        return {"status": "error", "error": "Aucun produit PRO trouvé"}
+
+    odoo_execute("product.template", "write", [prod_ids, {"tag_ids": [(4, tag_id)]}])
+    return {"status": "ok", "tag_id": tag_id, "produits_tagués": len(prod_ids), "ids": prod_ids}
+
+
+@app.get("/admin/tag-premium-products")
+def admin_tag_premium_products(secret: str = ""):
+    """Switch les produits dont le SKU = xxxx23xx vers LINE-Gamme Premium.
+    Retire LINE-Gamme Tradition et ajoute LINE-Gamme Premium.
+    Usage: /admin/tag-premium-products?secret=XXX"""
+    admin_secret = os.getenv("ADMIN_SECRET", "")
+    if not admin_secret or secret != admin_secret:
+        return {"status": "error", "error": "Invalid secret"}
+
+    tag_tradition = odoo_execute("product.tag", "search", [[["name", "=", "LINE-Gamme Tradition"]]])
+    tag_premium   = odoo_execute("product.tag", "search", [[["name", "=", "LINE-Gamme Premium"]]])
+    if not tag_tradition:
+        return {"status": "error", "error": "Tag LINE-Gamme Tradition introuvable"}
+    if not tag_premium:
+        return {"status": "error", "error": "Tag LINE-Gamme Premium introuvable"}
+    tid = tag_tradition[0]
+    pid = tag_premium[0]
+
+    # Tous les produits PRO avec un SKU
+    cat_ids = odoo_execute("product.category", "search", [[["name", "=", "PRO"]]])
+    all_pro = odoo_execute("product.template", "search_read",
+        [[["categ_id", "in", cat_ids], ["default_code", "!=", False]]],
+        {"fields": ["id", "default_code"]})
+
+    premium_ids = [
+        p["id"] for p in (all_pro or [])
+        if re.match(r'^.{4}23.{2}$', (p.get("default_code") or "").strip())
+    ]
+
+    if not premium_ids:
+        return {"status": "ok", "message": "Aucun SKU xxxx23xx trouvé", "premium_ids": []}
+
+    # Retire Tradition, ajoute Premium
+    odoo_execute("product.template", "write", [premium_ids, {
+        "tag_ids": [(3, tid), (4, pid)]
+    }])
+    return {
+        "status": "ok",
+        "nb_premium": len(premium_ids),
+        "ids": premium_ids,
+        "skus": [p["default_code"] for p in (all_pro or []) if p["id"] in premium_ids]
+    }
+
+
 @app.get("/debug-reorder")
 def debug_reorder(secret: str = "", code: str = ""):
     """Debug reorder: show what the bot finds for a client. /debug-reorder?secret=fd2026&code=62101"""
@@ -4295,6 +4364,51 @@ def _line_build_cat_flex(cats: list) -> dict:
                 "type": "box", "layout": "vertical",
                 "paddingAll": "10px", "spacing": "sm",
                 "contents": cat_buttons
+            }
+        }
+    }
+
+
+def _line_get_subcategories_for_tag(tag_id: int) -> list:
+    """Return [(categ_id, categ_name)] for Odoo categories that have products with this tag."""
+    EXCLUDE = {"all", "tous", "all products", "deliveries", "livraisons",
+               "matieres premieres", "matières premières", "expense", "expenses",
+               "default", "internal", "pro"}
+    prods = odoo_execute("product.product", "search_read",
+        [[["active", "=", True], ["sale_ok", "=", True],
+          ["product_tag_ids", "in", [tag_id]]]],
+        {"fields": ["categ_id"], "limit": 500})
+    seen = {}
+    for p in (prods or []):
+        cid, cname = p["categ_id"]
+        if cname.lower() not in EXCLUDE:
+            seen[cid] = cname
+    return sorted(seen.items(), key=lambda x: x[1])
+
+
+def _line_build_subcat_flex(tag_id: int, subcats: list, gamme_label: str) -> dict:
+    """Build a Flex bubble showing sub-family buttons for a given gamme tag."""
+    buttons = []
+    for categ_id, label in subcats[:10]:
+        buttons.append({
+            "type": "button", "style": "secondary", "height": "sm",
+            "action": {"type": "postback", "label": label[:40],
+                       "data": f"__subcat_{tag_id}_{categ_id}"}
+        })
+    return {
+        "type": "flex", "altText": f"{gamme_label} — Familles",
+        "contents": {
+            "type": "bubble",
+            "header": {
+                "type": "box", "layout": "vertical",
+                "backgroundColor": "#1A3A6B", "paddingAll": "14px",
+                "contents": [{"type": "text", "text": gamme_label,
+                              "weight": "bold", "color": "#FFFFFF", "size": "md"}]
+            },
+            "body": {
+                "type": "box", "layout": "vertical",
+                "paddingAll": "10px", "spacing": "sm",
+                "contents": buttons
             }
         }
     }
@@ -5026,12 +5140,42 @@ async def webhook_line(request: Request):
             )])
             continue
 
+        # ── Sub-family selected: __subcat_{tag_id}_{categ_id} ─────────────
+        if text.startswith("__subcat_"):
+            parts = text[9:].split("_")
+            tag_id = int(parts[0])
+            categ_id = int(parts[1])
+            domain = [["active", "=", True], ["sale_ok", "=", True],
+                       ["product_tag_ids", "in", [tag_id]],
+                       ["categ_id", "=", categ_id]]
+            prods = odoo_execute("product.product", "search_read",
+                [domain],
+                {"fields": ["id", "name", "default_code", "list_price", "description_sale"], "limit": 200,
+                 "context": {"lang": "en_US"}})
+            if not prods:
+                line_reply(reply_token, [line_text("No products in this category.")])
+                continue
+            _line_sessions[user_id] = {**_line_sessions.get(user_id, {}),
+                                        "category_products": prods, "page": 0}
+            line_reply(reply_token, _line_build_carousel(prods, pricelist, 0))
+            continue
+
         # ── Category selected ──────────────────────────────────────────────
         if text.startswith("__cat_"):
             cat_id = int(text.split("__cat_")[1])
             line_tag_id = _line_get_line_tag_id()
             if cat_id > 0:
-                # Mode LINE-* tag: filter by that sub-tag
+                # Check if this tag uses sub-families (Gamme Tradition only)
+                TAGS_WITH_SUBFAMILIES = {"LINE-Gamme Tradition"}
+                tag_rows = odoo_execute("product.tag", "search_read",
+                    [[["id", "=", cat_id]]], {"fields": ["name"], "limit": 1})
+                tag_name = tag_rows[0]["name"] if tag_rows else ""
+                if tag_name in TAGS_WITH_SUBFAMILIES:
+                    subcats = _line_get_subcategories_for_tag(cat_id)
+                    if subcats:
+                        line_reply(reply_token, [_line_build_subcat_flex(cat_id, subcats, tag_name[5:])])
+                        continue
+                # Regular tag: filter products directly
                 domain = [["active", "=", True], ["sale_ok", "=", True],
                            ["product_tag_ids", "in", [cat_id]]]
             else:
