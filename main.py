@@ -3841,72 +3841,51 @@ def debug_ecwid_order(order_id: str = "", secret: str = ""):
     }
 
 
-@app.get("/admin/tag-pro-products")
-def admin_tag_pro_products(secret: str = ""):
-    """Ajoute le tag LINE-Gamme Tradition à tous les produits de catégorie PRO.
-    Usage: /admin/tag-pro-products?secret=XXX"""
+@app.get("/admin/sync-gammes")
+def admin_sync_gammes(secret: str = ""):
+    """Resync les tags Gamme Tradition / Gamme Premium selon les SKUs actuels.
+    Rejouer après toute correction de SKU dans Odoo.
+    - SKU xxxx23xx → LINE-Gamme Premium (retire Tradition)
+    - Autres SKUs PRO → LINE-Gamme Tradition (retire Premium)
+    Usage: /admin/sync-gammes?secret=XXX"""
     admin_secret = os.getenv("ADMIN_SECRET", "")
     if not admin_secret or secret != admin_secret:
         return {"status": "error", "error": "Invalid secret"}
 
-    tag_ids = odoo_execute("product.tag", "search", [[["name", "=", "LINE-Gamme Tradition"]]])
-    if not tag_ids:
-        return {"status": "error", "error": "Tag 'LINE-Gamme Tradition' introuvable dans Odoo"}
-    tag_id = tag_ids[0]
+    tag_rows = odoo_execute("product.tag", "search_read",
+        [[["name", "in", ["LINE-Gamme Tradition", "LINE-Gamme Premium"]]]],
+        {"fields": ["id", "name"]})
+    tag_map = {t["name"]: t["id"] for t in (tag_rows or [])}
+    tid = tag_map.get("LINE-Gamme Tradition")
+    pid = tag_map.get("LINE-Gamme Premium")
+    if not tid or not pid:
+        return {"status": "error", "error": f"Tags manquants: {tag_map}"}
 
-    cat_ids = odoo_execute("product.category", "search", [[["name", "=", "PRO"]]])
-    if not cat_ids:
-        return {"status": "error", "error": "Catégorie PRO introuvable"}
-
-    prod_ids = odoo_execute("product.template", "search", [[["categ_id", "in", cat_ids]]])
-    if not prod_ids:
-        return {"status": "error", "error": "Aucun produit PRO trouvé"}
-
-    odoo_execute("product.template", "write", [prod_ids, {"tag_ids": [(4, tag_id)]}])
-    return {"status": "ok", "tag_id": tag_id, "produits_tagués": len(prod_ids), "ids": prod_ids}
-
-
-@app.get("/admin/tag-premium-products")
-def admin_tag_premium_products(secret: str = ""):
-    """Switch les produits dont le SKU = xxxx23xx vers LINE-Gamme Premium.
-    Retire LINE-Gamme Tradition et ajoute LINE-Gamme Premium.
-    Usage: /admin/tag-premium-products?secret=XXX"""
-    admin_secret = os.getenv("ADMIN_SECRET", "")
-    if not admin_secret or secret != admin_secret:
-        return {"status": "error", "error": "Invalid secret"}
-
-    tag_tradition = odoo_execute("product.tag", "search", [[["name", "=", "LINE-Gamme Tradition"]]])
-    tag_premium   = odoo_execute("product.tag", "search", [[["name", "=", "LINE-Gamme Premium"]]])
-    if not tag_tradition:
-        return {"status": "error", "error": "Tag LINE-Gamme Tradition introuvable"}
-    if not tag_premium:
-        return {"status": "error", "error": "Tag LINE-Gamme Premium introuvable"}
-    tid = tag_tradition[0]
-    pid = tag_premium[0]
-
-    # Tous les produits PRO avec un SKU
     cat_ids = odoo_execute("product.category", "search", [[["name", "=", "PRO"]]])
     all_pro = odoo_execute("product.template", "search_read",
         [[["categ_id", "in", cat_ids], ["default_code", "!=", False]]],
         {"fields": ["id", "default_code"]})
 
-    premium_ids = [
-        p["id"] for p in (all_pro or [])
-        if re.match(r'^.{4}23.{2}$', (p.get("default_code") or "").strip())
-    ]
+    # Exclure les produits BELGO (SKU commençant par BELGO) — tag LINE-BELGO géré séparément
+    premium_ids  = [p["id"] for p in (all_pro or [])
+                    if re.match(r'^.{4}23.{2}$', (p.get("default_code") or "").strip())
+                    and not (p.get("default_code") or "").upper().startswith("BELGO")]
+    tradition_ids = [p["id"] for p in (all_pro or [])
+                     if p["id"] not in premium_ids
+                     and not (p.get("default_code") or "").upper().startswith("BELGO")]
 
-    if not premium_ids:
-        return {"status": "ok", "message": "Aucun SKU xxxx23xx trouvé", "premium_ids": []}
+    if tradition_ids:
+        odoo_execute("product.template", "write", [tradition_ids,
+            {"product_tag_ids": [(3, pid), (4, tid)]}])
+    if premium_ids:
+        odoo_execute("product.template", "write", [premium_ids,
+            {"product_tag_ids": [(3, tid), (4, pid)]}])
 
-    # Retire Tradition, ajoute Premium
-    odoo_execute("product.template", "write", [premium_ids, {
-        "tag_ids": [(3, tid), (4, pid)]
-    }])
     return {
         "status": "ok",
-        "nb_premium": len(premium_ids),
-        "ids": premium_ids,
-        "skus": [p["default_code"] for p in (all_pro or []) if p["id"] in premium_ids]
+        "tradition": len(tradition_ids),
+        "premium": len(premium_ids),
+        "skus_premium": sorted(p["default_code"] for p in (all_pro or []) if p["id"] in premium_ids)
     }
 
 
@@ -4282,6 +4261,26 @@ def _line_get_line_tag_id() -> int | None:
     return tags[0]["id"] if tags else None
 
 
+def _line_extra_tags_for_partner(partner: dict) -> list:
+    """Retourne les tag IDs des catalogues privés auxquels ce partenaire a accès.
+    Logique : si le nom du tag LINE-XXXXX est contenu dans le nom du partenaire
+    (ou vice-versa), le partenaire voit ce catalogue.
+    Les tags publics (Gamme Tradition/Premium) sont exclus ici."""
+    PUBLIC_TAGS = {"LINE-Gamme Tradition", "LINE-Gamme Premium"}
+    name_low = (partner.get("name") or "").lower()
+    all_tags = odoo_execute("product.tag", "search_read",
+        [[["name", "=ilike", "LINE-%"]]],
+        {"fields": ["id", "name"], "limit": 50})
+    extra = []
+    for t in (all_tags or []):
+        if t["name"] in PUBLIC_TAGS:
+            continue
+        suffix = t["name"][5:].lower()  # retire "LINE-"
+        if suffix and suffix in name_low:
+            extra.append(t["id"])
+    return extra
+
+
 def _line_get_pro_categories(extra_tags: list | None = None) -> list:
     """Return (id, label) pairs for the LINE B2B bot menu.
 
@@ -4301,6 +4300,15 @@ def _line_get_pro_categories(extra_tags: list | None = None) -> list:
     )
     tag_by_name = {t["name"]: t["id"] for t in (sub_tags or [])}
 
+    # Si le client a des tags privés → il voit SEULEMENT ses produits, pas les gammes publiques
+    if extra_tags:
+        result = []
+        for tid in extra_tags:
+            t = next((t for t in (sub_tags or []) if t["id"] == tid), None)
+            if t:
+                result.append((tid, t["name"][5:].strip()))
+        return result
+
     result = []
     for name in PUBLIC_ORDER:
         tid = tag_by_name.get(name)
@@ -4312,12 +4320,6 @@ def _line_get_pro_categories(extra_tags: list | None = None) -> list:
         )
         if count:
             result.append((tid, name[5:].strip()))
-
-    # Append any extra hidden-category tags (e.g. BELGO/Dofann products)
-    for tid in (extra_tags or []):
-        t = next((t for t in (sub_tags or []) if t["id"] == tid), None)
-        if t:
-            result.append((tid, t["name"][5:].strip()))
 
     # Fallback: no LINE-* tags configured → use Odoo product categories
     if not result:
@@ -4912,7 +4914,7 @@ async def webhook_line(request: Request):
             ok, name = _line_quick_login(text, user_id)
             if ok:
                 partner = _line_get_partner(user_id)
-                cats = _line_get_pro_categories()
+                cats = _line_get_pro_categories(_line_extra_tags_for_partner(partner))
                 welcome = line_text(f"✅ Welcome back, {name}!")
                 if cats:
                     line_reply(reply_token, [welcome, _line_build_cat_flex(cats)])
@@ -5199,7 +5201,7 @@ async def webhook_line(request: Request):
 
         # ── Menu / catalogue ───────────────────────────────────────────────
         if text_low in ("menu", "catalog", "catalogue", "products", "shop"):
-            cats = _line_get_pro_categories()
+            cats = _line_get_pro_categories(_line_extra_tags_for_partner(partner))
             if not cats:
                 line_reply(reply_token, [line_text("No PRO products available yet.")])
                 continue
