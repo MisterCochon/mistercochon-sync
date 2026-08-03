@@ -3503,9 +3503,13 @@ async def pay_lookup(phone: str = "", email: str = ""):
 
     phone_digits = norm_phone(phone)
 
+    import time as _time
+    # Only look at orders placed in the last 24 hours to avoid matching old pending orders
+    since_ts = int(_time.time()) - 86400
+
     # Fetch recent pending orders from Ecwid
     params: dict = {"paymentStatus": "AWAITING_PAYMENT", "limit": 50,
-                    "sortBy": "DATE_PLACED_DESC"}
+                    "sortBy": "DATE_PLACED_DESC", "createdFrom": since_ts}
     if email:
         params["email"] = email
 
