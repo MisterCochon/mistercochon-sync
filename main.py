@@ -3138,32 +3138,29 @@ def _mark_order_paid_odoo(ecwid_order_ref: str, stripe_payment_id: str):
         except Exception as e:
             log.append(f"confirm error: {e}")
 
-    # Chercher ou créer la facture
+    # Chercher ou créer la facture (Odoo 17+: wizard sale.advance.payment.inv)
     invoice_ids = order.get("invoice_ids") or []
     if not invoice_ids:
         try:
-            result = odoo_execute("sale.order", "action_invoice_create", [[order_id]])
-            # Odoo 16 returns an action dict; Odoo 14 returns list of IDs
-            if isinstance(result, list):
-                invoice_ids = result
-            elif isinstance(result, int):
-                invoice_ids = [result]
-            elif isinstance(result, dict):
-                # Extract IDs from action domain: [('id','in',[...])]
-                domain = result.get("domain") or []
-                for clause in domain:
-                    if isinstance(clause, (list, tuple)) and len(clause) == 3 and clause[0] == "id":
-                        ids = clause[2]
-                        invoice_ids = ids if isinstance(ids, list) else [ids]
-            log.append(f"invoice created: {invoice_ids}")
+            ctx = {"active_ids": [order_id], "active_model": "sale.order", "active_id": order_id}
+            wiz_id = odoo_execute("sale.advance.payment.inv", "create",
+                [{"advance_payment_method": "delivered"}],
+                {"context": ctx})
+            if isinstance(wiz_id, list):
+                wiz_id = wiz_id[0]
+            odoo_execute("sale.advance.payment.inv", "create_invoices",
+                [[wiz_id]], {"context": ctx})
+            log.append(f"invoice wizard executed (wiz_id={wiz_id})")
         except Exception as e:
-            log.append(f"invoice create error: {e}")
+            log.append(f"invoice wizard error: {e}")
 
-    # Re-fetch invoice_ids in case they were created outside this call
-    if not invoice_ids:
+    # Re-fetch invoice_ids
+    try:
         fresh = odoo_execute("sale.order", "read", [[order_id]], {"fields": ["invoice_ids"]})[0]
         invoice_ids = fresh.get("invoice_ids") or []
-        log.append(f"invoice re-fetched: {invoice_ids}")
+        log.append(f"invoice_ids after wizard: {invoice_ids}")
+    except Exception as e:
+        log.append(f"re-fetch error: {e}")
 
     if invoice_ids:
         inv_id = invoice_ids[0]
