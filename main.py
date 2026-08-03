@@ -3602,6 +3602,30 @@ def setup_richmenu_retail(secret: str = ""):
         return {"status": "error", "error": str(e)}
 
 
+@app.get("/debug-ecwid-order")
+def debug_ecwid_order(order_id: str = "", secret: str = ""):
+    """Debug: show raw Ecwid order fields to check vendorOrderNumber etc."""
+    admin_secret = os.getenv("ADMIN_SECRET", "")
+    if not admin_secret or secret != admin_secret:
+        return {"status": "error", "error": "Invalid secret"}
+    order = ecwid_get(f"/orders/{order_id}")
+    if not order:
+        # Try searching by orderNumber
+        res = ecwid_get("/orders", {"orderNumber": order_id, "limit": 1})
+        if res and res.get("items"):
+            order = res["items"][0]
+    if not order:
+        return {"error": "Not found"}
+    return {
+        "id": order.get("id"),
+        "orderNumber": order.get("orderNumber"),
+        "vendorOrderNumber": order.get("vendorOrderNumber"),
+        "referenceTransactionId": order.get("referenceTransactionId"),
+        "paymentStatus": order.get("paymentStatus"),
+        "total": order.get("total"),
+    }
+
+
 @app.get("/debug-reorder")
 def debug_reorder(secret: str = "", code: str = ""):
     """Debug reorder: show what the bot finds for a client. /debug-reorder?secret=fd2026&code=62101"""
