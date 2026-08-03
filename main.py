@@ -3144,23 +3144,19 @@ def _mark_order_paid_odoo(ecwid_order_ref: str, stripe_payment_id: str):
         try:
             lines = odoo_execute("sale.order.line", "search_read",
                 [[["order_id", "=", order_id], ["product_id", "!=", False]]],
-                {"fields": ["product_id", "product_uom_qty", "price_unit", "name", "tax_id", "discount"]}
+                {"fields": ["product_id", "product_uom_qty", "price_unit", "name", "discount"]}
             )
             inv_lines = []
             for l in lines:
                 pid = l["product_id"]
                 if isinstance(pid, list):
                     pid = pid[0]
-                tax_ids = []
-                for t in (l.get("tax_id") or []):
-                    tax_ids.append(t if isinstance(t, int) else t["id"])
                 inv_lines.append((0, 0, {
                     "product_id": pid,
                     "quantity": l["product_uom_qty"],
                     "price_unit": l["price_unit"],
                     "name": l["name"],
                     "discount": l.get("discount", 0),
-                    "tax_ids": [(6, 0, tax_ids)],
                 }))
             partner_id = order["partner_id"]
             if isinstance(partner_id, list):
