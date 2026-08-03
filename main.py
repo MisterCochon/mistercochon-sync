@@ -3534,6 +3534,7 @@ async def pay_success_page(order_id: str = ""):
 <html lang="th">
 <head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Paiement confirmé</title>
+<meta http-equiv="refresh" content="5;url=https://mistercochon.com">
 <style>
   body {{ font-family: 'Segoe UI', Arial, sans-serif; background: #1a1a1a; color: #fff;
          display: flex; align-items: center; justify-content: center; min-height: 100vh; }}
@@ -3541,6 +3542,7 @@ async def pay_success_page(order_id: str = ""):
            max-width: 360px; text-align: center; box-shadow: 0 8px 32px rgba(0,0,0,.4); }}
   h1 {{ color: #065F46; font-size: 28px; margin-bottom: 12px; }}
   p  {{ color: #555; line-height: 1.7; }}
+  .redirect {{ font-size: 12px; color: #aaa; margin-top: 16px; }}
 </style>
 </head>
 <body>
@@ -3549,8 +3551,9 @@ async def pay_success_page(order_id: str = ""):
   <h1>ชำระเงินสำเร็จ!</h1>
   <p>Payment Successful!<br>
   {"คำสั่งซื้อ #" + str(order_id) + "<br>" if order_id else ""}
-  ขอบคุณที่ใช้บริการ Mister Cochon 🐷<br>
+  ขอบคุณที่ใช้บริการ Mister Cochon<br>
   Thank you for your order!</p>
+  <p class="redirect">Retour à la boutique dans 5 secondes…</p>
 </div>
 </body>
 </html>""")
