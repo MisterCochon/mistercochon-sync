@@ -4222,11 +4222,8 @@ def _line_get_pro_categories(extra_tags: list | None = None) -> list:
     extra_tags allows injecting hidden tag ids (e.g. BELGO/Dofann).
     """
     PUBLIC_ORDER = [
-        "LINE-Delicatessen",
-        "LINE-Fresh Delicatessen",
-        "LINE-Duck",
-        "LINE-Butchery",
-        "LINE-Premium",
+        "LINE-Gamme Tradition",
+        "LINE-Gamme Premium",
     ]
 
     sub_tags = odoo_execute("product.tag", "search_read",
