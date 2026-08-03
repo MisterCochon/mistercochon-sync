@@ -3346,8 +3346,14 @@ async function go(e) {
     if (d.order_id) {
       window.location.href = '/pay/promptpay?order_id=' + d.order_id;
     } else {
-      msg.textContent = d.error || 'Aucune commande en attente trouvée pour ce numéro.';
-      btn.textContent = 'Trouver ma commande →';
+      const isNotFound = !d.order_id;
+      msg.innerHTML = isNotFound
+        ? '<strong>Aucune commande en attente trouvée.</strong><br>'
+          + 'Avez-vous bien cliqué sur <em>"Place Order"</em> avant ?<br>'
+          + 'Please place your order first, then try again.<br>'
+          + '<a href="javascript:history.back()" style="display:inline-block;margin-top:10px;padding:8px 20px;background:#6B0000;color:#fff;border-radius:6px;text-decoration:none;font-weight:700;">← Retour / Go back</a>'
+        : (d.error || 'Erreur inconnue');
+      btn.textContent = 'Réessayer →';
       btn.disabled = false;
     }
   } catch(err) {
@@ -3542,7 +3548,6 @@ async def pay_success_page(order_id: str = ""):
 <html lang="th">
 <head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Paiement confirmé</title>
-<meta http-equiv="refresh" content="5;url=https://mistercochon.com">
 <style>
   body {{ font-family: 'Segoe UI', Arial, sans-serif; background: #1a1a1a; color: #fff;
          display: flex; align-items: center; justify-content: center; min-height: 100vh; }}
@@ -3551,6 +3556,8 @@ async def pay_success_page(order_id: str = ""):
   h1 {{ color: #065F46; font-size: 28px; margin-bottom: 12px; }}
   p  {{ color: #555; line-height: 1.7; }}
   .redirect {{ font-size: 12px; color: #aaa; margin-top: 16px; }}
+  .btn-store {{ display:inline-block;margin-top:16px;padding:10px 24px;background:#6B0000;
+               color:#fff;border-radius:8px;text-decoration:none;font-weight:700;font-size:14px; }}
 </style>
 </head>
 <body>
@@ -3561,8 +3568,15 @@ async def pay_success_page(order_id: str = ""):
   {"คำสั่งซื้อ #" + str(order_id) + "<br>" if order_id else ""}
   ขอบคุณที่ใช้บริการ Mister Cochon<br>
   Thank you for your order!</p>
-  <p class="redirect">Retour à la boutique dans 5 secondes…</p>
+  <a class="btn-store" href="https://mistercochon.com">Retour à la boutique →</a>
+  <p class="redirect" id="cd">Redirection dans 20 secondes…</p>
 </div>
+<script>
+var s=20,iv=setInterval(function(){{
+  s--;document.getElementById('cd').textContent='Redirection dans '+s+' secondes…';
+  if(s<=0){{clearInterval(iv);window.location.href='https://mistercochon.com';}}
+}},1000);
+</script>
 </body>
 </html>""")
 
