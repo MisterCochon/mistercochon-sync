@@ -3267,7 +3267,9 @@ async def webhook_stripe(request: Request):
     if not ecwid_ref:
         return {"status": "ignored", "reason": "no order ref", "stripe_id": stripe_id}
 
-    result = _mark_order_paid_odoo(str(ecwid_ref), stripe_id)
+    # Use the Odoo-specific ref if stored (e.g. "ECWID-FDFHNY6")
+    odoo_ref = metadata.get("ecwid_odoo_ref") or str(ecwid_ref)
+    result = _mark_order_paid_odoo(odoo_ref, stripe_id)
     ecwid_result = {}
     try:
         ecwid_put(f"/orders/{ecwid_ref}", {"paymentStatus": "PAID"})
@@ -3386,13 +3388,19 @@ async function go(e) {
     total     = float(order.get("total", 0))
     customer_email = order.get("email") or f"order{order_id}@mistercochon.com"
     order_num = order.get("orderNumber") or order_id
+    # Build Odoo reference: Ecwid stores vendorOrderNumber as "ECWID-XXXXX" in client_order_ref
+    vendor_num = order.get("vendorOrderNumber") or order.get("referenceTransactionId") or ""
+    odoo_ref = f"ECWID-{vendor_num}" if vendor_num else str(order_id)
 
     try:
         intent = _stripe.PaymentIntent.create(
             amount=int(round(total * 100)),
             currency="thb",
             payment_method_types=["promptpay"],
-            metadata={"ecwid_order_id": str(order_id)},
+            metadata={
+                "ecwid_order_id": str(order_id),
+                "ecwid_odoo_ref": odoo_ref,
+            },
         )
         intent = _stripe.PaymentIntent.confirm(
             intent["id"],
