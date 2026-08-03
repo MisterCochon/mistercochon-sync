@@ -207,6 +207,12 @@ async def _poll_ecwid_orders():
                     so_vals["note"] = eco_note
                 new_id = odoo_execute("sale.order", "create", [so_vals])
                 odoo_execute("sale.order", "action_confirm", [[new_id]])
+                # Ajouter immédiatement à existing_refs pour éviter les doublons
+                # si deux instances tournent simultanément (ex: redeployment Render)
+                existing_refs.add(ref)
+                existing_refs.add(ref_alt)
+                existing_refs.add(ecwid_id)
+                existing_refs.add(order_num)
                 print(f"[POLL] ✓ Nouvelle commande importée : {ref}")
 
         except Exception as e:
