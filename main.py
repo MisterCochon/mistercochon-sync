@@ -5801,7 +5801,7 @@ async def webhook_line_retail(request: Request):
                             "product_data": {"name": item["name"][:80]}},
                         "quantity": item["qty"],
                     })
-                try:
+try:
                     session = _stripe.checkout.Session.create(
                         payment_method_types=["card"],
                         line_items=line_items,
@@ -5812,7 +5812,7 @@ async def webhook_line_retail(request: Request):
                     )
                     _retail_sessions[user_id] = {**sess, "stripe_cart": cart,
                         "stripe_session_id": session.id}
-                        pay_bubble = {
+                    pay_bubble = {
                         "type": "bubble", "size": "mega",
                         "header": {
                             "type": "box", "layout": "vertical",
@@ -5841,7 +5841,6 @@ async def webhook_line_retail(request: Request):
                     retail_reply(reply_token, [{"type": "flex", "altText": f"Paiement carte {total:,.0f}฿", "contents": pay_bubble}])
                 except Exception as e:
                     retail_reply(reply_token, [line_text(f"❌ Stripe error: {str(e)[:100]}")])
-
         # ── Clear cart ─────────────────────────────────────────────────────
         elif text_low in ("cancel", "ยกเลิก", "clear", "ล้างตะกร้า"):
             _retail_sessions[user_id] = {**sess, "cart": []}
