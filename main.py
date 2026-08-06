@@ -5801,7 +5801,7 @@ async def webhook_line_retail(request: Request):
                             "product_data": {"name": item["name"][:80]}},
                         "quantity": item["qty"],
                     })
-try:
+                    try:
                     session = _stripe.checkout.Session.create(
                         payment_method_types=["card"],
                         line_items=line_items,
