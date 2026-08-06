@@ -5812,7 +5812,7 @@ async def webhook_line_retail(request: Request):
                     )
                     _retail_sessions[user_id] = {**sess, "stripe_cart": cart,
                         "stripe_session_id": session.id}
-                pay_bubble = {
+                        pay_bubble = {
                         "type": "bubble", "size": "mega",
                         "header": {
                             "type": "box", "layout": "vertical",
