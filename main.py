@@ -5812,9 +5812,33 @@ async def webhook_line_retail(request: Request):
                     )
                     _retail_sessions[user_id] = {**sess, "stripe_cart": cart,
                         "stripe_session_id": session.id}
-                    retail_reply(reply_token, [line_text(
-                        f"💳 ชำระเงินด้วยบัตร {total:,.0f}฿\nPay {total:,.0f}฿ by card:\n\n{session.url}"
-                    )])
+                pay_bubble = {
+                        "type": "bubble", "size": "mega",
+                        "header": {
+                            "type": "box", "layout": "vertical",
+                            "backgroundColor": "#1A3A6B", "paddingAll": "14px",
+                            "contents": [{"type": "text", "text": "💳 Paiement par carte",
+                                          "weight": "bold", "color": "#FFFFFF", "size": "md"}]
+                        },
+                        "body": {
+                            "type": "box", "layout": "vertical", "paddingAll": "14px",
+                            "contents": [
+                                {"type": "text", "text": f"Total : {total:,.0f} ฿",
+                                 "weight": "bold", "size": "xl", "color": "#C8102E"},
+                                {"type": "text", "text": "Appuyez sur le bouton pour payer en sécurité via Stripe.",
+                                 "size": "sm", "color": "#555555", "wrap": True, "margin": "md"},
+                            ]
+                        },
+                        "footer": {
+                            "type": "box", "layout": "vertical", "paddingAll": "10px",
+                            "contents": [
+                                {"type": "button", "style": "primary", "color": "#1A3A6B",
+                                 "action": {"type": "uri", "label": f"Payer {total:,.0f} ฿ par carte",
+                                            "uri": session.url}}
+                            ]
+                        }
+                    }
+                    retail_reply(reply_token, [{"type": "flex", "altText": f"Paiement carte {total:,.0f}฿", "contents": pay_bubble}])
                 except Exception as e:
                     retail_reply(reply_token, [line_text(f"❌ Stripe error: {str(e)[:100]}")])
 
