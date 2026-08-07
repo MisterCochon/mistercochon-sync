@@ -4301,15 +4301,12 @@ def _line_get_pro_categories(extra_tags: list | None = None) -> list:
     tag_by_name = {t["name"]: t["id"] for t in (sub_tags or [])}
 
     # Si le client a des tags privés → il voit SEULEMENT ses produits, pas les gammes publiques
+    result = []
     if extra_tags:
-        result = []
         for tid in extra_tags:
             t = next((t for t in (sub_tags or []) if t["id"] == tid), None)
             if t:
                 result.append((tid, t["name"][5:].strip()))
-        return result
-
-    result = []
     for name in PUBLIC_ORDER:
         tid = tag_by_name.get(name)
         if not tid:
