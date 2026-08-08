@@ -4491,24 +4491,25 @@ def _line_build_carousel(products: list, pricelist, page: int = 0,
         sku   = str(p.get("default_code") or "").strip().upper()
         name  = _shorten_product_name(p.get("name") or "")
         price = _line_get_client_price(p["id"], p.get("list_price", 0), pricelist)
-        rows.append({
-            "type": "box", "layout": "horizontal",
-            "paddingTop": "10px", "paddingBottom": "10px",
-            "paddingStart": "14px", "paddingEnd": "14px",
-            "action": {"type": "postback", "label": name[:40],
-                       "data": f"__view_{p['id']}_{sku}"},
-            "contents": [
-                {"type": "text", "text": name[:34], "flex": 6, "size": "sm",
-                 "color": "#222222", "wrap": False, "adjustMode": "shrink-to-fit"},
-                {"type": "text", "text": f"{price:,.0f}฿", "flex": 3,
-                 "size": "sm", "weight": "bold", "color": "#C8102E", "align": "end"},
-                {"type": "text", "text": "›", "flex": 1, "size": "xl",
-                 "color": "#1A3A6B", "align": "end"}
-            ]
-        })
-        rows.append({"type": "separator"})
-    if rows and rows[-1].get("type") == "separator":
-        rows.pop()
+        img_url = _line_get_ecwid_images().get(sku, "")
+            img_box = {"type": "image", "url": img_url, "size": "xs", "aspectMode": "cover", "aspectRatio": "1:1", "flex": 2} if img_url else {"type": "filler", "flex": 2}
+            rows.append({
+                "type": "box", "layout": "horizontal",
+                "paddingTop": "8px", "paddingBottom": "8px",
+                "paddingStart": "10px", "paddingEnd": "14px",
+                "spacing": "md",
+                "action": {"type": "postback", "label": name[:40],
+                            "data": f"__view_{p['id']}_{sku}"},
+                "contents": [
+                    img_box,
+                    {"type": "box", "layout": "vertical", "flex": 7, "justifyContent": "center",
+                     "contents": [
+                         {"type": "text", "text": name[:34], "size": "sm", "color": "#222222", "wrap": False},
+                         {"type": "text", "text": f"{price:.0f}฿", "size": "sm", "weight": "bold", "color": "#C8102E"}
+                     ]},
+                    {"type": "text", "text": ">", "flex": 1, "size": "xl", "color": "#1A3A6B", "align": "end"}
+                ]
+            })
 
     nav_buttons = []
     if page > 0:
