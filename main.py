@@ -4597,16 +4597,10 @@ def _line_product_detail(p: dict, pricelist, back_page: int = 0) -> list:
         "footer": {
             "type": "box", "layout": "vertical", "paddingAll": "10px", "spacing": "sm",
             "contents": [
-                {"type": "text", "text": "Select quantity:", "size": "sm", "color": "#555555"},
-                {"type": "box", "layout": "horizontal", "spacing": "xs",
-                 "contents": [qty_btn(1), qty_btn(2), qty_btn(3)]},
-                {"type": "box", "layout": "horizontal", "spacing": "xs",
-                 "contents": [
-                     qty_btn(5), qty_btn(10),
-                     {"type": "button", "style": "secondary", "height": "sm", "flex": 1,
-                      "action": {"type": "postback", "label": "Other",
-                                 "data": f"__cq_{pid}_{sku}_{price_int}"}}
-                 ]},
+               {"type": "text", "text": f"Stock: {int(p.get('qty_available', 0))} unites",
+                 "size": "sm", "color": "#555555"},
+                {"type": "text", "text": "Tapez le SKU suivi de la quantite. Ex: JAMB x2",
+                 "size": "xs", "color": "#888888", "wrap": True},
                 {"type": "button", "style": "secondary", "height": "sm",
                  "action": {"type": "postback", "label": "← Back to list",
                             "data": f"__page_{back_page}"}}
