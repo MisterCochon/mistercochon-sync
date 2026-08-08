@@ -4492,8 +4492,8 @@ def _line_build_carousel(products: list, pricelist, page: int = 0,
         name  = _shorten_product_name(p.get("name") or "")
         price = _line_get_client_price(p["id"], p.get("list_price", 0), pricelist)
         img_url = _line_get_ecwid_images().get(sku, "")
-            img_box = {"type": "image", "url": img_url, "size": "xs", "aspectMode": "cover", "aspectRatio": "1:1", "flex": 2} if img_url else {"type": "filler", "flex": 2}
-            rows.append({
+        img_box = {"type": "image", "url": img_url, "size": "xs", "aspectMode": "cover", "aspectRatio": "1:1", "flex": 2} if img_url else {"type": "filler", "flex": 2}
+        rows.append({
                 "type": "box", "layout": "horizontal",
                 "paddingTop": "8px", "paddingBottom": "8px",
                 "paddingStart": "10px", "paddingEnd": "14px",
