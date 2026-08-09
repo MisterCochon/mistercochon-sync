@@ -2435,7 +2435,140 @@ async def import_clients_xlsx(file: UploadFile = File(...)):
         return {"status": "error", "error": str(e)}
 
 
-# ─── Import commandes depuis WinDev (2 fichiers CSV/Excel) ────────────────────
+# ─── Export / import des tags produit LINE-* (nettoyage des doublons) ─────────
+
+@app.get("/admin/export-line-tags")
+def export_line_tags(secret: str = ""):
+    """Export an .xlsx with one row per product tagged LINE-* and one column
+    per LINE-* tag (X = product currently has that tag). Includes a helper
+    column flagging products in both Gamme Tradition AND Gamme Premium at
+    once, which is normally a mistake. Edit the X's in Excel and re-upload
+    via /admin/import-line-tags to apply the corrections in Odoo."""
+    admin_secret = os.getenv("ADMIN_SECRET", "")
+    if not admin_secret or secret != admin_secret:
+        return {"status": "error", "error": "Invalid secret"}
+    try:
+        import pandas as pd
+
+        tags = odoo_execute("product.tag", "search_read",
+            [[["name", "=ilike", "LINE-%"]]],
+            {"fields": ["id", "name"], "limit": 100}
+        )
+        if not tags:
+            return {"status": "error", "error": "No LINE-* tags found in Odoo."}
+        tags = sorted(tags, key=lambda t: t["name"])
+        tag_ids = [t["id"] for t in tags]
+        tag_id_to_col = {t["id"]: t["name"] for t in tags}
+
+        products = odoo_execute("product.product", "search_read",
+            [[["active", "=", True], ["product_tag_ids", "in", tag_ids]]],
+            {"fields": ["id", "default_code", "name", "product_tag_ids"], "limit": 5000,
+             "context": {"lang": "en_US"}}
+        )
+
+        rows = []
+        for p in products:
+            row = {
+                "product_id": p["id"],
+                "default_code": p.get("default_code") or "",
+                "name": p.get("name") or "",
+            }
+            ptags = set(p.get("product_tag_ids") or [])
+            for t in tags:
+                row[t["name"]] = "X" if t["id"] in ptags else ""
+            trad = "LINE-Gamme Tradition" in row and row.get("LINE-Gamme Tradition") == "X"
+            prem = "LINE-Gamme Premium" in row and row.get("LINE-Gamme Premium") == "X"
+            row["⚠️ Both Gammes"] = "OUI" if (trad and prem) else ""
+            rows.append(row)
+
+        df = pd.DataFrame(rows)
+        cols = ["product_id", "default_code", "name"] + [t["name"] for t in tags] + ["⚠️ Both Gammes"]
+        df = df[cols]
+
+        buf = io.BytesIO()
+        with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+            df.to_excel(writer, index=False, sheet_name="LINE tags")
+        buf.seek(0)
+        return StreamingResponse(buf,
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={"Content-Disposition": "attachment; filename=line_product_tags.xlsx"})
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+
+
+@app.post("/admin/import-line-tags")
+async def import_line_tags(file: UploadFile = File(...), secret: str = ""):
+    """Re-upload the (edited) export from /admin/export-line-tags. For each
+    row, applies only the additions/removals needed on the LINE-* tag
+    columns present in the file — any tag NOT one of these columns is left
+    untouched on the product (e.g. non-LINE tags, if any)."""
+    admin_secret = os.getenv("ADMIN_SECRET", "")
+    if not admin_secret or secret != admin_secret:
+        return {"status": "error", "error": "Invalid secret"}
+    try:
+        import pandas as pd
+
+        content = await file.read()
+        df = pd.read_excel(io.BytesIO(content), dtype=str)
+        df = df.where(pd.notna(df), "")
+        df.columns = [str(c).strip() for c in df.columns]
+
+        if "product_id" not in df.columns:
+            return {"status": "error", "error": "Missing 'product_id' column — use the file from /admin/export-line-tags."}
+
+        tags = odoo_execute("product.tag", "search_read",
+            [[["name", "=ilike", "LINE-%"]]],
+            {"fields": ["id", "name"], "limit": 100}
+        )
+        name_to_tagid = {t["name"]: t["id"] for t in (tags or [])}
+        tag_cols = [c for c in df.columns if c in name_to_tagid]
+        if not tag_cols:
+            return {"status": "error", "error": "No LINE-* tag columns found in the file."}
+
+        pids = [int(v) for v in df["product_id"] if str(v).strip()]
+        current = odoo_execute("product.product", "read", [pids, ["product_tag_ids"]], {})
+        current_by_pid = {c["id"]: set(c.get("product_tag_ids") or []) for c in current}
+
+        updated, unchanged, errors = [], [], []
+        for _, row in df.iterrows():
+            pid_raw = str(row.get("product_id", "")).strip()
+            if not pid_raw:
+                continue
+            pid = int(float(pid_raw))
+            desired = set()
+            for col in tag_cols:
+                if str(row.get(col, "")).strip():
+                    desired.add(name_to_tagid[col])
+
+            cur = current_by_pid.get(pid, set())
+            # Only touch the tags covered by this export — leave any other
+            # (non-LINE) tags on the product exactly as they are.
+            covered = {name_to_tagid[c] for c in tag_cols}
+            to_add = desired - cur
+            to_remove = (cur & covered) - desired
+            if not to_add and not to_remove:
+                unchanged.append(pid)
+                continue
+            try:
+                ops = [(4, tid, 0) for tid in to_add] + [(3, tid, 0) for tid in to_remove]
+                odoo_execute("product.product", "write", [[pid], {"product_tag_ids": ops}])
+                updated.append({"id": pid, "name": row.get("name", ""),
+                                 "added": [c for c in tag_cols if name_to_tagid[c] in to_add],
+                                 "removed": [c for c in tag_cols if name_to_tagid[c] in to_remove]})
+            except Exception as e:
+                errors.append({"id": pid, "error": str(e)})
+
+        return {
+            "status": "ok",
+            "updated": len(updated), "unchanged": len(unchanged), "errors": len(errors),
+            "updated_list": updated[:50],
+            "errors_list": errors[:20],
+        }
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+
+
+
 
 @app.post("/import-commandes-xlsx")
 async def import_commandes_xlsx(
@@ -4522,18 +4655,24 @@ def _line_get_client_price(product_id: int, list_price: float, pricelist) -> flo
 
 def _parse_qty_input(text: str, is_per_kg: bool):
     """Parse a customer's quantity reply. Returns (qty, is_weight) or None.
-    - "3kg" / "1.5kg" (any product)      → weight in kg, is_weight=True
-    - "1.5" on a kg-priced product       → weight in kg, is_weight=True
-    - plain integer "3" (1-9999)         → piece/unit count, is_weight=False
+    On a kg-priced product, the client MUST be explicit — "3kg"/"1.5kg" for
+    a weight, or "3 units"/"3pcs" for a piece count — a bare number like "3"
+    is rejected as ambiguous (staff corrects the exact weight afterwards
+    either way, but the intent must be clear from the start).
+    On a normal (non-kg) product, a bare integer is unambiguous and works
+    as before.
     """
-    text = text.strip()
-    m_kg = re.match(r"^(\d+(?:\.\d+)?)\s*kg$", text, re.I)
+    text = text.strip().lower()
+    m_kg = re.match(r"^(\d+(?:\.\d+)?)\s*kg$", text)
     if m_kg:
         val = float(m_kg.group(1))
         return (val, True) if val > 0 else None
-    if is_per_kg and re.match(r"^\d+\.\d+$", text):
-        val = float(text)
-        return (val, True) if val > 0 else None
+    m_unit = re.match(r"^(\d+)\s*(units?|unit[ée]s?|pcs?|pieces?)$", text)
+    if m_unit:
+        val = int(m_unit.group(1))
+        return (val, False) if 1 <= val <= 9999 else None
+    if is_per_kg:
+        return None  # bare number on a kg product → ambiguous, force clarification
     if re.match(r"^\d+$", text):
         val = int(text)
         if 1 <= val <= 9999:
@@ -5198,9 +5337,9 @@ async def webhook_line(request: Request):
                 "pending_sku": sku, "pending_price": float(price_int),
                 "pending_pid": product_id, "pending_name": name,
                 "pending_is_per_kg": is_per_kg}
-            qty_prompt = ("⚖️ Price per kg. Enter the weight you want in kg "
-                          "(e.g. 1.5 or 1.5kg), or the number of pieces "
-                          "(e.g. 3 — exact weight confirmed at packing):"
+            qty_prompt = ("⚖️ Price per kg. Please type your quantity with "
+                          "*kg* or *units* at the end, e.g. \"1.5kg\" or "
+                          "\"3 units\" (exact weight confirmed at packing):"
                           if is_per_kg else "Combien d'unités ?")
             line_reply(reply_token, [line_text(
                 f"*{short}*\nUnit price: {price:.0f} ฿{' /kg' if is_per_kg else ''}\n\n{qty_prompt}"
@@ -5261,6 +5400,12 @@ async def webhook_line(request: Request):
             if prods:
                 msgs += _line_build_carousel(prods, pricelist, cur_page)
             line_reply(reply_token, msgs[:5])
+            continue
+        elif sess.get("pending_sku") and sess.get("pending_is_per_kg"):
+            line_reply(reply_token, [line_text(
+                "⚖️ Please be specific: type your quantity with *kg* or "
+                "*units* at the end, e.g. \"1.5kg\" or \"3 units\"."
+            )])
             continue
 
         # ── Qty button: __aq_{product_id}_{sku}_{price}_{qty} ────────────
