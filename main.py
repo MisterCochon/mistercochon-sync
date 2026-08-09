@@ -5024,7 +5024,8 @@ def _line_create_order(partner: dict, items: list) -> str:
     return "\n".join(msg)
 
 
-def _line_cart_messages(cart: list, added_name: str = None, added_qty: int = None) -> list:
+def _line_cart_messages(cart: list, added_name: str = None, added_qty: int = None,
+                         allow_remove: bool = True) -> list:
     """Return LINE messages showing the cart as a clean Flex bubble."""
     total = sum(i["price"] * i["qty"] for i in cart)
     n = len(cart)
@@ -5034,19 +5035,25 @@ def _line_cart_messages(cart: list, added_name: str = None, added_qty: int = Non
         header_text = f"Added: {_truncate(added_name, 28)} ×{added_qty}"
 
     body_rows = []
-    for i in cart:
+    for idx, i in enumerate(cart):
         short = _truncate(_shorten_product_name(i["name"]), 28)
         row_total = i["price"] * i["qty"]
         qty_label = f"{i['qty']:g}kg" if i.get("is_weight") else f"×{i['qty']}"
         label = f"{short} {qty_label}" + (" 🕐" if i.get("preorder") else "")
+        row_contents = [
+            {"type": "text", "text": label, "size": "sm",
+             "color": "#333333", "wrap": True, "flex": 4},
+            {"type": "text", "text": f"{row_total:,.0f} ฿", "size": "sm",
+             "color": "#333333", "align": "end", "flex": 2},
+        ]
+        if allow_remove:
+            row_contents.append({"type": "box", "layout": "vertical", "flex": 1, "alignItems": "end",
+                 "action": {"type": "postback", "label": "Remove item", "data": f"__rmline_{idx}"},
+                 "contents": [{"type": "text", "text": "✕", "size": "sm",
+                               "color": "#C8102E", "weight": "bold", "align": "end"}]})
         body_rows.append({
-            "type": "box", "layout": "horizontal", "margin": "sm",
-            "contents": [
-                {"type": "text", "text": label, "size": "sm",
-                 "color": "#333333", "wrap": True, "flex": 4},
-                {"type": "text", "text": f"{row_total:,.0f} ฿", "size": "sm",
-                 "color": "#333333", "align": "end", "flex": 2}
-            ]
+            "type": "box", "layout": "horizontal", "margin": "sm", "alignItems": "center",
+            "contents": row_contents
         })
 
     if any(i.get("preorder") for i in cart):
@@ -5463,6 +5470,26 @@ async def webhook_line(request: Request):
                 )])
             else:
                 line_reply(reply_token, _line_cart_messages(cart))
+            continue
+
+        # ── Remove a single line from the cart: __rmline_{index} ────────────
+        if text.startswith("__rmline_"):
+            idx_str = text[len("__rmline_"):]
+            sess = _line_sessions.get(user_id, {})
+            cart = list(sess.get("cart", []))
+            if idx_str.isdigit() and 0 <= int(idx_str) < len(cart):
+                removed = cart.pop(int(idx_str))
+                _line_sessions[user_id] = {**sess, "cart": cart}
+                short = _shorten_product_name(removed.get("name", ""))
+                if cart:
+                    line_reply(reply_token, [line_text(f"🗑️ Removed: {short}")] + _line_cart_messages(cart))
+                else:
+                    line_reply(reply_token, [line_quick_reply(
+                        f"🗑️ Removed: {short}\nYour cart is now empty.",
+                        [("Browse catalog", "menu")]
+                    )])
+            else:
+                line_reply(reply_token, [line_text("This item is no longer in your cart.")])
             continue
 
         # ── Checkout ───────────────────────────────────────────────────────
@@ -6508,6 +6535,27 @@ async def webhook_line_retail(request: Request):
                 retail_reply(reply_token, [line_text("ตะกร้าสินค้าว่างเปล่า\nYour cart is empty.")])
             else:
                 retail_reply(reply_token, _line_cart_messages(cart))
+
+        # ── Remove a single line from the cart: __rmline_{index} ────────────
+        elif text.startswith("__rmline_"):
+            idx_str = text[len("__rmline_"):]
+            cart_live = list(sess.get("cart", []))
+            if idx_str.isdigit() and 0 <= int(idx_str) < len(cart_live):
+                removed = cart_live.pop(int(idx_str))
+                _retail_sessions[user_id] = {**sess, "cart": cart_live}
+                short = _shorten_product_name(removed.get("name", ""))
+                if cart_live:
+                    retail_reply(reply_token,
+                        [line_text(f"🗑️ ลบแล้ว / Removed: {short}")] + _line_cart_messages(cart_live))
+                else:
+                    retail_reply(reply_token, [line_quick_reply(
+                        f"🗑️ ลบแล้ว / Removed: {short}\nตะกร้าสินค้าว่างเปล่า / Your cart is now empty.",
+                        [("🛍️ เมนู / Browse catalog", "menu")]
+                    )])
+            else:
+                retail_reply(reply_token, [line_text(
+                    "ไม่พบสินค้านี้ในตะกร้าแล้ว\nThis item is no longer in your cart."
+                )])
 
         # ── Checkout: choose delivery type first ─────────────────────────────
         elif text_low in ("checkout", "ชำระเงิน", "สั่งซื้อ", "order"):
