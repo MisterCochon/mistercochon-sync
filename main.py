@@ -4457,21 +4457,42 @@ def _line_get_client_price(product_id: int, list_price: float, pricelist) -> flo
     return list_price
 
 
+def _truncate(s: str, n: int) -> str:
+    """Truncate to at most n chars, adding an ellipsis when actually cut.
+    Never cuts a word in half if a space is reasonably close to the limit."""
+    s = (s or "").strip()
+    if len(s) <= n:
+        return s
+    cut = s[:n - 1]
+    sp = cut.rfind(" ")
+    if sp > n * 0.6:  # avoid chopping mid-word when a space is nearby
+        cut = cut[:sp]
+    return cut.rstrip() + "…"
+
+
 def _shorten_product_name(name: str) -> str:
-    """Shorten Odoo product names for LINE carousel (max 40 chars)."""
+    """Normalize Odoo product name variants into a compact display form.
+    Does NOT hard-truncate: callers should truncate to fit their own UI
+    element via _truncate(), since the safe length differs per bubble/field."""
     import re as _re
+    name = name or ""
     # "Chipolata (weight: 1000 gr / Taste: Herbs)" → "Chipolata 1kg · Herbs"
     m = _re.match(r"^(.+?)\s*\(weight:\s*(\d+)\s*gr\s*/\s*Taste:\s*(.+?)\)\s*$", name, _re.I)
     if m:
         base, weight, taste = m.group(1).strip(), m.group(2), m.group(3).strip()
         kg = f"{int(weight)//1000}kg" if int(weight) >= 1000 else f"{weight}g"
-        return f"{base} {kg} · {taste}"[:40]
+        return f"{base} {kg} · {taste}"
     # "Chipolata (weight: 300 gr)" → "Chipolata 300g"
     m2 = _re.match(r"^(.+?)\s*\(weight:\s*(\d+)\s*gr\)\s*$", name, _re.I)
     if m2:
         base, weight = m2.group(1).strip(), m2.group(2)
-        return f"{base} {weight}g"[:40]
-    return name[:40]
+        return f"{base} {weight}g"
+    # "Boudin Blanc (flavor: Apple)" → "Boudin Blanc · Apple"
+    m3 = _re.match(r"^(.+?)\s*\(flavor:\s*(.+?)\)\s*$", name, _re.I)
+    if m3:
+        base, flavor = m3.group(1).strip(), m3.group(2).strip()
+        return f"{base} · {flavor}"
+    return name
 
 
 def _line_build_carousel(products: list, pricelist, page: int = 0,
@@ -4498,13 +4519,13 @@ def _line_build_carousel(products: list, pricelist, page: int = 0,
                 "paddingTop": "8px", "paddingBottom": "8px",
                 "paddingStart": "10px", "paddingEnd": "14px",
                 "spacing": "md",
-                "action": {"type": "postback", "label": name[:40],
+                "action": {"type": "postback", "label": _truncate(name, 40),
                             "data": f"__view_{p['id']}_{sku}"},
                 "contents": [
                     img_box,
                     {"type": "box", "layout": "vertical", "flex": 7, "justifyContent": "center",
                      "contents": [
-                         {"type": "text", "text": name[:60], "size": "sm", "color": "#222222", "wrap": True, "maxLines": 2},
+                         {"type": "text", "text": _truncate(name, 60), "size": "sm", "color": "#222222", "wrap": True, "maxLines": 2},
                          {"type": "text", "text": f"{price:.0f}฿", "size": "sm", "weight": "bold", "color": "#C8102E"}
                      ]},
                     {"type": "text", "text": ">", "flex": 1, "size": "xl", "color": "#1A3A6B", "align": "end"}
@@ -4695,11 +4716,11 @@ def _line_cart_messages(cart: list, added_name: str = None, added_qty: int = Non
 
     header_text = f"Your Order  ({n} item{'s' if n > 1 else ''})"
     if added_name and added_qty:
-        header_text = f"Added: {added_name[:28]} ×{added_qty}"
+        header_text = f"Added: {_truncate(added_name, 28)} ×{added_qty}"
 
     body_rows = []
     for i in cart:
-        short = _shorten_product_name(i["name"])[:28]
+        short = _truncate(_shorten_product_name(i["name"]), 28)
         row_total = i["price"] * i["qty"]
         body_rows.append({
             "type": "box", "layout": "horizontal", "margin": "sm",
@@ -5687,6 +5708,46 @@ async def webhook_line_retail(request: Request):
             retail_reply(reply_token, _line_build_carousel(prods, pricelist, page))
             continue
 
+        # ── Postback: add to cart — button from shared product detail footer ──
+        # data format: __add_{product_id}_{sku}  (same format as B2B)
+        if text.startswith("__add_"):
+            raw = text[6:]
+            first, _, rest = raw.partition("_")
+            if first.isdigit() and rest:
+                product_id = int(first)
+                sku = rest.upper()
+            else:
+                product_id = 0
+                sku = raw.upper()
+
+            prods = sess.get("category_products", [])
+            prod = next((p for p in prods if p.get("id") == product_id
+                         or str(p.get("default_code") or "").upper() == sku), None)
+            if not prod and product_id:
+                found = odoo_execute("product.product", "search_read",
+                    [[["id", "=", product_id]]],
+                    {"fields": ["id", "name", "default_code", "list_price"],
+                     "limit": 1, "context": {"lang": "en_US"}}
+                )
+                prod = found[0] if found else None
+
+            if prod:
+                product_id = product_id or prod["id"]
+                price = _line_get_client_price(prod["id"], prod.get("list_price", 0), pricelist)
+                name  = prod.get("name", sku)
+            else:
+                price = 0.0
+                name  = sku
+
+            short = _truncate(_shorten_product_name(name), 40)
+            _retail_sessions[user_id] = {**sess, "state": "awaiting_qty",
+                "pending_pid": product_id, "pending_sku": sku,
+                "pending_price": int(round(price))}
+            retail_reply(reply_token, [line_text(
+                f"*{short}*\nUnit price: {price:.0f} ฿\n\nกรุณากรอกจำนวน:\nEnter quantity:"
+            )])
+            continue
+
         # ── Postback: add to cart (fixed qty) ─────────────────────────────
         if text.startswith("__aq_"):
             parts = text[5:].split("_")
@@ -5696,7 +5757,7 @@ async def webhook_line_retail(request: Request):
                 prods = sess.get("category_products", [])
                 prod = next((p for p in prods if p.get("id") == pid), None)
                 name = prod["name"] if prod else sku
-                short = name[:25]
+                short = _truncate(_shorten_product_name(name), 25)
                 existing = next((i for i in cart if i["pid"] == pid), None)
                 if existing:
                     existing["qty"] += qty
@@ -5739,8 +5800,9 @@ async def webhook_line_retail(request: Request):
             _retail_sessions[user_id] = {**{k: v for k, v in sess.items()
                                             if k not in ("state", "pending_pid", "pending_sku", "pending_price")},
                                           "cart": cart}
+            short = _truncate(_shorten_product_name(name), 25)
             retail_reply(reply_token, [line_text(
-                f"✅ {name[:25]} ×{qty} เพิ่มแล้ว\nตะกร้า: {len(cart)} รายการ — {total:,.0f}฿"
+                f"✅ {short} ×{qty} เพิ่มแล้ว\nตะกร้า: {len(cart)} รายการ — {total:,.0f}฿"
             )])
             continue
 
@@ -6080,4 +6142,3 @@ async def check_stripe_intent(intent_id: str):
         )
     except Exception as e:
         return JSONResponse({"paid": False, "error": str(e)}, headers={"Access-Control-Allow-Origin": "*"})
-
