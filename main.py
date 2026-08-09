@@ -4987,7 +4987,7 @@ async def webhook_line(request: Request):
 
             short     = _shorten_product_name(name)
             price_int = int(round(price))
-          sess = _line_sessions.get(user_id, {})
+            sess = _line_sessions.get(user_id, {})
             _line_sessions[user_id] = {**sess,
                 "pending_sku": sku, "pending_price": float(price_int),
                 "pending_pid": product_id, "pending_name": name}
