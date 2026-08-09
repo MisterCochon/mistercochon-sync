@@ -4520,6 +4520,27 @@ def _line_get_client_price(product_id: int, list_price: float, pricelist) -> flo
     return list_price
 
 
+def _parse_qty_input(text: str, is_per_kg: bool):
+    """Parse a customer's quantity reply. Returns (qty, is_weight) or None.
+    - "3kg" / "1.5kg" (any product)      → weight in kg, is_weight=True
+    - "1.5" on a kg-priced product       → weight in kg, is_weight=True
+    - plain integer "3" (1-9999)         → piece/unit count, is_weight=False
+    """
+    text = text.strip()
+    m_kg = re.match(r"^(\d+(?:\.\d+)?)\s*kg$", text, re.I)
+    if m_kg:
+        val = float(m_kg.group(1))
+        return (val, True) if val > 0 else None
+    if is_per_kg and re.match(r"^\d+\.\d+$", text):
+        val = float(text)
+        return (val, True) if val > 0 else None
+    if re.match(r"^\d+$", text):
+        val = int(text)
+        if 1 <= val <= 9999:
+            return (val, False)
+    return None
+
+
 def _truncate(s: str, n: int) -> str:
     """Truncate to at most n chars, adding an ellipsis when actually cut.
     Never cuts a word in half if a space is reasonably close to the limit."""
@@ -4582,6 +4603,9 @@ def _line_build_carousel(products: list, pricelist, page: int = 0,
         sku   = str(p.get("default_code") or "").strip().upper()
         name  = _shorten_product_name(p.get("name") or "")
         price = _line_get_client_price(p["id"], p.get("list_price", 0), pricelist)
+        uom   = p.get("uom_id")
+        uom_name = uom[1] if isinstance(uom, list) else ""
+        price_suffix = "/kg" if "kg" in uom_name.lower() else ""
         img_url = _line_get_ecwid_images().get(sku, "")
         img_box = {"type": "image", "url": img_url, "size": "xs", "aspectMode": "cover", "aspectRatio": "1:1", "flex": 2} if img_url else {"type": "filler", "flex": 2}
         rows.append({
@@ -4596,7 +4620,7 @@ def _line_build_carousel(products: list, pricelist, page: int = 0,
                     {"type": "box", "layout": "vertical", "flex": 7, "justifyContent": "center",
                      "contents": [
                          {"type": "text", "text": _truncate(name, 60), "size": "sm", "color": "#222222", "wrap": True, "maxLines": 2},
-                         {"type": "text", "text": f"{price:.0f}฿", "size": "sm", "weight": "bold", "color": "#C8102E"}
+                         {"type": "text", "text": f"{price:.0f}฿{price_suffix}", "size": "sm", "weight": "bold", "color": "#C8102E"}
                      ]},
                     {"type": "text", "text": ">", "flex": 1, "size": "xl", "color": "#1A3A6B", "align": "end"}
                 ]
@@ -4658,6 +4682,10 @@ def _line_product_detail(p: dict, pricelist, back_page: int = 0, is_retail: bool
     desc  = str(p.get("description_sale") or "").strip()
     price_int = int(round(price))
     pid   = p["id"]
+    uom   = p.get("uom_id")
+    uom_name = uom[1] if isinstance(uom, list) else ""
+    is_per_kg = "kg" in uom_name.lower()
+    price_suffix = " / กก. (kg)" if is_per_kg else ""
 
     body_contents = []
 
@@ -4669,11 +4697,15 @@ def _line_product_detail(p: dict, pricelist, back_page: int = 0, is_retail: bool
                                    "margin": "none"})
 
     body_contents += [
-        {"type": "text", "text": f"{price:,.0f} ฿",
+        {"type": "text", "text": f"{price:,.0f} ฿{price_suffix}",
          "weight": "bold", "size": "xxl", "color": "#C8102E", "margin": "md"},
         {"type": "text", "text": f"Ref: {sku}", "size": "xs",
          "color": "#888888", "margin": "xs"},
     ]
+    if is_per_kg:
+        body_contents.append({"type": "text",
+            "text": "⚖️ Price per kg — ordered by the piece, exact weight confirmed at packing.",
+            "size": "xs", "color": "#8B5A00", "wrap": True, "margin": "xs"})
 
     if is_retail:
         _, weight_gr, _variant = _parse_product_variant(name)
@@ -4749,6 +4781,20 @@ def _line_create_order(partner: dict, items: list) -> str:
         return "❌ Order creation failed (sequence error). Please contact us."
     fd_number = f"{fd_number}L"  # suffix "L" = order placed via the LINE bot
 
+    # Batch-resolve each product's UoM so we can flag items priced per kg
+    # but that the client actually ordered by the piece — same signal the
+    # team already writes by hand ("client veut N pièces") for logistics
+    # to weigh and correct before invoicing.
+    known_pids = [item["product_id"] for item in items if item.get("product_id")]
+    uom_by_pid = {}
+    if known_pids:
+        try:
+            prods = odoo_execute("product.product", "read", [known_pids, ["uom_id"]], {})
+            for p in prods:
+                uom_by_pid[p["id"]] = p.get("uom_id")
+        except Exception as e:
+            print(f"[_line_create_order] Erreur lecture uom_id: {e}")
+
     order_vals = {
         "partner_id": partner["id"],
         "name": fd_number,
@@ -4760,7 +4806,7 @@ def _line_create_order(partner: dict, items: list) -> str:
 
     order_id = odoo_execute("sale.order", "create", [order_vals])
 
-    lines_ok, lines_nok = [], []
+    lines_ok, lines_nok, weight_flags = [], [], []
     for item in items:
         sku        = item["sku"]
         qty        = item["qty"]
@@ -4772,15 +4818,17 @@ def _line_create_order(partner: dict, items: list) -> str:
         if not product_id:
             hits = odoo_execute("product.product", "search_read",
                 [[["default_code", "=", sku], ["active", "=", True]]],
-                {"fields": ["id", "list_price"], "limit": 1, "context": {"lang": "en_US"}}
+                {"fields": ["id", "list_price", "uom_id"], "limit": 1, "context": {"lang": "en_US"}}
             )
             if not hits:
                 lines_nok.append(sku)
                 continue
             product_id = hits[0]["id"]
             price = hits[0]["list_price"]
+            uom_by_pid[product_id] = hits[0].get("uom_id")
 
         client_price = _line_get_client_price(product_id, price, pricelist)
+        is_weight = item.get("is_weight", False)
         line_vals = {
             "order_id":        order_id,
             "product_id":      product_id,
@@ -4790,9 +4838,34 @@ def _line_create_order(partner: dict, items: list) -> str:
         }
         try:
             odoo_execute("sale.order.line", "create", [line_vals])
-            lines_ok.append(f"{sku} x{qty}")
+            lines_ok.append(f"{sku} x{qty:g}" + ("kg" if is_weight else ""))
+            product_uom = uom_by_pid.get(product_id)
+            uom_name = product_uom[1] if isinstance(product_uom, list) else ""
+            # Sausages/whole pieces can't be cut to hit an exact weight —
+            # logistics always picks whole pieces and weighs them, so this
+            # note applies regardless of whether the client gave a piece
+            # count or a target weight.
+            if "kg" in uom_name.lower():
+                if is_weight:
+                    weight_flags.append(
+                        f"⚖️ {name}: client wants ~{qty:g}kg (approx., in whole "
+                        f"pieces) — please weigh and confirm actual quantity before invoicing."
+                    )
+                else:
+                    weight_flags.append(
+                        f"⚖️ {name}: client wants {qty} pieces — please weigh and "
+                        f"confirm actual quantity before invoicing."
+                    )
         except Exception:
             lines_nok.append(sku)
+
+    if weight_flags:
+        try:
+            odoo_execute("sale.order", "write", [[order_id], {
+                "note": order_vals["note"] + "\n\n" + "\n".join(weight_flags)
+            }])
+        except Exception as e:
+            print(f"[_line_create_order] Erreur ajout note poids: {e}")
 
     if lines_ok:
         try:
@@ -4805,6 +4878,9 @@ def _line_create_order(partner: dict, items: list) -> str:
         msg.append("Items: " + ", ".join(lines_ok))
     if lines_nok:
         msg.append("⚠️ SKUs not found: " + ", ".join(lines_nok))
+    if weight_flags:
+        msg.append("⚖️ Some items are priced per kg — final weight and price "
+                    "will be confirmed by our team before invoicing.")
     msg.append("Our team will contact you to confirm delivery. Thank you!")
     return "\n".join(msg)
 
@@ -4822,7 +4898,8 @@ def _line_cart_messages(cart: list, added_name: str = None, added_qty: int = Non
     for i in cart:
         short = _truncate(_shorten_product_name(i["name"]), 28)
         row_total = i["price"] * i["qty"]
-        label = f"{short} ×{i['qty']}" + (" 🕐" if i.get("preorder") else "")
+        qty_label = f"{i['qty']:g}kg" if i.get("is_weight") else f"×{i['qty']}"
+        label = f"{short} {qty_label}" + (" 🕐" if i.get("preorder") else "")
         body_rows.append({
             "type": "box", "layout": "horizontal", "margin": "sm",
             "contents": [
@@ -5075,7 +5152,7 @@ async def webhook_line(request: Request):
             if not prod and product_id:
                 rows = odoo_execute("product.product", "search_read",
                     [[["id", "=", product_id]]],
-                    {"fields": ["id", "name", "default_code", "list_price", "description_sale", "qty_available"],
+                    {"fields": ["id", "name", "default_code", "list_price", "description_sale", "qty_available", "uom_id"],
                      "limit": 1, "context": {"lang": "en_US"}})
                 prod = rows[0] if rows else None
             if not prod:
@@ -5107,18 +5184,26 @@ async def webhook_line(request: Request):
                 product_id = product_id or prod["id"]
                 price = _line_get_client_price(prod["id"], prod.get("list_price", 0), pricelist)
                 name  = prod.get("name", sku)
+                uom = prod.get("uom_id")
+                is_per_kg = isinstance(uom, list) and "kg" in (uom[1] or "").lower()
             else:
                 price = 0.0
                 name  = sku
+                is_per_kg = False
 
             short     = _shorten_product_name(name)
             price_int = int(round(price))
             sess = _line_sessions.get(user_id, {})
             _line_sessions[user_id] = {**sess,
                 "pending_sku": sku, "pending_price": float(price_int),
-                "pending_pid": product_id, "pending_name": name}
+                "pending_pid": product_id, "pending_name": name,
+                "pending_is_per_kg": is_per_kg}
+            qty_prompt = ("⚖️ Price per kg. Enter the weight you want in kg "
+                          "(e.g. 1.5 or 1.5kg), or the number of pieces "
+                          "(e.g. 3 — exact weight confirmed at packing):"
+                          if is_per_kg else "Combien d'unités ?")
             line_reply(reply_token, [line_text(
-                f"*{short}*\nUnit price: {price:.0f} ฿\n\nCombien d'unités ?"
+                f"*{short}*\nUnit price: {price:.0f} ฿{' /kg' if is_per_kg else ''}\n\n{qty_prompt}"
             )])
             continue
 
@@ -5142,26 +5227,32 @@ async def webhook_line(request: Request):
 
         # ── Free-text qty for custom quantity ──────────────────────────────
         sess = _line_sessions.get(user_id, {})
-        if sess.get("pending_sku") and re.match(r"^\d+$", text) and 1 <= int(text) <= 9999:
+        if sess.get("pending_sku"):
+            parsed = _parse_qty_input(text, sess.get("pending_is_per_kg", False))
+        else:
+            parsed = None
+        if parsed:
+            qty, is_weight = parsed
             sku        = sess["pending_sku"]
             price      = sess["pending_price"]
             product_id = sess.get("pending_pid", 0)
             name       = sess.get("pending_name", sku)
-            qty        = int(text)
             cart = list(sess.get("cart", []))
             for item in cart:
-                if item["sku"] == sku:
+                if item["sku"] == sku and item.get("is_weight", False) == is_weight:
                     item["qty"] += qty
                     break
             else:
-                cart.append({"sku": sku, "name": name,
-                              "price": price, "product_id": product_id, "qty": qty})
+                cart.append({"sku": sku, "name": name, "price": price,
+                              "product_id": product_id, "qty": qty, "is_weight": is_weight})
             _line_sessions[user_id] = {**sess, "cart": cart,
-                                        "pending_sku": None, "pending_price": None}
+                                        "pending_sku": None, "pending_price": None,
+                                        "pending_is_per_kg": None}
             short = _shorten_product_name(name)
             total = sum(i["price"] * i["qty"] for i in cart)
+            qty_label = f"{qty:g}kg" if is_weight else f"×{qty}"
             confirm_msg = line_text(
-                f"✅ {short} ×{qty} added\n"
+                f"✅ {short} {qty_label} added\n"
                 f"Cart: {len(cart)} item{'s' if len(cart)>1 else ''} — {total:,.0f} ฿"
             )
             prods = sess.get("category_products", [])
@@ -5266,7 +5357,7 @@ async def webhook_line(request: Request):
                        ["categ_id", "=", categ_id]]
             prods = odoo_execute("product.product", "search_read",
                 [domain],
-                {"fields": ["id", "name", "default_code", "list_price", "description_sale", "qty_available"], "limit": 200,
+                {"fields": ["id", "name", "default_code", "list_price", "description_sale", "qty_available", "uom_id"], "limit": 200,
                  "context": {"lang": "en_US"}})
             if not prods:
                 line_reply(reply_token, [line_text("No products in this category.")])
@@ -5302,7 +5393,7 @@ async def webhook_line(request: Request):
                     domain.append(["product_tag_ids", "in", [line_tag_id]])
             prods = odoo_execute("product.product", "search_read",
                 [domain],
-                {"fields": ["id", "name", "default_code", "list_price", "description_sale", "qty_available"], "limit": 200,
+                {"fields": ["id", "name", "default_code", "list_price", "description_sale", "qty_available", "uom_id"], "limit": 200,
                  "context": {"lang": "en_US"}}
             )
             if not prods:
@@ -5333,7 +5424,7 @@ async def webhook_line(request: Request):
                         domain.append(["product_tag_ids", "in", [line_tag_id]])
                 prods = odoo_execute("product.product", "search_read",
                     [domain],
-                    {"fields": ["id", "name", "default_code", "list_price", "description_sale", "qty_available"], "limit": 200,
+                    {"fields": ["id", "name", "default_code", "list_price", "description_sale", "qty_available", "uom_id"], "limit": 200,
                      "context": {"lang": "en_US"}}
                 )
                 _line_sessions[user_id] = {"category_products": prods, "page": 0}
@@ -5381,12 +5472,16 @@ async def webhook_line(request: Request):
                     [[["order_id", "in", oid_list]]],
                     {"fields": ["product_id", "product_uom_qty"], "limit": 200}
                 )
-                # Deduplicate products, keep max qty ordered
+                # Deduplicate products, keep max qty ordered, exclude the
+                # Transport / Frozen-supplement lines (product_id 1915/1917)
+                # so shipping fees never show up as a "usual product".
                 seen, prod_ids = {}, []
                 for ln in all_lines:
                     if not ln.get("product_id"):
                         continue
                     pid = ln["product_id"][0]
+                    if pid in (1915, 1917):
+                        continue
                     qty = int(ln.get("product_uom_qty", 1))
                     if pid not in seen:
                         seen[pid] = qty
@@ -5403,10 +5498,12 @@ async def webhook_line(request: Request):
                     domain = [["id", "in", prod_ids],
                               ["name", "not ilike", "frozen"],
                               ["name", "not ilike", "livraison"],
-                              ["name", "not ilike", "delivery"]]
+                              ["name", "not ilike", "delivery"],
+                              ["name", "not ilike", "transport"],
+                              ["name", "not ilike", "supplement"]]
                     prods = odoo_execute("product.product", "search_read",
                         [domain],
-                        {"fields": ["id", "name", "default_code", "list_price", "description_sale", "qty_available"],
+                        {"fields": ["id", "name", "default_code", "list_price", "description_sale", "qty_available", "uom_id"],
                          "limit": 100, "context": {"lang": "en_US", "active_test": False}}
                     )
                     if not prods:
@@ -5512,7 +5609,7 @@ async def webhook_line(request: Request):
                 raw_sku = sku_match.group(1).upper()
                 prods_found = odoo_execute("product.product", "search_read",
                     [[["default_code", "=ilike", raw_sku]]],
-                    {"fields": ["id", "name", "default_code", "list_price", "description_sale", "qty_available"],
+                    {"fields": ["id", "name", "default_code", "list_price", "description_sale", "qty_available", "uom_id"],
                      "limit": 1, "context": {"lang": "en_US", "active_test": False}}
                 )
                 if prods_found:
@@ -6036,7 +6133,7 @@ async def webhook_line_retail(request: Request):
                       ["categ_id", "=", cat_id]]
             prods = odoo_execute("product.product", "search_read",
                 [domain],
-                {"fields": ["id", "name", "default_code", "list_price", "description_sale", "qty_available"],
+                {"fields": ["id", "name", "default_code", "list_price", "description_sale", "qty_available", "uom_id"],
                  "limit": 200, "context": {"lang": "en_US"}}
             )
             _retail_sessions[user_id] = {**sess, "category_products": prods, "page": 0}
@@ -6053,7 +6150,7 @@ async def webhook_line_retail(request: Request):
             if not prod:
                 found = odoo_execute("product.product", "search_read",
                     [[["id", "=", product_id]]],
-                    {"fields": ["id", "name", "default_code", "list_price", "description_sale", "qty_available"],
+                    {"fields": ["id", "name", "default_code", "list_price", "description_sale", "qty_available", "uom_id"],
                      "limit": 1, "context": {"lang": "en_US"}}
                 )
                 prod = found[0] if found else None
