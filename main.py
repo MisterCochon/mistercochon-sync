@@ -5346,6 +5346,41 @@ async def webhook_line(request: Request):
                 "📞 Support: @jfbuc"
             )])
 
+        # ── Free-text order: "SKU x2" or "SKU1 x2, SKU2 x3" ────────────────
+        elif _line_parse_order(text):
+            parsed = _line_parse_order(text)
+            sess = _line_sessions.get(user_id, {})
+            cart = list(sess.get("cart", []))
+            added, not_found = [], []
+            for sku, qty in parsed:
+                hits = odoo_execute("product.product", "search_read",
+                    [[["default_code", "=ilike", sku], ["active", "=", True]]],
+                    {"fields": ["id", "name", "default_code", "list_price"],
+                     "limit": 1, "context": {"lang": "en_US"}}
+                )
+                if not hits:
+                    not_found.append(sku)
+                    continue
+                prod = hits[0]
+                price = _line_get_client_price(prod["id"], prod.get("list_price", 0), pricelist)
+                for item in cart:
+                    if item["sku"] == sku:
+                        item["qty"] += qty
+                        break
+                else:
+                    cart.append({"sku": sku, "name": prod["name"],
+                                  "price": price, "product_id": prod["id"], "qty": qty})
+                added.append(f"{_shorten_product_name(prod['name'])} ×{qty}")
+            _line_sessions[user_id] = {**sess, "cart": cart}
+            lines = []
+            if added:
+                total = sum(i["price"] * i["qty"] for i in cart)
+                lines.append("✅ Added:\n" + "\n".join(added))
+                lines.append(f"\nCart: {len(cart)} item{'s' if len(cart)>1 else ''} — {total:,.0f} ฿")
+            if not_found:
+                lines.append("❌ Not found: " + ", ".join(not_found))
+            line_reply(reply_token, [line_text("\n".join(lines))])
+        
         # ── SKU lookup: type a SKU to open product detail ─────────────────
         else:
             sess = _line_sessions.get(user_id, {})
