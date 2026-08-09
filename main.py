@@ -4504,7 +4504,7 @@ def _line_build_carousel(products: list, pricelist, page: int = 0,
                     img_box,
                     {"type": "box", "layout": "vertical", "flex": 7, "justifyContent": "center",
                      "contents": [
-                         {"type": "text", "text": name[:34], "size": "sm", "color": "#222222", "wrap": False},
+                         {"type": "text", "text": name[:60], "size": "sm", "color": "#222222", "wrap": True, "maxLines": 2},
                          {"type": "text", "text": f"{price:.0f}฿", "size": "sm", "weight": "bold", "color": "#C8102E"}
                      ]},
                     {"type": "text", "text": ">", "flex": 1, "size": "xl", "color": "#1A3A6B", "align": "end"}
@@ -4587,7 +4587,7 @@ def _line_product_detail(p: dict, pricelist, back_page: int = 0) -> list:
             "type": "box", "layout": "vertical",
             "backgroundColor": "#1A3A6B", "paddingAll": "14px",
             "contents": [{"type": "text", "text": short, "weight": "bold",
-                          "color": "#FFFFFF", "size": "md", "wrap": True, "maxLines": 2}]
+                          "color": "#FFFFFF", "size": "md", "wrap": True, "maxLines": 3}]
         },
         "body": {
             "type": "box", "layout": "vertical",
@@ -4597,10 +4597,9 @@ def _line_product_detail(p: dict, pricelist, back_page: int = 0) -> list:
         "footer": {
             "type": "box", "layout": "vertical", "paddingAll": "10px", "spacing": "sm",
             "contents": [
-               {"type": "text", "text": f"Stock: {int(p.get('qty_available', 0))} unites",
-                 "size": "sm", "color": "#555555"},
-                {"type": "text", "text": "Tapez le SKU suivi de la quantite. Ex: JAMB x2",
-                 "size": "xs", "color": "#888888", "wrap": True},
+               {"type": "button", "style": "primary", "height": "sm", "color": "#1A3A6B",
+                 "action": {"type": "postback", "label": "🛒 Add to cart",
+                            "data": f"__add_{pid}_{sku}"}},
                 {"type": "button", "style": "secondary", "height": "sm",
                  "action": {"type": "postback", "label": "← Back to list",
                             "data": f"__page_{back_page}"}}
@@ -4988,15 +4987,12 @@ async def webhook_line(request: Request):
 
             short     = _shorten_product_name(name)
             price_int = int(round(price))
-            # Embed product_id + sku + price in every button — zero Odoo calls at qty/checkout
-            line_reply(reply_token, [line_quick_reply(
-                f"*{short}*\n"
-                f"Unit price: {price:.0f} ฿\n\n"
-                f"Select quantity:",
-                [(f"× {q}", f"__aq_{product_id}_{sku}_{price_int}_{q}")
-                 for q in [1, 2, 3, 5, 10]]
-                + [("Other qty", f"__cq_{product_id}_{sku}_{price_int}"),
-                   ("Cancel", "cancel")]
+          sess = _line_sessions.get(user_id, {})
+            _line_sessions[user_id] = {**sess,
+                "pending_sku": sku, "pending_price": float(price_int),
+                "pending_pid": product_id, "pending_name": name}
+            line_reply(reply_token, [line_text(
+                f"*{short}*\nUnit price: {price:.0f} ฿\n\nCombien d'unités ?"
             )])
             continue
 
