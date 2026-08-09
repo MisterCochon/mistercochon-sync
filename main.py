@@ -4788,15 +4788,20 @@ def _line_cart_messages(cart: list, added_name: str = None, added_qty: int = Non
     for i in cart:
         short = _truncate(_shorten_product_name(i["name"]), 28)
         row_total = i["price"] * i["qty"]
+        label = f"{short} ×{i['qty']}" + (" 🕐" if i.get("preorder") else "")
         body_rows.append({
             "type": "box", "layout": "horizontal", "margin": "sm",
             "contents": [
-                {"type": "text", "text": f"{short} ×{i['qty']}", "size": "sm",
+                {"type": "text", "text": label, "size": "sm",
                  "color": "#333333", "wrap": True, "flex": 4},
                 {"type": "text", "text": f"{row_total:,.0f} ฿", "size": "sm",
                  "color": "#333333", "align": "end", "flex": 2}
             ]
         })
+
+    if any(i.get("preorder") for i in cart):
+        body_rows.append({"type": "text", "text": "🕐 Pre-order — out of stock, longer delivery time",
+                           "size": "xs", "color": "#888888", "wrap": True, "margin": "sm"})
 
     body_rows += [
         {"type": "separator", "margin": "md"},
@@ -5598,8 +5603,11 @@ def _retail_checkout_messages(cart: list, partner: dict) -> list:
     total = sum(i["qty"] * i["price"] for i in cart)
     lines = []
     for i in cart:
-        lines.append(f"• {i['name'][:30]} ×{i['qty']} = {i['qty']*i['price']:,.0f}฿")
+        tag = " 🕐(Pre-order)" if i.get("preorder") else ""
+        lines.append(f"• {i['name'][:30]} ×{i['qty']} = {i['qty']*i['price']:,.0f}฿{tag}")
     order_text = "\n".join(lines)
+    if any(i.get("preorder") for i in cart):
+        order_text += "\n\n🕐 มีสินค้าพรีออเดอร์ อาจใช้เวลาจัดส่งนานกว่าปกติ\nIncludes pre-order item(s) — may take longer to deliver."
     # PromptPay QR code with amount via promptpay.io
     qr_url = f"https://promptpay.io/{PROMPTPAY_NUMBER}/{int(total)}.png"
     return [
@@ -5894,7 +5902,7 @@ async def webhook_line_retail(request: Request):
             if not prod and product_id:
                 found = odoo_execute("product.product", "search_read",
                     [[["id", "=", product_id]]],
-                    {"fields": ["id", "name", "default_code", "list_price"],
+                    {"fields": ["id", "name", "default_code", "list_price", "qty_available"],
                      "limit": 1, "context": {"lang": "en_US"}}
                 )
                 prod = found[0] if found else None
@@ -5903,17 +5911,24 @@ async def webhook_line_retail(request: Request):
                 product_id = product_id or prod["id"]
                 price = _line_get_client_price(prod["id"], prod.get("list_price", 0), pricelist)
                 name  = prod.get("name", sku)
+                is_preorder = (prod.get("qty_available", 0) or 0) <= 0
             else:
                 price = 0.0
                 name  = sku
+                is_preorder = False
 
             short = _truncate(_shorten_product_name(name), 40)
             _retail_sessions[user_id] = {**sess, "state": "awaiting_qty",
                 "pending_pid": product_id, "pending_sku": sku,
-                "pending_price": int(round(price))}
-            retail_reply(reply_token, [line_text(
-                f"*{short}*\nUnit price: {price:.0f} ฿\n\nกรุณากรอกจำนวน:\nEnter quantity:"
-            )])
+                "pending_price": int(round(price)), "pending_preorder": is_preorder}
+            prompt = f"*{short}*\nUnit price: {price:.0f} ฿\n\nกรุณากรอกจำนวน:\nEnter quantity:"
+            if is_preorder:
+                prompt = (f"*{short}*\nUnit price: {price:.0f} ฿\n\n"
+                           "🕐 สินค้าหมด — คุณสามารถสั่งพรีออเดอร์ได้\n"
+                           "Out of stock — you can still place a pre-order,\n"
+                           "delivery time may be longer than usual.\n\n"
+                           "กรุณากรอกจำนวน:\nEnter quantity:")
+            retail_reply(reply_token, [line_text(prompt)])
             continue
 
         # ── Postback: add to cart (fixed qty) ─────────────────────────────
@@ -5956,21 +5971,26 @@ async def webhook_line_retail(request: Request):
             pid = sess.get("pending_pid")
             sku = sess.get("pending_sku", "")
             price = _line_get_client_price(pid, float(sess.get("pending_price", 0)), pricelist)
+            is_preorder = bool(sess.get("pending_preorder", False))
             prods = sess.get("category_products", [])
             prod = next((p for p in prods if p.get("id") == pid), None)
             name = prod["name"] if prod else sku
             existing = next((i for i in cart if i["pid"] == pid), None)
             if existing:
                 existing["qty"] += qty
+                existing["preorder"] = existing.get("preorder", False) or is_preorder
             else:
-                cart.append({"pid": pid, "sku": sku, "name": name, "qty": qty, "price": price})
+                cart.append({"pid": pid, "sku": sku, "name": name, "qty": qty,
+                              "price": price, "preorder": is_preorder})
             total = sum(i["qty"] * i["price"] for i in cart)
             _retail_sessions[user_id] = {**{k: v for k, v in sess.items()
-                                            if k not in ("state", "pending_pid", "pending_sku", "pending_price")},
+                                            if k not in ("state", "pending_pid", "pending_sku",
+                                                          "pending_price", "pending_preorder")},
                                           "cart": cart}
             short = _truncate(_shorten_product_name(name), 25)
+            preorder_note = "\n🕐 พรีออเดอร์ — Pre-order (out of stock)" if is_preorder else ""
             retail_reply(reply_token, [line_text(
-                f"✅ {short} ×{qty} เพิ่มแล้ว\nตะกร้า: {len(cart)} รายการ — {total:,.0f}฿"
+                f"✅ {short} ×{qty} เพิ่มแล้ว{preorder_note}\nตะกร้า: {len(cart)} รายการ — {total:,.0f}฿"
             )])
             continue
 
@@ -5995,8 +6015,12 @@ async def webhook_line_retail(request: Request):
                 retail_reply(reply_token, [line_text("ตะกร้าสินค้าว่างเปล่า\nYour cart is empty.")])
             else:
                 total = sum(i["qty"] * i["price"] for i in cart)
+                preorder_note = ""
+                if any(i.get("preorder") for i in cart):
+                    preorder_note = ("\n\n🕐 มีสินค้าพรีออเดอร์ในตะกร้า อาจใช้เวลาจัดส่งนานกว่าปกติ\n"
+                                      "Includes pre-order item(s) — may take longer to deliver.")
                 retail_reply(reply_token, [line_quick_reply(
-                    f"ยอดรวม {total:,.0f}฿ — เลือกวิธีชำระเงิน\nTotal {total:,.0f}฿ — Choose payment:",
+                    f"ยอดรวม {total:,.0f}฿ — เลือกวิธีชำระเงิน\nTotal {total:,.0f}฿ — Choose payment:{preorder_note}",
                     [("📱 PromptPay", "__pay_promptpay"),
                      ("💳 บัตรเครดิต", "__pay_card")]
                 )])
