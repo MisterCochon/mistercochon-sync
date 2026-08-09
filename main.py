@@ -4950,7 +4950,7 @@ async def webhook_line(request: Request):
             if not prod and product_id:
                 rows = odoo_execute("product.product", "search_read",
                     [[["id", "=", product_id]]],
-                    {"fields": ["id", "name", "default_code", "list_price", "description_sale"],
+                    {"fields": ["id", "name", "default_code", "list_price", "description_sale", "qty_available"],
                      "limit": 1, "context": {"lang": "en_US"}})
                 prod = rows[0] if rows else None
             if not prod:
@@ -5144,7 +5144,7 @@ async def webhook_line(request: Request):
                        ["categ_id", "=", categ_id]]
             prods = odoo_execute("product.product", "search_read",
                 [domain],
-                {"fields": ["id", "name", "default_code", "list_price", "description_sale"], "limit": 200,
+                {"fields": ["id", "name", "default_code", "list_price", "description_sale", "qty_available"], "limit": 200,
                  "context": {"lang": "en_US"}})
             if not prods:
                 line_reply(reply_token, [line_text("No products in this category.")])
@@ -5180,7 +5180,7 @@ async def webhook_line(request: Request):
                     domain.append(["product_tag_ids", "in", [line_tag_id]])
             prods = odoo_execute("product.product", "search_read",
                 [domain],
-                {"fields": ["id", "name", "default_code", "list_price", "description_sale"], "limit": 200,
+                {"fields": ["id", "name", "default_code", "list_price", "description_sale", "qty_available"], "limit": 200,
                  "context": {"lang": "en_US"}}
             )
             if not prods:
@@ -5211,7 +5211,7 @@ async def webhook_line(request: Request):
                         domain.append(["product_tag_ids", "in", [line_tag_id]])
                 prods = odoo_execute("product.product", "search_read",
                     [domain],
-                    {"fields": ["id", "name", "default_code", "list_price", "description_sale"], "limit": 200,
+                    {"fields": ["id", "name", "default_code", "list_price", "description_sale", "qty_available"], "limit": 200,
                      "context": {"lang": "en_US"}}
                 )
                 _line_sessions[user_id] = {"category_products": prods, "page": 0}
@@ -5284,7 +5284,7 @@ async def webhook_line(request: Request):
                               ["name", "not ilike", "delivery"]]
                     prods = odoo_execute("product.product", "search_read",
                         [domain],
-                        {"fields": ["id", "name", "default_code", "list_price", "description_sale"],
+                        {"fields": ["id", "name", "default_code", "list_price", "description_sale", "qty_available"],
                          "limit": 100, "context": {"lang": "en_US", "active_test": False}}
                     )
                     if not prods:
@@ -5355,7 +5355,7 @@ async def webhook_line(request: Request):
                 raw_sku = sku_match.group(1).upper()
                 prods_found = odoo_execute("product.product", "search_read",
                     [[["default_code", "=ilike", raw_sku]]],
-                    {"fields": ["id", "name", "default_code", "list_price", "description_sale"],
+                    {"fields": ["id", "name", "default_code", "list_price", "description_sale", "qty_available"],
                      "limit": 1, "context": {"lang": "en_US", "active_test": False}}
                 )
                 if prods_found:
@@ -5623,7 +5623,7 @@ async def webhook_line_retail(request: Request):
                       ["categ_id", "=", cat_id]]
             prods = odoo_execute("product.product", "search_read",
                 [domain],
-                {"fields": ["id", "name", "default_code", "list_price", "description_sale"],
+                {"fields": ["id", "name", "default_code", "list_price", "description_sale", "qty_available"],
                  "limit": 200, "context": {"lang": "en_US"}}
             )
             _retail_sessions[user_id] = {**sess, "category_products": prods, "page": 0}
@@ -5640,7 +5640,7 @@ async def webhook_line_retail(request: Request):
             if not prod:
                 found = odoo_execute("product.product", "search_read",
                     [[["id", "=", product_id]]],
-                    {"fields": ["id", "name", "default_code", "list_price", "description_sale"],
+                    {"fields": ["id", "name", "default_code", "list_price", "description_sale", "qty_available"],
                      "limit": 1, "context": {"lang": "en_US"}}
                 )
                 prod = found[0] if found else None
