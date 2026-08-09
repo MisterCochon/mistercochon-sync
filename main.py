@@ -5669,6 +5669,99 @@ async def webhook_line_retail(request: Request):
                     )])
                 continue
 
+            # ── Registration: email not found → offer to sign up ──────────
+            if sess.get("state") == "awaiting_register_choice":
+                if text_low in ("ใช่", "yes", "สมัคร", "register", "ลงทะเบียน", "✅"):
+                    _retail_sessions[user_id] = {"state": "awaiting_reg_name",
+                                                  "reg_email": sess.get("reg_email", "")}
+                    retail_reply(reply_token, [line_text(
+                        "📝 ลงทะเบียนสมาชิกใหม่ / New registration\n\n"
+                        "กรุณากรอกชื่อ-นามสกุลของคุณ\nPlease enter your full name:"
+                    )])
+                else:
+                    _retail_sessions.pop(user_id, None)
+                    retail_reply(reply_token, [line_text(
+                        "กรุณากรอกอีเมลของคุณอีกครั้ง\nPlease enter your email again."
+                    )])
+                continue
+
+            # Registration step 2: waiting for full name
+            if sess.get("state") == "awaiting_reg_name":
+                name = text.strip()
+                if len(name) < 2:
+                    retail_reply(reply_token, [line_text(
+                        "กรุณากรอกชื่อ-นามสกุลที่ถูกต้อง\nPlease enter a valid full name:"
+                    )])
+                    continue
+                _retail_sessions[user_id] = {"state": "awaiting_reg_phone",
+                                              "reg_name": name,
+                                              "reg_email": sess.get("reg_email", "")}
+                retail_reply(reply_token, [line_text(
+                    f"ชื่อ: *{name}*\n\n"
+                    "กรุณากรอกเบอร์โทรศัพท์ของคุณ\nNow please enter your phone number:"
+                )])
+                continue
+
+            # Registration step 3: waiting for phone → create the account
+            if sess.get("state") == "awaiting_reg_phone":
+                phone = re.sub(r"[^\d+]", "", text.strip())
+                if len(re.sub(r"\D", "", phone)) < 8:
+                    retail_reply(reply_token, [line_text(
+                        "เบอร์โทรศัพท์ไม่ถูกต้อง กรุณากรอกใหม่\n"
+                        "Invalid phone number, please try again:"
+                    )])
+                    continue
+
+                name  = sess.get("reg_name", "").strip()
+                email = sess.get("reg_email", "").strip()
+                _retail_sessions.pop(user_id, None)
+
+                display = _line_get_display_name(user_id)
+                marker  = f"line_retail:{user_id}"
+
+                # Guard: someone may have registered with this email in the
+                # gap since the failed lookup — link to that account instead
+                # of creating a duplicate.
+                existing = None
+                if email:
+                    existing = odoo_execute("res.partner", "search_read",
+                        [[["email", "=ilike", email], ["customer_rank", ">", 0]]],
+                        {"fields": ["id", "name", "comment"], "limit": 1}
+                    )
+                    existing = existing[0] if existing else None
+
+                if existing:
+                    comment = existing.get("comment") or ""
+                    if marker not in comment:
+                        odoo_execute("res.partner", "write",
+                            [[existing["id"]], {"comment": (comment + "\n" + marker).strip()}])
+                    pname = existing["name"]
+                else:
+                    odoo_execute("res.partner", "create", [{
+                        "name": name or display or "Mister Cochon Customer",
+                        "email": email,
+                        "phone": phone,
+                        "customer_rank": 1,
+                        "is_company": False,
+                        "country_id": 216,  # Thailand
+                        "comment": (
+                            f"{marker}\n"
+                            f"Registered via LINE bot — {display}"
+                        ),
+                    }])
+                    pname = name
+
+                partner = _retail_get_partner(user_id)
+                cats = _retail_get_categories()
+                retail_reply(reply_token, [
+                    line_text(
+                        f"✅ ยินดีต้อนรับ คุณ{pname}!\nWelcome, {pname}!\n\n"
+                        "บัญชีของคุณถูกสร้างแล้ว\nYour account has been created."
+                    ),
+                    _retail_build_cat_flex(cats) if cats else line_text("พิมพ์ เมนู เพื่อดูสินค้า")
+                ])
+                continue
+
             p = _retail_email_login(text)
             if p:
                 _retail_sessions[user_id] = {
@@ -5679,6 +5772,15 @@ async def webhook_line_retail(request: Request):
                 retail_reply(reply_token, [line_text(
                     f"✅ พบบัญชี:\n*{p['name']}*\n\nถูกต้องไหม? Is this you?\n\n"
                     "ใช่ / Yes   |   ไม่ใช่ / No"
+                )])
+            elif re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", text.strip()):
+                # Looks like an email but no match in Odoo → offer registration
+                _retail_sessions[user_id] = {"state": "awaiting_register_choice",
+                                              "reg_email": text.strip()}
+                retail_reply(reply_token, [line_quick_reply(
+                    "❌ ไม่พบอีเมลนี้ในระบบ\nEmail not found.\n\n"
+                    "ต้องการสมัครสมาชิกใหม่หรือไม่?\nWould you like to register as a new customer?",
+                    [("✅ สมัคร / Register", "ใช่"), ("🔄 ลองอีกครั้ง / Try again", "ไม่ใช่")]
                 )])
             else:
                 retail_reply(reply_token, [line_text(
