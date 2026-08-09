@@ -298,8 +298,8 @@ async def _poll_stock_sync():
                     requests.put(target["url"], headers=headers, json=payload)
                     if "quantity" in payload: updated_qty += 1
                     if "price" in payload: updated_price += 1
-                except Exception:
-                    pass
+                except Exception as e:
+                    print(f"[_poll_stock_sync] Erreur: {e}")
             print(f"[STOCK] {updated_qty} stocks, {updated_price} prix mis a jour sur Ecwid")
         except Exception as e:
             print(f"[STOCK] Erreur: {e}")
@@ -338,8 +338,8 @@ for _fp in [
         try:
             pdfmetrics.registerFont(TTFont("ThaiMC", _fp))
             _THAI_FONT = "ThaiMC"
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[lifespan] Erreur: {e}")
         break
 
 _LOGO_PATH = os.path.join(os.path.dirname(__file__), "logo.png")
@@ -1667,8 +1667,8 @@ def order_pdf(order_ref: str):
                         ship.get("countryName") or "",
                     ]
                     address = "\n".join(p for p in addr_parts if p)
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"[order_pdf] Erreur: {e}")
 
         # Générer le PDF
         buf = io.BytesIO()
@@ -2591,8 +2591,8 @@ async def import_commandes_xlsx(
                     m2 = re.match(r"(\d{4})[/\-](\d{2})[/\-](\d{2})", date_str)
                     if m2:
                         order_vals["date_order"] = f"{m2.group(1)}-{m2.group(2)}-{m2.group(3)} 00:00:00"
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"[find_partner] Erreur: {e}")
 
         try:
             order_id = odoo_execute("sale.order", "create", [order_vals])
@@ -2649,8 +2649,8 @@ async def import_commandes_xlsx(
 
         try:
             odoo_execute("sale.order", "action_confirm", [[order_id]])
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[find_partner] Erreur: {e}")
 
         created.append({
             "windev": windev_num,
@@ -2844,8 +2844,8 @@ def sync_ecwid_orders(
                 from datetime import datetime
                 dt = datetime.utcfromtimestamp(order_date / 1000 if order_date > 1e10 else order_date)
                 order_vals["date_order"] = dt.strftime("%Y-%m-%d %H:%M:%S")
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"[find_product] Erreur: {e}")
 
         try:
             order_id = odoo_execute("sale.order", "create", [order_vals])
@@ -2907,8 +2907,8 @@ def sync_ecwid_orders(
         # Confirmer la commande
         try:
             odoo_execute("sale.order", "action_confirm", [[order_id]])
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[find_product] Erreur: {e}")
 
         created.append({
             "ecwid": order_num,
@@ -2949,8 +2949,8 @@ def _parse_ecwid_date(order_date) -> str:
                     return dt.strftime("%Y-%m-%d %H:%M:%S")
                 except Exception:
                     continue
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[_parse_ecwid_date] Erreur: {e}")
     return ""
 
 
@@ -3065,8 +3065,8 @@ def _import_one_ecwid_order(order_num: str, eco: dict) -> dict:
         try:
             odoo_execute("sale.order.line", "create", [line_vals])
             lines_created += 1
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[_import_one_ecwid_order] Erreur: {e}")
 
     for surcharge in (eco.get("customSurcharges") or []):
         amount = surcharge.get("total") or surcharge.get("value") or 0
@@ -3078,13 +3078,13 @@ def _import_one_ecwid_order(order_num: str, eco: dict) -> dict:
                     "product_uom_qty": 1, "price_unit": amount,
                 }])
                 lines_created += 1
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"[_import_one_ecwid_order] Erreur: {e}")
 
     try:
         odoo_execute("sale.order", "action_confirm", [[order_id]])
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[_import_one_ecwid_order] Erreur: {e}")
 
     return {"status": "created", "fd": fd_number, "lines": lines_created}
 
@@ -3771,8 +3771,8 @@ def cancel_old_orders(secret: str = ""):
                         "message_type": "comment",
                         "subtype_xmlid": "mail.mt_note",
                     })
-                except Exception:
-                    pass
+                except Exception as e:
+                    print(f"[cancel_old_orders] Erreur: {e}")
         except Exception as e:
             errors.append({"order": ecwid_num, "step": "odoo", "error": str(e)})
 
@@ -3971,7 +3971,7 @@ def debug_reorder(secret: str = "", code: str = ""):
 # ─── Utilitaires import Ecwid ────────────────────────────────────────────────
 
 @app.get("/debug-ecwid-order/{order_num}")
-def debug_ecwid_order(order_num: str):
+def debug_ecwid_order_by_number(order_num: str):
     """Affiche la structure brute d'une commande Ecwid (pour debug)."""
     data = ecwid_get("/orders", {"orderNumber": order_num, "limit": 1})
     if not data or not data.get("items"):
@@ -4143,8 +4143,8 @@ def delete_ecwid_imports(confirm: str = ""):
                 odoo_execute("sale.order", "action_cancel", [[oid]])
             try:
                 odoo_execute("sale.order", "action_draft", [[oid]])
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"[delete_ecwid_imports] Erreur: {e}")
             odoo_execute("sale.order", "unlink", [[oid]])
             deleted.append(name)
         except Exception as e:
@@ -4174,8 +4174,8 @@ def line_reply(reply_token: str, messages: list):
         requests.post(f"{LINE_API}/message/reply",
             json={"replyToken": reply_token, "messages": messages},
             headers=headers, timeout=10)
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[line_reply] Erreur: {e}")
 
 
 def line_text(text: str) -> dict:
@@ -4783,8 +4783,8 @@ def _line_create_order(partner: dict, items: list) -> str:
     if lines_ok:
         try:
             odoo_execute("sale.order", "action_confirm", [[order_id]])
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[_line_create_order] Erreur: {e}")
 
     msg = [f"✅ Order *{fd_number}* confirmed!"]
     if lines_ok:
@@ -5425,8 +5425,8 @@ async def webhook_line(request: Request):
                         json={"to": admin_id, "messages": [{"type": "text",
                             "text": f"📩 Contact request\nClient: {client_name}\nLINE ID: {user_id}\n\nReply directly in OA Manager."}]},
                         timeout=5)
-                except Exception:
-                    pass
+                except Exception as e:
+                    print(f"[webhook_line] Erreur: {e}")
 
         # ── My LINE ID (admin helper) ──────────────────────────────────────
         elif text == "!myid":
@@ -6119,10 +6119,13 @@ async def webhook_line_retail(request: Request):
                     cart.append({"pid": pid, "sku": sku, "name": name, "qty": qty, "price": price})
                 total = sum(i["qty"] * i["price"] for i in cart)
                 _retail_sessions[user_id] = {**sess, "cart": cart}
-                cur_page = sess.get("page", 0)
-                confirm_msg = line_text(f"✅ {short} ×{qty} เพิ่มแล้ว\nตะกร้า: {len(cart)} รายการ — {total:,.0f}฿")
-                msgs = [confirm_msg] + _line_build_carousel(prods, pricelist, cur_page)
-                retail_reply(reply_token, msgs[:5])
+                confirm_msg = line_quick_reply(
+                    f"✅ {short} ×{qty} เพิ่มแล้ว\nตะกร้า: {len(cart)} รายการ — {total:,.0f}฿",
+                    [("🛍️ ซื้อต่อ / Continue shopping", f"__page_{sess.get('page', 0)}"),
+                     ("🛒 ตะกร้า / Cart", "cart"),
+                     ("💳 ชำระเงิน / Checkout", "checkout")]
+                )
+                retail_reply(reply_token, [confirm_msg])
             continue
 
         # ── Postback: custom qty prompt ────────────────────────────────────
@@ -6160,8 +6163,11 @@ async def webhook_line_retail(request: Request):
                                           "cart": cart}
             short = _truncate(_shorten_product_name(name), 25)
             preorder_note = "\n🕐 พรีออเดอร์ — Pre-order (out of stock)" if is_preorder else ""
-            retail_reply(reply_token, [line_text(
-                f"✅ {short} ×{qty} เพิ่มแล้ว{preorder_note}\nตะกร้า: {len(cart)} รายการ — {total:,.0f}฿"
+            retail_reply(reply_token, [line_quick_reply(
+                f"✅ {short} ×{qty} เพิ่มแล้ว{preorder_note}\nตะกร้า: {len(cart)} รายการ — {total:,.0f}฿",
+                [("🛍️ ซื้อต่อ / Continue shopping", f"__page_{sess.get('page', 0)}"),
+                 ("🛒 ตะกร้า / Cart", "cart"),
+                 ("💳 ชำระเงิน / Checkout", "checkout")]
             )])
             continue
 
@@ -6428,7 +6434,7 @@ async def payment_cancel():
 # ─── PromptPay Stripe — Page de paiement Ecwid ───────────────────────────────
 
 @app.get("/pay/{order_number}")
-async def pay_ecwid_promptpay(order_number: str):
+async def pay_ecwid_promptpay_by_order_number(order_number: str):
     """Page de paiement PromptPay Stripe pour commande Ecwid."""
     if not STRIPE_SECRET_KEY:
         return HTMLResponse("<h2 style='font-family:sans-serif;padding:40px;color:red'>Stripe non configuré</h2>", status_code=500)
