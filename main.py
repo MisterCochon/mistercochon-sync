@@ -309,9 +309,11 @@ async def _poll_stock_sync():
 async def lifespan(app: FastAPI):
     task = asyncio.create_task(_poll_ecwid_orders())
     task2 = asyncio.create_task(_poll_stock_sync())
+    task3 = asyncio.create_task(_poll_ecwid_images())
     yield
     task.cancel()
     task2.cancel()
+    task3.cancel()
 
 app = FastAPI(lifespan=lifespan)
 
@@ -4417,15 +4419,22 @@ _ecwid_image_cache: dict = {}
 _ecwid_image_cache_ts: float = 0.0
 
 def _line_get_ecwid_images() -> dict:
-    """Return {sku_upper: image_url} from Ecwid. Cached for 1 hour."""
+    """Return {sku_upper: image_url} for the WHOLE Ecwid catalog (paginated).
+    Cached for 1 hour on success. On failure, keeps serving the previous
+    (stale) cache instead of going empty, and retries again within ~60s
+    instead of being stuck without images for the full hour."""
     import time
     global _ecwid_image_cache, _ecwid_image_cache_ts
-    if time.time() - _ecwid_image_cache_ts < 3600 and _ecwid_image_cache is not None:
+    now = time.time()
+    has_cache = bool(_ecwid_image_cache)
+    cache_age = now - _ecwid_image_cache_ts
+
+    if has_cache and cache_age < 3600:
         return _ecwid_image_cache
+
     img_map = {}
     try:
-        data = ecwid_get("/products", {"limit": 100, "offset": 0}, timeout=3)
-        for item in data.get("items", []):
+        for item in ecwid_get_all_products():
             img = item.get("imageUrl") or item.get("thumbnailUrl") or ""
             sku = str(item.get("sku") or "").strip().upper()
             if sku and img:
@@ -4435,10 +4444,31 @@ def _line_get_ecwid_images() -> dict:
                 if vsku and img:
                     img_map[vsku] = img
     except Exception:
-        pass
-    _ecwid_image_cache = img_map
-    _ecwid_image_cache_ts = time.time()
-    return img_map
+        img_map = {}
+
+    if img_map:
+        _ecwid_image_cache = img_map
+        _ecwid_image_cache_ts = now
+        return img_map
+
+    # Fetch failed or returned nothing usable this round.
+    if has_cache:
+        # Serve the stale cache but retry again in ~60s instead of an hour.
+        _ecwid_image_cache_ts = now - 3600 + 60
+        return _ecwid_image_cache
+    _ecwid_image_cache_ts = now - 3600 + 60
+    return {}
+
+
+async def _poll_ecwid_images():
+    """Keep the product-image cache warm in the background so LINE
+    requests never pay the full Ecwid fetch cost synchronously."""
+    while True:
+        try:
+            _line_get_ecwid_images()
+        except Exception as e:
+            print(f"[IMG] Erreur: {e}")
+        await asyncio.sleep(1800)  # refresh every 30 min, well under the 1h cache TTL
 
 
 def _line_get_client_price(product_id: int, list_price: float, pricelist) -> float:
