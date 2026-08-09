@@ -4470,29 +4470,36 @@ def _truncate(s: str, n: int) -> str:
     return cut.rstrip() + "…"
 
 
+def _parse_product_variant(name: str):
+    """Parse a raw Odoo product name into (base, weight_gr:int|None, variant:str|None).
+    Handles 'Taste', 'Flavour' (UK) and 'Flavor' (US) labels."""
+    import re as _re
+    name = name or ""
+    m = _re.match(r"^(.+?)\s*\(weight:\s*(\d+)\s*gr\s*/\s*(?:Taste|Flavour|Flavor):\s*(.+?)\)\s*$", name, _re.I)
+    if m:
+        return m.group(1).strip(), int(m.group(2)), m.group(3).strip()
+    m2 = _re.match(r"^(.+?)\s*\(weight:\s*(\d+)\s*gr\)\s*$", name, _re.I)
+    if m2:
+        return m2.group(1).strip(), int(m2.group(2)), None
+    m3 = _re.match(r"^(.+?)\s*\((?:Taste|Flavour|Flavor):\s*(.+?)\)\s*$", name, _re.I)
+    if m3:
+        return m3.group(1).strip(), None, m3.group(2).strip()
+    return name, None, None
+
+
 def _shorten_product_name(name: str) -> str:
     """Normalize Odoo product name variants into a compact display form.
     Does NOT hard-truncate: callers should truncate to fit their own UI
     element via _truncate(), since the safe length differs per bubble/field."""
-    import re as _re
-    name = name or ""
-    # "Chipolata (weight: 1000 gr / Taste: Herbs)" → "Chipolata 1kg · Herbs"
-    m = _re.match(r"^(.+?)\s*\(weight:\s*(\d+)\s*gr\s*/\s*Taste:\s*(.+?)\)\s*$", name, _re.I)
-    if m:
-        base, weight, taste = m.group(1).strip(), m.group(2), m.group(3).strip()
-        kg = f"{int(weight)//1000}kg" if int(weight) >= 1000 else f"{weight}g"
-        return f"{base} {kg} · {taste}"
-    # "Chipolata (weight: 300 gr)" → "Chipolata 300g"
-    m2 = _re.match(r"^(.+?)\s*\(weight:\s*(\d+)\s*gr\)\s*$", name, _re.I)
-    if m2:
-        base, weight = m2.group(1).strip(), m2.group(2)
+    base, weight, variant = _parse_product_variant(name)
+    if weight and variant:
+        kg = f"{weight//1000}kg" if weight >= 1000 else f"{weight}g"
+        return f"{base} {kg} · {variant}"
+    if weight:
         return f"{base} {weight}g"
-    # "Boudin Blanc (flavor: Apple)" → "Boudin Blanc · Apple"
-    m3 = _re.match(r"^(.+?)\s*\(flavor:\s*(.+?)\)\s*$", name, _re.I)
-    if m3:
-        base, flavor = m3.group(1).strip(), m3.group(2).strip()
-        return f"{base} · {flavor}"
-    return name
+    if variant:
+        return f"{base} · {variant}"
+    return base
 
 
 def _line_build_carousel(products: list, pricelist, page: int = 0,
@@ -4577,8 +4584,10 @@ def _line_build_carousel(products: list, pricelist, page: int = 0,
     return [{"type": "flex", "altText": header_text, "contents": bubble}]
 
 
-def _line_product_detail(p: dict, pricelist, back_page: int = 0) -> list:
-    """Detail bubble for a single product with qty buttons."""
+def _line_product_detail(p: dict, pricelist, back_page: int = 0, is_retail: bool = False) -> list:
+    """Detail bubble for a single product with qty buttons.
+    is_retail=True (Mister Cochon / B2C) adds photo, stock, and weight —
+    is_retail=False (French Delicatessen / B2B) keeps the original lean layout."""
     sku   = str(p.get("default_code") or "").strip().upper()
     name  = p.get("name") or sku
     short = _shorten_product_name(name)
@@ -4587,12 +4596,38 @@ def _line_product_detail(p: dict, pricelist, back_page: int = 0) -> list:
     price_int = int(round(price))
     pid   = p["id"]
 
-    body_contents = [
+    body_contents = []
+
+    if is_retail:
+        img_url = _line_get_ecwid_images().get(sku, "")
+        if img_url:
+            body_contents.append({"type": "image", "url": img_url, "size": "full",
+                                   "aspectMode": "cover", "aspectRatio": "4:3",
+                                   "margin": "none"})
+
+    body_contents += [
         {"type": "text", "text": f"{price:,.0f} ฿",
-         "weight": "bold", "size": "xxl", "color": "#C8102E"},
+         "weight": "bold", "size": "xxl", "color": "#C8102E", "margin": "md"},
         {"type": "text", "text": f"Ref: {sku}", "size": "xs",
          "color": "#888888", "margin": "xs"},
     ]
+
+    if is_retail:
+        _, weight_gr, _variant = _parse_product_variant(name)
+        if weight_gr:
+            w_text = f"{weight_gr/1000:.2f}".rstrip("0").rstrip(".") + " kg" if weight_gr >= 1000 else f"{weight_gr} g"
+            body_contents.append({"type": "text", "text": f"⚖️ {w_text}", "size": "sm",
+                                   "color": "#444444", "margin": "xs"})
+        qty_available = p.get("qty_available", 0) or 0
+        if qty_available > 0:
+            stock_text = f"✅ มีสินค้า {int(qty_available)} ชิ้น / In stock"
+            stock_color = "#1E8E3E"
+        else:
+            stock_text = "❌ สินค้าหมด / Out of stock"
+            stock_color = "#C8102E"
+        body_contents.append({"type": "text", "text": stock_text, "size": "sm",
+                               "color": stock_color, "weight": "bold", "margin": "xs"})
+
     if desc:
         body_contents.append({"type": "text", "text": desc[:120], "size": "sm",
                                "color": "#444444", "wrap": True, "margin": "sm"})
@@ -4602,6 +4637,14 @@ def _line_product_detail(p: dict, pricelist, back_page: int = 0) -> list:
                 "action": {"type": "postback", "label": f"×{q}",
                            "data": f"__aq_{pid}_{sku}_{price_int}_{q}"}}
 
+    footer_contents = [
+       {"type": "button", "style": "primary", "height": "sm", "color": "#1A3A6B",
+         "action": {"type": "postback", "label": "🛒 Add to cart",
+                    "data": f"__add_{pid}_{sku}"}},
+        {"type": "button", "style": "secondary", "height": "sm",
+         "action": {"type": "postback", "label": "← Back to list",
+                    "data": f"__page_{back_page}"}}
+    ]
     bubble = {
         "type": "bubble", "size": "mega",
         "header": {
@@ -4617,14 +4660,7 @@ def _line_product_detail(p: dict, pricelist, back_page: int = 0) -> list:
         },
         "footer": {
             "type": "box", "layout": "vertical", "paddingAll": "10px", "spacing": "sm",
-            "contents": [
-               {"type": "button", "style": "primary", "height": "sm", "color": "#1A3A6B",
-                 "action": {"type": "postback", "label": "🛒 Add to cart",
-                            "data": f"__add_{pid}_{sku}"}},
-                {"type": "button", "style": "secondary", "height": "sm",
-                 "action": {"type": "postback", "label": "← Back to list",
-                            "data": f"__page_{back_page}"}}
-            ]
+            "contents": footer_contents
         }
     }
     return [{"type": "flex", "altText": short, "contents": bubble}]
@@ -5697,7 +5733,7 @@ async def webhook_line_retail(request: Request):
                 )
                 prod = found[0] if found else None
             if prod:
-                retail_reply(reply_token, _line_product_detail(prod, pricelist, sess.get("page", 0)))
+                retail_reply(reply_token, _line_product_detail(prod, pricelist, sess.get("page", 0), is_retail=True))
             continue
 
         # ── Postback: page navigation ──────────────────────────────────────
