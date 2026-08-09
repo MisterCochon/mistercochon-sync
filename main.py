@@ -3284,9 +3284,29 @@ async def webhook_stripe(request: Request):
                 return
             lines_vals = [(0, 0, {"product_id": i["pid"],
                 "product_uom_qty": i["qty"], "price_unit": i["price"]}) for i in cart]
+
+            base_shipping = float(meta.get("base_shipping_fee", 0) or 0)
+            frozen_fee    = float(meta.get("frozen_fee", 0) or 0)
+            delivery_temp = meta.get("delivery_temp", "chilled")
+            thai_phone    = meta.get("thai_contact_phone", "")
+
+            if base_shipping > 0:
+                lines_vals.append((0, 0, {"product_id": 1915, "name": "Transport",
+                    "product_uom_qty": 1, "price_unit": round(base_shipping, 2), "tax_ids": [(5, 0, 0)]}))
+            if frozen_fee > 0:
+                lines_vals.append((0, 0, {"product_id": 1917, "name": "Delivery Frozen supplement",
+                    "product_uom_qty": 1, "price_unit": round(frozen_fee, 2)}))
+
             try:
-                intent_id = meta.get("stripe_intent_id", "") or obj.get("id", "")
-                note = f"LINE Retail Stripe — {intent_id or user_id}"
+                # BUGFIX: this used to reference an undefined `obj`, which raised
+                # a NameError on every retail payment and silently prevented any
+                # Odoo order from ever being created (caught by the except below).
+                intent_id = meta.get("stripe_intent_id", "") or data_obj.get("id", "")
+                note_lines = [f"LINE Retail Stripe — {intent_id or user_id}",
+                              f"Delivery: {'Frozen' if delivery_temp == 'frozen' else 'Chilled'}"]
+                if thai_phone:
+                    note_lines.append(f"Thai-speaking contact: {thai_phone}")
+                note = "\n".join(note_lines)
                 # Anti-doublon: ne pas créer si cet intent existe déjà
                 existing = odoo_execute("sale.order", "search_read",
                     [[["note", "=", note]]],
@@ -5538,7 +5558,8 @@ def retail_push(user_id: str, messages: list):
 def _retail_get_partner(user_id: str) -> dict | None:
     results = odoo_execute("res.partner", "search_read",
         [[["comment", "like", f"line_retail:{user_id}"]]],
-        {"fields": ["id", "name", "email", "property_product_pricelist"], "limit": 1}
+        {"fields": ["id", "name", "email", "property_product_pricelist",
+                    "street", "city", "zip"], "limit": 1}
     )
     return results[0] if results else None
 
@@ -5596,6 +5617,104 @@ def _retail_build_cat_flex(cats: list) -> dict:
             }
         }
     }
+
+
+_ecwid_shipping_cache: list = []
+_ecwid_shipping_cache_ts: float = 0.0
+
+def _get_ecwid_shipping_options() -> list:
+    """Return the store's configured Ecwid shipping options (zones + rates),
+    as set up in the Ecwid admin panel. Cached for 1 hour; on failure, keeps
+    serving the previous (stale) list instead of going empty."""
+    import time
+    global _ecwid_shipping_cache, _ecwid_shipping_cache_ts
+    now = time.time()
+    has_cache = bool(_ecwid_shipping_cache)
+    if has_cache and now - _ecwid_shipping_cache_ts < 3600:
+        return _ecwid_shipping_cache
+    try:
+        data = ecwid_get("/profile/shippingOptions", timeout=10)
+        options = data if isinstance(data, list) else (data or {}).get("items", [])
+    except Exception:
+        options = None
+    if options:
+        _ecwid_shipping_cache = options
+        _ecwid_shipping_cache_ts = now
+        return options
+    if has_cache:
+        _ecwid_shipping_cache_ts = now - 3600 + 60
+        return _ecwid_shipping_cache
+    _ecwid_shipping_cache_ts = now - 3600 + 60
+    return []
+
+
+def _postcode_matches_zone(zip_code: str, templates: list) -> bool:
+    """Match a zip code against Ecwid postcode zone templates.
+    Supports exact codes, trailing-* prefixes (e.g. '10*' for Bangkok),
+    and numeric ranges ('10000-10300')."""
+    if not templates:
+        return True  # zone has no postcode restriction → matches everywhere
+    zip_code = (zip_code or "").strip()
+    if not zip_code:
+        return False
+    for tpl in templates:
+        tpl = str(tpl).strip()
+        if not tpl:
+            continue
+        if "-" in tpl and tpl.replace("-", "").isdigit():
+            lo, hi = tpl.split("-", 1)
+            if lo.isdigit() and hi.isdigit() and lo <= zip_code <= hi:
+                return True
+        elif tpl.endswith("*"):
+            if zip_code.startswith(tpl[:-1]):
+                return True
+        elif tpl == zip_code:
+            return True
+    return False
+
+
+def _get_shipping_fee(zip_code: str, subtotal: float) -> tuple:
+    """Return (fee, option_title) for a delivery address, based on the
+    shipping zones/rates configured in Ecwid (Store settings → Shipping →
+    Zones). Returns (0.0, "") if nothing is configured or no zone matches —
+    callers should treat that as 'no shipping fee applied'."""
+    options = _get_ecwid_shipping_options()
+    candidates = [o for o in options
+                  if o.get("enabled") and o.get("fulfilmentType") in ("shipping", "delivery")]
+    # A zone with explicit postcodes wins over a catch-all zone (no postcodes = anywhere).
+    specific, catch_all = [], []
+    for o in candidates:
+        templates = ((o.get("destinationZone") or {}).get("postCodes") or [])
+        if templates:
+            if _postcode_matches_zone(zip_code, templates):
+                specific.append(o)
+        else:
+            catch_all.append(o)
+    match = specific[0] if specific else (catch_all[0] if catch_all else None)
+    if not match:
+        return 0.0, ""
+
+    calc = match.get("ratesCalculationType")
+    title = match.get("title", "")
+    if calc == "flat":
+        fr = match.get("flatRate") or {}
+        rate, rate_type = fr.get("rate", 0) or 0, fr.get("rateType", "ABSOLUTE")
+        fee = subtotal * rate / 100 if rate_type == "PERCENT" else rate
+        return float(fee), title
+    if calc == "table":
+        rt = match.get("ratesTable") or {}
+        based_on = rt.get("tableBasedOn", "subtotal")
+        if based_on in ("subtotal", "discountedSubtotal"):
+            for row in rt.get("rates", []):
+                cond = row.get("conditions", {}) or {}
+                lo = cond.get("subtotalFrom", cond.get("discountedSubtotalFrom", 0)) or 0
+                hi = cond.get("subtotalTo", cond.get("discountedSubtotalTo"))
+                if subtotal >= lo and (hi is None or subtotal <= hi):
+                    r = row.get("rate", {}) or {}
+                    return float(r.get("perOrder", 0) or 0), title
+        return 0.0, title
+    # carrier-calculated / app-based rates need live carrier data we don't have here.
+    return 0.0, title
 
 
 def _retail_checkout_messages(cart: list, partner: dict) -> list:
@@ -5740,7 +5859,7 @@ async def webhook_line_retail(request: Request):
                 )])
                 continue
 
-            # Registration step 3: waiting for phone → create the account
+            # Registration step 3: waiting for phone → then ask for address
             if sess.get("state") == "awaiting_reg_phone":
                 phone = re.sub(r"[^\d+]", "", text.strip())
                 if len(re.sub(r"\D", "", phone)) < 8:
@@ -5749,10 +5868,35 @@ async def webhook_line_retail(request: Request):
                         "Invalid phone number, please try again:"
                     )])
                     continue
+                _retail_sessions[user_id] = {"state": "awaiting_reg_address",
+                                              "reg_name": sess.get("reg_name", ""),
+                                              "reg_email": sess.get("reg_email", ""),
+                                              "reg_phone": phone}
+                retail_reply(reply_token, [line_text(
+                    f"เบอร์โทร: *{phone}*\n\n"
+                    "กรุณากรอกที่อยู่จัดส่งแบบเต็ม (บ้านเลขที่ ถนน ตำบล/แขวง อำเภอ/เขต จังหวัด รหัสไปรษณีย์):\n"
+                    "Please enter your full delivery address "
+                    "(house number, street, sub-district, district, province, postal code):"
+                )])
+                continue
+
+            # Registration step 4: waiting for address → create the account
+            if sess.get("state") == "awaiting_reg_address":
+                address = text.strip()
+                if len(address) < 10:
+                    retail_reply(reply_token, [line_text(
+                        "กรุณากรอกที่อยู่ให้ครบถ้วนมากขึ้น\n"
+                        "Please enter a more complete address:"
+                    )])
+                    continue
 
                 name  = sess.get("reg_name", "").strip()
                 email = sess.get("reg_email", "").strip()
+                phone = sess.get("reg_phone", "").strip()
                 _retail_sessions.pop(user_id, None)
+
+                zip_match = re.search(r"\b(\d{5})\b", address)
+                zip_code = zip_match.group(1) if zip_match else ""
 
                 display = _line_get_display_name(user_id)
                 marker  = f"line_retail:{user_id}"
@@ -5772,13 +5916,16 @@ async def webhook_line_retail(request: Request):
                     comment = existing.get("comment") or ""
                     if marker not in comment:
                         odoo_execute("res.partner", "write",
-                            [[existing["id"]], {"comment": (comment + "\n" + marker).strip()}])
+                            [[existing["id"]], {"comment": (comment + "\n" + marker).strip(),
+                                                 "street": address, "zip": zip_code}])
                     pname = existing["name"]
                 else:
                     odoo_execute("res.partner", "create", [{
                         "name": name or display or "Mister Cochon Customer",
                         "email": email,
                         "phone": phone,
+                        "street": address,
+                        "zip": zip_code,
                         "customer_rank": 1,
                         "is_company": False,
                         "country_id": 216,  # Thailand
@@ -5815,11 +5962,35 @@ async def webhook_line_retail(request: Request):
                 # Looks like an email but no match in Odoo → offer registration
                 _retail_sessions[user_id] = {"state": "awaiting_register_choice",
                                               "reg_email": text.strip()}
-                retail_reply(reply_token, [line_quick_reply(
-                    "❌ ไม่พบอีเมลนี้ในระบบ\nEmail not found.\n\n"
-                    "ต้องการสมัครสมาชิกใหม่หรือไม่?\nWould you like to register as a new customer?",
-                    [("✅ สมัคร / Register", "ใช่"), ("🔄 ลองอีกครั้ง / Try again", "ไม่ใช่")]
-                )])
+                retail_reply(reply_token, [{
+                    "type": "flex",
+                    "altText": "Email not found — Would you like to register?",
+                    "contents": {
+                        "type": "bubble", "size": "mega",
+                        "header": {
+                            "type": "box", "layout": "vertical",
+                            "backgroundColor": "#8B0000", "paddingAll": "14px",
+                            "contents": [{"type": "text", "text": "❌ ไม่พบอีเมลนี้ / Email not found",
+                                          "weight": "bold", "color": "#FFFFFF", "size": "md", "wrap": True}]
+                        },
+                        "body": {
+                            "type": "box", "layout": "vertical", "paddingAll": "14px",
+                            "contents": [
+                                {"type": "text", "wrap": True, "size": "sm", "color": "#444444",
+                                 "text": "ต้องการสมัครสมาชิกใหม่หรือไม่?\nWould you like to register as a new customer?"}
+                            ]
+                        },
+                        "footer": {
+                            "type": "box", "layout": "vertical", "paddingAll": "10px", "spacing": "sm",
+                            "contents": [
+                                {"type": "button", "style": "primary", "height": "md", "color": "#1A3A6B",
+                                 "action": {"type": "postback", "label": "✅ สมัคร / Register", "data": "ใช่"}},
+                                {"type": "button", "style": "secondary", "height": "md",
+                                 "action": {"type": "postback", "label": "🔄 ลองอีกครั้ง / Try again", "data": "ไม่ใช่"}}
+                            ]
+                        }
+                    }
+                }])
             else:
                 retail_reply(reply_token, [line_text(
                     "🐷 *Mister Cochon* — French Delicatessen\n\n"
@@ -5994,6 +6165,73 @@ async def webhook_line_retail(request: Request):
             )])
             continue
 
+        # ── Delivery type: chilled or frozen? (asked before showing totals) ──
+        if sess.get("state") == "awaiting_delivery_temp" and text_low in ("chilled", "frozen", "แช่เย็น", "แช่แข็ง"):
+            delivery_temp = "frozen" if text_low in ("frozen", "แช่แข็ง") else "chilled"
+            _retail_sessions[user_id] = {**sess, "state": "awaiting_thai_phone",
+                                          "checkout_delivery_temp": delivery_temp}
+            retail_reply(reply_token, [line_text(
+                "📞 กรุณากรอกเบอร์โทรของผู้ที่พูดภาษาไทยได้ สำหรับติดต่อจัดส่ง\n"
+                "Please enter the phone number of someone who speaks Thai, "
+                "for the delivery contact:"
+            )])
+            continue
+
+        # ── Thai-speaking delivery contact phone → then show totals ─────────
+        if sess.get("state") == "awaiting_thai_phone":
+            thai_phone = re.sub(r"[^\d+]", "", text.strip())
+            if len(re.sub(r"\D", "", thai_phone)) < 8:
+                retail_reply(reply_token, [line_text(
+                    "เบอร์โทรศัพท์ไม่ถูกต้อง กรุณากรอกใหม่\n"
+                    "Invalid phone number, please try again:"
+                )])
+                continue
+
+            delivery_temp = sess.get("checkout_delivery_temp", "chilled")
+            frozen_fee = 50.0 if delivery_temp == "frozen" else 0.0
+            subtotal = sum(i["qty"] * i["price"] for i in cart)
+            zip_code = (partner.get("zip") or "").strip()
+            base_shipping, ship_title = _get_shipping_fee(zip_code, subtotal)
+            shipping_fee = base_shipping + frozen_fee
+            grand_total = subtotal + shipping_fee
+            _retail_sessions[user_id] = {**{k: v for k, v in sess.items() if k != "state"},
+                                          "checkout_shipping_fee": shipping_fee,
+                                          "checkout_base_shipping": base_shipping,
+                                          "checkout_frozen_fee": frozen_fee,
+                                          "checkout_shipping_title": ship_title,
+                                          "checkout_delivery_temp": delivery_temp,
+                                          "checkout_thai_phone": thai_phone}
+
+            preorder_note = ""
+            if any(i.get("preorder") for i in cart):
+                preorder_note = ("\n\n🕐 มีสินค้าพรีออเดอร์ในตะกร้า อาจใช้เวลาจัดส่งนานกว่าปกติ\n"
+                                  "Includes pre-order item(s) — may take longer to deliver.")
+
+            if not zip_code:
+                ship_line = ("\n⚠️ ไม่พบที่อยู่จัดส่งในโปรไฟล์ — ยังไม่รวมค่าส่ง\n"
+                              "No delivery address on file — shipping not included yet.")
+            else:
+                parts = []
+                if base_shipping > 0:
+                    label = f" ({ship_title})" if ship_title else ""
+                    parts.append(f"Shipping{label}: {base_shipping:,.0f}฿")
+                else:
+                    parts.append("Shipping: Free")
+                if frozen_fee:
+                    parts.append(f"Frozen surcharge: {frozen_fee:,.0f}฿")
+                ship_line = "\n" + " + ".join(parts)
+
+            temp_label = "🧊 Frozen (แช่แข็ง)" if delivery_temp == "frozen" else "❄️ Chilled (แช่เย็น)"
+            retail_reply(reply_token, [line_quick_reply(
+                f"การจัดส่ง / Delivery: {temp_label}\n"
+                f"เบอร์ติดต่อจัดส่ง / Delivery contact: {thai_phone}\n"
+                f"สินค้า / Subtotal: {subtotal:,.0f}฿{ship_line}\n"
+                f"รวมทั้งหมด / Total: {grand_total:,.0f}฿\n\nเลือกวิธีชำระเงิน / Choose payment:{preorder_note}",
+                [("📱 PromptPay", "__pay_promptpay"),
+                 ("💳 บัตรเครดิต", "__pay_card")]
+            )])
+            continue
+
         # ── Menu / catalogue ───────────────────────────────────────────────
         if text_low in ("menu", "เมนู", "สินค้า", "catalog", "ดูสินค้า"):
             cats = _retail_get_categories()
@@ -6009,20 +6247,17 @@ async def webhook_line_retail(request: Request):
             else:
                 retail_reply(reply_token, _line_cart_messages(cart))
 
-        # ── Checkout: choose payment method ────────────────────────────────
+        # ── Checkout: choose delivery type first ─────────────────────────────
         elif text_low in ("checkout", "ชำระเงิน", "สั่งซื้อ", "order"):
             if not cart:
                 retail_reply(reply_token, [line_text("ตะกร้าสินค้าว่างเปล่า\nYour cart is empty.")])
             else:
-                total = sum(i["qty"] * i["price"] for i in cart)
-                preorder_note = ""
-                if any(i.get("preorder") for i in cart):
-                    preorder_note = ("\n\n🕐 มีสินค้าพรีออเดอร์ในตะกร้า อาจใช้เวลาจัดส่งนานกว่าปกติ\n"
-                                      "Includes pre-order item(s) — may take longer to deliver.")
+                _retail_sessions[user_id] = {**sess, "state": "awaiting_delivery_temp"}
                 retail_reply(reply_token, [line_quick_reply(
-                    f"ยอดรวม {total:,.0f}฿ — เลือกวิธีชำระเงิน\nTotal {total:,.0f}฿ — Choose payment:{preorder_note}",
-                    [("📱 PromptPay", "__pay_promptpay"),
-                     ("💳 บัตรเครดิต", "__pay_card")]
+                    "🚚 เลือกรูปแบบการจัดส่ง\nChoose delivery type:\n\n"
+                    "❄️ Chilled — ไม่มีค่าใช้จ่ายเพิ่ม / no extra charge\n"
+                    "🧊 Frozen — +50฿",
+                    [("❄️ Chilled", "chilled"), ("🧊 Frozen (+50฿)", "frozen")]
                 )])
 
         # ── Pay via PromptPay (Stripe) ─────────────────────────────────────
@@ -6032,13 +6267,20 @@ async def webhook_line_retail(request: Request):
             elif not STRIPE_SECRET_KEY:
                 retail_reply(reply_token, [line_text("❌ Stripe not configured.")])
             else:
-                total = sum(i["qty"] * i["price"] for i in cart)
+                subtotal = sum(i["qty"] * i["price"] for i in cart)
+                shipping_fee = float(sess.get("checkout_shipping_fee", 0) or 0)
+                total = subtotal + shipping_fee
                 try:
                     intent = _stripe.PaymentIntent.create(
                         amount=int(total * 100),
                         currency="thb",
                         payment_method_types=["promptpay"],
                         metadata={"line_user_id": user_id, "partner_id": str(partner["id"]),
+                                  "shipping_fee": str(shipping_fee),
+                                  "delivery_temp": sess.get("checkout_delivery_temp", "chilled"),
+                                  "thai_contact_phone": sess.get("checkout_thai_phone", ""),
+                                  "base_shipping_fee": str(sess.get("checkout_base_shipping", 0) or 0),
+                                  "frozen_fee": str(sess.get("checkout_frozen_fee", 0) or 0),
                                   "cart": json.dumps([{"pid": i["pid"], "name": i["name"],
                                       "qty": i["qty"], "price": i["price"]} for i in cart])},
                     )
@@ -6051,8 +6293,9 @@ async def webhook_line_retail(request: Request):
                         return_url=f"{RENDER_URL}/payment-success?user={user_id}",
                     )
                     qr_url = intent["next_action"]["promptpay_display_qr_code"]["image_url_png"]
-                    _retail_sessions[user_id] = {**sess, "stripe_cart": cart,
-                        "stripe_intent_id": intent["id"], "cart": []}
+                    _retail_sessions[user_id] = {**{k: v for k, v in sess.items()
+                                                     if k not in ("checkout_shipping_fee", "checkout_shipping_title", "checkout_delivery_temp", "checkout_thai_phone", "checkout_base_shipping", "checkout_frozen_fee")},
+                        "stripe_cart": cart, "stripe_intent_id": intent["id"], "cart": []}
                     retail_reply(reply_token, [
                         line_text(f"📱 สแกน QR PromptPay เพื่อชำระ {total:,.0f}฿\n"
                                   f"Scan to pay {total:,.0f}฿ via PromptPay"),
@@ -6068,7 +6311,8 @@ async def webhook_line_retail(request: Request):
             elif not STRIPE_SECRET_KEY:
                 retail_reply(reply_token, [line_text("❌ Stripe not configured.")])
             else:
-                total = sum(i["qty"] * i["price"] for i in cart)
+                shipping_fee = float(sess.get("checkout_shipping_fee", 0) or 0)
+                ship_title = sess.get("checkout_shipping_title", "")
                 line_items = []
                 for item in cart:
                     price = _line_get_client_price(item["pid"], float(item["price"]), pricelist)
@@ -6078,6 +6322,15 @@ async def webhook_line_retail(request: Request):
                             "product_data": {"name": item["name"][:80]}},
                         "quantity": item["qty"],
                     })
+                if shipping_fee > 0:
+                    line_items.append({
+                        "price_data": {"currency": "thb",
+                            "unit_amount": int(shipping_fee * 100),
+                            "product_data": {"name": f"Shipping ({ship_title})" if ship_title else "Shipping"}},
+                        "quantity": 1,
+                    })
+                subtotal = sum(i["qty"] * i["price"] for i in cart)
+                total = subtotal + shipping_fee
                 try:
                     session = _stripe.checkout.Session.create(
                         payment_method_types=["card"],
@@ -6085,10 +6338,16 @@ async def webhook_line_retail(request: Request):
                         mode="payment",
                         success_url=f"{RENDER_URL}/payment-success?user={user_id}",
                         cancel_url=f"{RENDER_URL}/payment-cancel?user={user_id}",
-                        metadata={"line_user_id": user_id, "partner_id": str(partner["id"])},
+                        metadata={"line_user_id": user_id, "partner_id": str(partner["id"]),
+                                  "shipping_fee": str(shipping_fee),
+                                  "delivery_temp": sess.get("checkout_delivery_temp", "chilled"),
+                                  "thai_contact_phone": sess.get("checkout_thai_phone", ""),
+                                  "base_shipping_fee": str(sess.get("checkout_base_shipping", 0) or 0),
+                                  "frozen_fee": str(sess.get("checkout_frozen_fee", 0) or 0)},
                     )
-                    _retail_sessions[user_id] = {**sess, "stripe_cart": cart,
-                        "stripe_session_id": session.id}
+                    _retail_sessions[user_id] = {**{k: v for k, v in sess.items()
+                                                     if k not in ("checkout_shipping_fee", "checkout_shipping_title", "checkout_delivery_temp", "checkout_thai_phone", "checkout_base_shipping", "checkout_frozen_fee")},
+                        "stripe_cart": cart, "stripe_session_id": session.id}
                     pay_bubble = {
                         "type": "bubble", "size": "mega",
                         "header": {
