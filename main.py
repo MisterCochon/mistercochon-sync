@@ -3320,7 +3320,12 @@ async def webhook_stripe(request: Request):
                     odoo_execute("sale.order", "action_confirm", [[order_id]])
                     order_name = odoo_execute("sale.order", "read",
                         [[order_id]], {"fields": ["name"]})[0]["name"]
-            except Exception:
+                    # Suffix "L" = order placed via the LINE bot (mirrors B2B)
+                    if not order_name.endswith("L"):
+                        order_name = f"{order_name}L"
+                        odoo_execute("sale.order", "write", [[order_id], {"name": order_name}])
+            except Exception as e:
+                print(f"[_confirm_retail] Erreur: {e}")
                 order_name = "—"
             sess = _retail_sessions.get(user_id, {})
             _retail_sessions[user_id] = {k: v for k, v in sess.items()
@@ -4363,14 +4368,21 @@ def _line_get_pro_categories(extra_tags: list | None = None) -> list:
     return result
 
 
-def _line_build_cat_flex(cats: list) -> dict:
+def _line_build_cat_flex(cats: list, partner_name: str = "", show_reorder: bool = True) -> dict:
     """Build a Flex bubble showing category buttons."""
-    cat_buttons = []
+    body_contents = []
+    if show_reorder:
+        body_contents.append({
+            "type": "button", "style": "primary", "height": "sm", "color": "#1A3A6B",
+            "action": {"type": "postback", "label": "🔄 Reorder last order", "data": "reorder"}
+        })
+        body_contents.append({"type": "separator", "margin": "sm"})
     for cid, label in cats[:10]:
-        cat_buttons.append({
+        body_contents.append({
             "type": "button", "style": "secondary", "height": "sm",
             "action": {"type": "postback", "label": label[:40], "data": f"__cat_{cid}"}
         })
+    header_text = _truncate(partner_name, 40) if partner_name else "French Delicatessen PRO"
     return {
         "type": "flex", "altText": "Select a category",
         "contents": {
@@ -4378,13 +4390,14 @@ def _line_build_cat_flex(cats: list) -> dict:
             "header": {
                 "type": "box", "layout": "vertical",
                 "backgroundColor": "#1A3A6B", "paddingAll": "14px",
-                "contents": [{"type": "text", "text": "French Delicatessen PRO",
-                              "weight": "bold", "color": "#FFFFFF", "size": "md"}]
+                "contents": [{"type": "text", "text": header_text,
+                              "weight": "bold", "color": "#FFFFFF", "size": "md",
+                              "wrap": True, "maxLines": 2}]
             },
             "body": {
                 "type": "box", "layout": "vertical",
                 "paddingAll": "10px", "spacing": "sm",
-                "contents": cat_buttons
+                "contents": body_contents
             }
         }
     }
@@ -4734,6 +4747,7 @@ def _line_create_order(partner: dict, items: list) -> str:
     fd_number = odoo_execute("ir.sequence", "next_by_code", [[SEQ_CODES["P"]]])
     if not fd_number:
         return "❌ Order creation failed (sequence error). Please contact us."
+    fd_number = f"{fd_number}L"  # suffix "L" = order placed via the LINE bot
 
     order_vals = {
         "partner_id": partner["id"],
@@ -5020,7 +5034,7 @@ async def webhook_line(request: Request):
                 cats = _line_get_pro_categories(_line_extra_tags_for_partner(partner))
                 welcome = line_text(f"✅ Welcome back, {name}!")
                 if cats:
-                    line_reply(reply_token, [welcome, _line_build_cat_flex(cats)])
+                    line_reply(reply_token, [welcome, _line_build_cat_flex(cats, partner_name=name)])
                 else:
                     line_reply(reply_token, [welcome, line_text("Type *menu* to browse our PRO catalog.")])
             else:
@@ -5326,7 +5340,7 @@ async def webhook_line(request: Request):
                 line_reply(reply_token, _line_build_carousel(prods, pricelist, 0))
                 continue
             # Flex bubble with category buttons — all visible on one screen
-            line_reply(reply_token, [_line_build_cat_flex(cats)])
+            line_reply(reply_token, [_line_build_cat_flex(cats, partner_name=partner.get("name", ""))])
 
         # ── My orders ─────────────────────────────────────────────────────
         elif text_low in ("orders", "my orders", "history"):
