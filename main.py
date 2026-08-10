@@ -5150,7 +5150,14 @@ async def webhook_line(request: Request):
         user_id = event.get("source", {}).get("userId", "")
         text_low = text.lower()
 
-        partner = _line_get_partner(user_id)
+        try:
+            partner = _line_get_partner(user_id)
+        except Exception as e:
+            print(f"[webhook_line] Erreur Odoo lors de l'identification (user {user_id}): {e}")
+            line_reply(reply_token, [line_text(
+                "⚠️ Temporary connection issue, please try again in a moment."
+            )])
+            continue
 
         # ── Logout ────────────────────────────────────────────────────────
         if text_low in ("logout", "log out", "déconnexion", "ออกจากระบบ"):
@@ -6109,7 +6116,15 @@ async def webhook_line_retail(request: Request):
             continue
 
         text_low = text.lower().strip()
-        partner = _retail_get_partner(user_id)
+        try:
+            partner = _retail_get_partner(user_id)
+        except Exception as e:
+            print(f"[webhook_line_retail] Erreur Odoo lors de l'identification (user {user_id}): {e}")
+            retail_reply(reply_token, [line_text(
+                "⚠️ Temporary connection issue, please try again in a moment.\n"
+                "เกิดปัญหาการเชื่อมต่อชั่วคราว กรุณาลองใหม่อีกครั้ง"
+            )])
+            continue
 
         # ── Not authenticated ──────────────────────────────────────────────
         if not partner:
