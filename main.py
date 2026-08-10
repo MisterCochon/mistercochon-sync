@@ -4579,7 +4579,7 @@ def _line_get_subcategories_for_tag(tag_id: int) -> list:
     # "PRO" is Odoo's generic catch-all B2B category — real products live there
     # (confirmed: e.g. Boudin Noir), so it must stay visible, just relabeled
     # to something presentable instead of the raw internal name.
-    RELABEL = {"pro": "Autres produits"}
+    RELABEL = {"pro": "Other products"}
     prods = odoo_execute("product.product", "search_read",
         [[["active", "=", True], ["sale_ok", "=", True],
           ["product_tag_ids", "in", [tag_id]]]],
