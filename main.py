@@ -4660,11 +4660,14 @@ def _parse_qty_input(text: str, is_per_kg: bool):
     is rejected as ambiguous (staff corrects the exact weight afterwards
     either way, but the intent must be clear from the start).
     On a normal (non-kg) product, a bare integer is unambiguous and works
-    as before.
+    as before — but "kg" is rejected there too, since the product isn't
+    sold by weight.
     """
     text = text.strip().lower()
     m_kg = re.match(r"^(\d+(?:\.\d+)?)\s*kg$", text)
     if m_kg:
+        if not is_per_kg:
+            return None  # "kg" doesn't apply to a product sold by the piece
         val = float(m_kg.group(1))
         return (val, True) if val > 0 else None
     m_unit = re.match(r"^(\d+)\s*(units?|unit[ée]s?|pcs?|pieces?)$", text)
@@ -5412,6 +5415,11 @@ async def webhook_line(request: Request):
             line_reply(reply_token, [line_text(
                 "⚖️ Please be specific: type your quantity with *kg* or "
                 "*units* at the end, e.g. \"1.5kg\" or \"3 units\"."
+            )])
+            continue
+        elif sess.get("pending_sku"):
+            line_reply(reply_token, [line_text(
+                "Please enter a valid quantity — a whole number, e.g. \"3\"."
             )])
             continue
 
