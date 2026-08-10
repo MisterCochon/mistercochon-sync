@@ -4641,7 +4641,11 @@ async def _poll_ecwid_images():
 
 
 def _line_get_client_price(product_id: int, list_price: float, pricelist) -> float:
-    """Get price for a product given partner's pricelist."""
+    """Get price for a product given partner's pricelist.
+    A fixed_price of exactly 0 is treated as "not actually configured"
+    (an incomplete pricelist row) rather than a genuine free price, and
+    falls back to the product's list_price — selling at 0฿ by accident
+    from an incomplete pricelist entry is a real business risk."""
     if not pricelist or pricelist is False:
         return list_price
     pricelist_id = pricelist[0] if isinstance(pricelist, list) else pricelist
@@ -4651,7 +4655,7 @@ def _line_get_client_price(product_id: int, list_price: float, pricelist) -> flo
           ["compute_price", "=", "fixed"]]],
         {"fields": ["fixed_price"], "limit": 1}
     )
-    if items:
+    if items and items[0]["fixed_price"]:
         return items[0]["fixed_price"]
     return list_price
 
@@ -5353,7 +5357,7 @@ async def webhook_line(request: Request):
             qty_prompt = ("⚖️ Price per kg. Please type your quantity with "
                           "*kg* or *units* at the end, e.g. \"1.5kg\" or "
                           "\"3 units\" (exact weight confirmed at packing):"
-                          if is_per_kg else "Combien d'unités ?")
+                          if is_per_kg else "How many units?")
             line_reply(reply_token, [line_text(
                 f"*{short}*\nUnit price: {price:.0f} ฿{' /kg' if is_per_kg else ''}\n\n{qty_prompt}"
             )])
