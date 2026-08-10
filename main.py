@@ -4543,7 +4543,11 @@ def _line_get_subcategories_for_tag(tag_id: int) -> list:
     """Return [(categ_id, categ_name)] for Odoo categories that have products with this tag."""
     EXCLUDE = {"all", "tous", "all products", "deliveries", "livraisons",
                "matieres premieres", "matières premières", "expense", "expenses",
-               "default", "internal", "pro"}
+               "default", "internal"}
+    # "PRO" is Odoo's generic catch-all B2B category — real products live there
+    # (confirmed: e.g. Boudin Noir), so it must stay visible, just relabeled
+    # to something presentable instead of the raw internal name.
+    RELABEL = {"pro": "Autres produits"}
     prods = odoo_execute("product.product", "search_read",
         [[["active", "=", True], ["sale_ok", "=", True],
           ["product_tag_ids", "in", [tag_id]]]],
@@ -4551,8 +4555,10 @@ def _line_get_subcategories_for_tag(tag_id: int) -> list:
     seen = {}
     for p in (prods or []):
         cid, cname = p["categ_id"]
-        if cname.lower() not in EXCLUDE:
-            seen[cid] = cname
+        key = cname.lower()
+        if key in EXCLUDE:
+            continue
+        seen[cid] = RELABEL.get(key, cname)
     return sorted(seen.items(), key=lambda x: x[1])
 
 
