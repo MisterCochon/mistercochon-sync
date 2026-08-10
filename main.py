@@ -5446,12 +5446,13 @@ async def webhook_line(request: Request):
                 product_id = prod["id"]
             cart = list(sess.get("cart", []))
             for item in cart:
-                if item["sku"] == sku:
+                if item["sku"] == sku and not item.get("is_weight", False):
                     item["qty"] += qty
                     break
             else:
                 cart.append({"sku": sku, "name": name,
-                              "price": price, "product_id": product_id, "qty": qty})
+                              "price": price, "product_id": product_id, "qty": qty,
+                              "is_weight": False})
             _line_sessions[user_id] = {**sess, "cart": cart}
             short = _shorten_product_name(name)
             total = sum(i["price"] * i["qty"] for i in cart)
@@ -5763,12 +5764,13 @@ async def webhook_line(request: Request):
                 prod = hits[0]
                 price = _line_get_client_price(prod["id"], prod.get("list_price", 0), pricelist)
                 for item in cart:
-                    if item["sku"] == sku:
+                    if item["sku"] == sku and not item.get("is_weight", False):
                         item["qty"] += qty
                         break
                 else:
                     cart.append({"sku": sku, "name": prod["name"],
-                                  "price": price, "product_id": prod["id"], "qty": qty})
+                                  "price": price, "product_id": prod["id"], "qty": qty,
+                                  "is_weight": False})
                 added.append(f"{_shorten_product_name(prod['name'])} ×{qty}")
             _line_sessions[user_id] = {**sess, "cart": cart}
             lines = []
