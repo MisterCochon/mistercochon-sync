@@ -4309,9 +4309,12 @@ def line_reply(reply_token: str, messages: list):
         "Content-Type": "application/json",
     }
     try:
-        requests.post(f"{LINE_API}/message/reply",
+        resp = requests.post(f"{LINE_API}/message/reply",
             json={"replyToken": reply_token, "messages": messages},
             headers=headers, timeout=10)
+        if resp.status_code != 200:
+            print(f"[line_reply] LINE API a refusé le message "
+                  f"(status {resp.status_code}): {resp.text[:500]}")
     except Exception as e:
         print(f"[line_reply] Erreur: {e}")
 
@@ -5833,19 +5836,31 @@ _retail_sessions: dict = {}
 
 
 def retail_reply(reply_token: str, messages: list):
-    requests.post("https://api.line.me/v2/bot/message/reply",
-        headers={"Authorization": f"Bearer {LINE_RETAIL_TOKEN}",
-                 "Content-Type": "application/json"},
-        json={"replyToken": reply_token, "messages": messages[:5]},
-        timeout=10)
+    try:
+        resp = requests.post("https://api.line.me/v2/bot/message/reply",
+            headers={"Authorization": f"Bearer {LINE_RETAIL_TOKEN}",
+                     "Content-Type": "application/json"},
+            json={"replyToken": reply_token, "messages": messages[:5]},
+            timeout=10)
+        if resp.status_code != 200:
+            print(f"[retail_reply] LINE API a refusé le message "
+                  f"(status {resp.status_code}): {resp.text[:500]}")
+    except Exception as e:
+        print(f"[retail_reply] Erreur: {e}")
 
 
 def retail_push(user_id: str, messages: list):
-    requests.post("https://api.line.me/v2/bot/message/push",
-        headers={"Authorization": f"Bearer {LINE_RETAIL_TOKEN}",
-                 "Content-Type": "application/json"},
-        json={"to": user_id, "messages": messages[:5]},
-        timeout=10)
+    try:
+        resp = requests.post("https://api.line.me/v2/bot/message/push",
+            headers={"Authorization": f"Bearer {LINE_RETAIL_TOKEN}",
+                     "Content-Type": "application/json"},
+            json={"to": user_id, "messages": messages[:5]},
+            timeout=10)
+        if resp.status_code != 200:
+            print(f"[retail_push] LINE API a refusé le message "
+                  f"(status {resp.status_code}): {resp.text[:500]}")
+    except Exception as e:
+        print(f"[retail_push] Erreur: {e}")
 
 
 def _retail_get_partner(user_id: str) -> dict | None:
