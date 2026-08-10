@@ -5470,7 +5470,7 @@ async def webhook_line(request: Request):
             continue
 
         # ── Cart display ───────────────────────────────────────────────────
-        if text_low in ("cart", "panier", "my cart"):
+        if text_low in ("cart", "panier", "my cart", "ตะกร้าสินค้า", "ตะกร้า"):
             cart = _line_sessions.get(user_id, {}).get("cart", [])
             if not cart:
                 line_reply(reply_token, [line_quick_reply(
@@ -5586,7 +5586,7 @@ async def webhook_line(request: Request):
             continue
 
         # ── Menu / catalogue ───────────────────────────────────────────────
-        if text_low in ("menu", "catalog", "catalogue", "products", "shop"):
+        if text_low in ("menu", "catalog", "catalogue", "products", "shop", "แคตตาล็อกสินค้า"):
             cats = _line_get_pro_categories(_line_extra_tags_for_partner(partner))
             if not cats:
                 line_reply(reply_token, [line_text("No PRO products available yet.")])
@@ -5615,7 +5615,7 @@ async def webhook_line(request: Request):
             line_reply(reply_token, [_line_build_cat_flex(cats, partner_name=partner.get("name", ""))])
 
         # ── My orders ─────────────────────────────────────────────────────
-        elif text_low in ("orders", "my orders", "history"):
+        elif text_low in ("orders", "my orders", "history", "ประวัติคำสั่งซื้อ"):
             orders = odoo_execute("sale.order", "search_read",
                 [[["partner_id", "=", partner["id"]]]],
                 {"fields": ["name", "date_order", "amount_total", "state"],
@@ -5636,7 +5636,7 @@ async def webhook_line(request: Request):
                 )])
 
         # ── Reorder: show previously ordered products as carousel ──────────
-        elif text_low in ("reorder", "recommander", "last order"):
+        elif text_low in ("reorder", "recommander", "last order", "สั่งซ้ำ"):
             # Collect unique products from last 5 confirmed orders
             past_orders = odoo_execute("sale.order", "search_read",
                 [[["partner_id", "child_of", partner["id"]], ["state", "in", ["sale", "done"]]]],
