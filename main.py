@@ -4049,6 +4049,38 @@ def admin_sync_gammes(secret: str = ""):
     }
 
 
+@app.get("/debug-subcats")
+def debug_subcats(secret: str = "", tag: str = "LINE-Gamme Tradition"):
+    """Debug: show exactly what Odoo returns for the sub-family grouping,
+    before and after the exclude/relabel filtering.
+    /debug-subcats?secret=fd2026&tag=LINE-Gamme Tradition"""
+    admin_secret = os.getenv("ADMIN_SECRET", "")
+    if not admin_secret or secret != admin_secret:
+        return {"status": "error", "error": "Invalid secret"}
+    tag_rows = odoo_execute("product.tag", "search_read",
+        [[["name", "=", tag]]], {"fields": ["id", "name"], "limit": 1})
+    if not tag_rows:
+        return {"status": "error", "error": f"Tag '{tag}' not found"}
+    tag_id = tag_rows[0]["id"]
+    prods = odoo_execute("product.product", "search_read",
+        [[["active", "=", True], ["sale_ok", "=", True],
+          ["product_tag_ids", "in", [tag_id]]]],
+        {"fields": ["id", "name", "default_code", "categ_id"], "limit": 500})
+    raw = [{"id": p["id"], "sku": p.get("default_code"), "name": p["name"],
+            "categ_id": p["categ_id"][0] if p.get("categ_id") else None,
+            "categ_name": p["categ_id"][1] if p.get("categ_id") else None}
+           for p in (prods or [])]
+    computed_subcats = _line_get_subcategories_for_tag(tag_id)
+    return {
+        "status": "ok",
+        "tag_id": tag_id,
+        "tag_name": tag,
+        "total_products_with_tag": len(raw),
+        "raw_products": raw,
+        "computed_subcategories": computed_subcats,
+    }
+
+
 @app.get("/debug-reorder")
 def debug_reorder(secret: str = "", code: str = ""):
     """Debug reorder: show what the bot finds for a client. /debug-reorder?secret=fd2026&code=62101"""
