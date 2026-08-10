@@ -5057,7 +5057,7 @@ def _line_cart_messages(cart: list, added_name: str = None, added_qty: int = Non
              "color": "#333333", "align": "end", "flex": 2},
         ]
         if allow_remove:
-            row_contents.append({"type": "box", "layout": "vertical", "flex": 1, "alignItems": "end",
+            row_contents.append({"type": "box", "layout": "vertical", "flex": 1, "alignItems": "flex-end",
                  "action": {"type": "postback", "label": "Remove item", "data": f"__rmline_{idx}"},
                  "contents": [{"type": "text", "text": "✕", "size": "sm",
                                "color": "#C8102E", "weight": "bold", "align": "end"}]})
