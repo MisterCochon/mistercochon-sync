@@ -3482,21 +3482,44 @@ async def webhook_stripe(request: Request):
         metadata.get("orderNumber") or
         data_obj.get("description") or ""
     )
+    print(f"[webhook_stripe] Ecwid branch — event={event_type} stripe_id={stripe_id} "
+          f"metadata={metadata} description={data_obj.get('description')!r} "
+          f"extracted_ecwid_ref={ecwid_ref!r}")
     if not ecwid_ref:
+        print(f"[webhook_stripe] Aucune référence de commande trouvée dans "
+              f"metadata/description — paiement ignoré, Odoo non mis à jour.")
         return {"status": "ignored", "reason": "no order ref", "stripe_id": stripe_id}
 
     # Use the Odoo-specific ref if stored (e.g. "ECWID-FDFHNY6")
     odoo_ref = metadata.get("ecwid_odoo_ref") or str(ecwid_ref)
     result = _mark_order_paid_odoo(odoo_ref, stripe_id)
+    # Fallback: if not found under the raw ref, retry with the "ECWID-" prefix
+    # Odoo actually stores (covers payments whose metadata didn't already
+    # include the properly-formatted ecwid_odoo_ref).
+    if not result.get("found") and not odoo_ref.upper().startswith("ECWID-"):
+        retry_ref = f"ECWID-{odoo_ref}"
+        print(f"[webhook_stripe] '{odoo_ref}' introuvable dans Odoo, "
+              f"nouvel essai avec '{retry_ref}'")
+        result = _mark_order_paid_odoo(retry_ref, stripe_id)
+        if result.get("found"):
+            odoo_ref = retry_ref
+    if not result.get("found"):
+        print(f"[webhook_stripe] ⚠️ Commande Odoo introuvable pour la référence "
+              f"'{odoo_ref}' (stripe_id={stripe_id}) — le statut payé n'a PAS été "
+              f"mis à jour dans Odoo.")
+    else:
+        print(f"[webhook_stripe] ✅ Commande Odoo '{odoo_ref}' marquée payée "
+              f"(stripe_id={stripe_id}): {result}")
     ecwid_result = {}
     try:
         ecwid_put(f"/orders/{ecwid_ref}", {"paymentStatus": "PAID"})
         ecwid_result = {"ecwid_updated": True}
     except Exception as e:
+        print(f"[webhook_stripe] Erreur mise à jour statut Ecwid: {e}")
         ecwid_result = {"ecwid_updated": False, "error": str(e)}
 
     return {"status": "ok", "source": "ecwid", "event": event_type,
-            "ecwid_ref": ecwid_ref, "result": result, "ecwid": ecwid_result}
+            "ecwid_ref": ecwid_ref, "odoo_ref": odoo_ref, "result": result, "ecwid": ecwid_result}
 
 
 # ─── Ecwid PromptPay payment page ────────────────────────────────────────────
@@ -6839,6 +6862,10 @@ async def pay_ecwid_promptpay_by_order_number(order_number: str):
     amount = int(total * 100)
     customer_name = (eco.get("billingPerson") or {}).get("name", "")
     payment_status = eco.get("paymentStatus", "")
+    # Build Odoo reference the same way /pay/promptpay does — Ecwid stores
+    # vendorOrderNumber as "ECWID-XXXXX" in Odoo's client_order_ref/name.
+    vendor_num = eco.get("vendorOrderNumber") or eco.get("referenceTransactionId") or ""
+    odoo_ref = f"ECWID-{vendor_num}" if vendor_num else str(eco.get("id", order_number))
 
     if payment_status == "PAID":
         return HTMLResponse(f"""<!DOCTYPE html><html><head><meta charset=UTF-8>
@@ -6857,7 +6884,7 @@ async def pay_ecwid_promptpay_by_order_number(order_number: str):
             amount=amount,
             currency="thb",
             payment_method_types=["promptpay"],
-            metadata={"ecwid_order_id": order_number},
+            metadata={"ecwid_order_id": order_number, "ecwid_odoo_ref": odoo_ref},
             description=f"Commande Ecwid #{order_number}",
         )
         confirmed = _stripe.PaymentIntent.confirm(
