@@ -123,19 +123,22 @@ async def _poll_ecwid_orders():
                     if email:
                         email_map[email] = partner_id
                 else:
-                    # Mettre à jour l'adresse/téléphone si manquants
-                    existing_partner = odoo_execute("res.partner", "read",
-                        [[partner_id]], {"fields": ["phone","street","city","zip","x_sub_district"]})[0]
+                    # Toujours aligner l'adresse/téléphone sur la commande Ecwid la
+                    # plus récente : un client existant peut avoir déménagé ou avoir
+                    # simplement indiqué une autre adresse de livraison depuis sa
+                    # dernière commande. Ne JAMAIS se contenter de combler les champs
+                    # vides : ça fige la première adresse connue pour toujours (c'est
+                    # ce qui a fait rater la livraison de Pascal Menou en août 2026).
                     update_vals = {}
-                    if customer_phone and not existing_partner.get("phone"):
+                    if customer_phone:
                         update_vals["phone"] = customer_phone
-                    if customer_street and not existing_partner.get("street"):
+                    if customer_street:
                         update_vals["street"] = customer_street
-                    if customer_city and not existing_partner.get("city"):
+                    if customer_city:
                         update_vals["city"] = customer_city
-                    if customer_zip and not existing_partner.get("zip"):
+                    if customer_zip:
                         update_vals["zip"] = customer_zip
-                    if customer_subdistrict and not existing_partner.get("x_sub_district"):
+                    if customer_subdistrict:
                         update_vals["x_sub_district"] = customer_subdistrict
                     if update_vals:
                         odoo_execute("res.partner", "write", [[partner_id], update_vals])
@@ -3136,6 +3139,24 @@ def _import_one_ecwid_order(order_num: str, eco: dict) -> dict:
         if subdistrict:
             vals_p["x_sub_district"] = subdistrict
         partner_id = odoo_execute("res.partner", "create", [vals_p])
+    else:
+        # Client déjà connu : aligner son adresse/téléphone sur CETTE commande.
+        # Avant ce correctif, l'adresse d'un client existant n'était jamais mise
+        # à jour ici, donc une nouvelle adresse de livraison indiquée sur Ecwid
+        # ne remontait jamais dans Odoo (voir aussi _poll_ecwid_orders).
+        update_vals = {}
+        if phone:
+            update_vals["phone"] = phone
+        if street:
+            update_vals["street"] = street
+        if city:
+            update_vals["city"] = city
+        if zipcode:
+            update_vals["zip"] = zipcode
+        if subdistrict:
+            update_vals["x_sub_district"] = subdistrict
+        if update_vals:
+            odoo_execute("res.partner", "write", [[partner_id], update_vals])
 
     # Numéro FD
     fd_number = odoo_execute("ir.sequence", "next_by_code", [[seq_code]])
