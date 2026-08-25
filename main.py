@@ -2417,7 +2417,21 @@ async def import_clients_xlsx(file: UploadFile = File(...)):
                     partner_id = results[0]["id"]
 
             if partner_id:
-                odoo_execute("res.partner", "write", [[partner_id], vals])
+                # Ne jamais écraser l'adresse/téléphone d'un client existant avec
+                # les données de ce fichier Excel : "Table Client.xlsx" n'est pas
+                # synchronisé en temps réel et peut contenir une adresse ancienne
+                # (c'est ce qui a fait repartir Pascal Menou sur son ancienne
+                # adresse en juillet puis août 2026). Si le client a déjà une
+                # adresse dans Odoo (généralement alimentée par ses commandes
+                # Ecwid, qui sont la source la plus à jour), on ne complète que
+                # les champs actuellement vides.
+                existing = odoo_execute("res.partner", "read",
+                    [[partner_id]], {"fields": ["phone", "street", "street2", "zip", "city"]})[0]
+                safe_vals = dict(vals)
+                for f in ("phone", "street", "street2", "zip", "city"):
+                    if existing.get(f):
+                        safe_vals.pop(f, None)
+                odoo_execute("res.partner", "write", [[partner_id], safe_vals])
                 updated.append({"id": partner_id, "name": nom})
             else:
                 new_id = odoo_execute("res.partner", "create", [vals])
