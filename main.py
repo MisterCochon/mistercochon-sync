@@ -62,9 +62,9 @@ async def _poll_ecwid_orders():
             default_partner = odoo_execute("res.partner", "search", [[["name", "=", "Mister Cochon"]]])
             default_partner_id = default_partner[0] if default_partner else 1
 
-            # 200 dernières commandes Ecwid
+            # 200 dernières commandes Ecwid (uniquement les commandes payées)
             r = requests.get(f"{ecwid_base}/orders", headers=headers,
-                params={"limit": 200, "sortBy": "CREATED_DATE_DESC"})
+                params={"limit": 200, "sortBy": "CREATED_DATE_DESC", "paymentStatus": "PAID"})
             orders = r.json().get("items", []) if r.ok else []
 
             for eco in orders:
@@ -123,22 +123,19 @@ async def _poll_ecwid_orders():
                     if email:
                         email_map[email] = partner_id
                 else:
-                    # Toujours aligner l'adresse/téléphone sur la commande Ecwid la
-                    # plus récente : un client existant peut avoir déménagé ou avoir
-                    # simplement indiqué une autre adresse de livraison depuis sa
-                    # dernière commande. Ne JAMAIS se contenter de combler les champs
-                    # vides : ça fige la première adresse connue pour toujours (c'est
-                    # ce qui a fait rater la livraison de Pascal Menou en août 2026).
+                    # Mettre à jour l'adresse/téléphone si manquants
+                    existing_partner = odoo_execute("res.partner", "read",
+                        [[partner_id]], {"fields": ["phone","street","city","zip","x_sub_district"]})[0]
                     update_vals = {}
-                    if customer_phone:
+                    if customer_phone and not existing_partner.get("phone"):
                         update_vals["phone"] = customer_phone
-                    if customer_street:
+                    if customer_street and not existing_partner.get("street"):
                         update_vals["street"] = customer_street
-                    if customer_city:
+                    if customer_city and not existing_partner.get("city"):
                         update_vals["city"] = customer_city
-                    if customer_zip:
+                    if customer_zip and not existing_partner.get("zip"):
                         update_vals["zip"] = customer_zip
-                    if customer_subdistrict:
+                    if customer_subdistrict and not existing_partner.get("x_sub_district"):
                         update_vals["x_sub_district"] = customer_subdistrict
                     if update_vals:
                         odoo_execute("res.partner", "write", [[partner_id], update_vals])
@@ -301,8 +298,8 @@ async def _poll_stock_sync():
                     requests.put(target["url"], headers=headers, json=payload)
                     if "quantity" in payload: updated_qty += 1
                     if "price" in payload: updated_price += 1
-                except Exception as e:
-                    print(f"[_poll_stock_sync] Erreur: {e}")
+                except Exception:
+                    pass
             print(f"[STOCK] {updated_qty} stocks, {updated_price} prix mis a jour sur Ecwid")
         except Exception as e:
             print(f"[STOCK] Erreur: {e}")
@@ -312,11 +309,9 @@ async def _poll_stock_sync():
 async def lifespan(app: FastAPI):
     task = asyncio.create_task(_poll_ecwid_orders())
     task2 = asyncio.create_task(_poll_stock_sync())
-    task3 = asyncio.create_task(_poll_ecwid_images())
     yield
     task.cancel()
     task2.cancel()
-    task3.cancel()
 
 app = FastAPI(lifespan=lifespan)
 
@@ -341,8 +336,8 @@ for _fp in [
         try:
             pdfmetrics.registerFont(TTFont("ThaiMC", _fp))
             _THAI_FONT = "ThaiMC"
-        except Exception as e:
-            print(f"[lifespan] Erreur: {e}")
+        except Exception:
+            pass
         break
 
 _LOGO_PATH = os.path.join(os.path.dirname(__file__), "logo.png")
@@ -1670,8 +1665,8 @@ def order_pdf(order_ref: str):
                         ship.get("countryName") or "",
                     ]
                     address = "\n".join(p for p in addr_parts if p)
-            except Exception as e:
-                print(f"[order_pdf] Erreur: {e}")
+            except Exception:
+                pass
 
         # Générer le PDF
         buf = io.BytesIO()
@@ -2417,21 +2412,7 @@ async def import_clients_xlsx(file: UploadFile = File(...)):
                     partner_id = results[0]["id"]
 
             if partner_id:
-                # Ne jamais écraser l'adresse/téléphone d'un client existant avec
-                # les données de ce fichier Excel : "Table Client.xlsx" n'est pas
-                # synchronisé en temps réel et peut contenir une adresse ancienne
-                # (c'est ce qui a fait repartir Pascal Menou sur son ancienne
-                # adresse en juillet puis août 2026). Si le client a déjà une
-                # adresse dans Odoo (généralement alimentée par ses commandes
-                # Ecwid, qui sont la source la plus à jour), on ne complète que
-                # les champs actuellement vides.
-                existing = odoo_execute("res.partner", "read",
-                    [[partner_id]], {"fields": ["phone", "street", "street2", "zip", "city"]})[0]
-                safe_vals = dict(vals)
-                for f in ("phone", "street", "street2", "zip", "city"):
-                    if existing.get(f):
-                        safe_vals.pop(f, None)
-                odoo_execute("res.partner", "write", [[partner_id], safe_vals])
+                odoo_execute("res.partner", "write", [[partner_id], vals])
                 updated.append({"id": partner_id, "name": nom})
             else:
                 new_id = odoo_execute("res.partner", "create", [vals])
@@ -2452,140 +2433,7 @@ async def import_clients_xlsx(file: UploadFile = File(...)):
         return {"status": "error", "error": str(e)}
 
 
-# ─── Export / import des tags produit LINE-* (nettoyage des doublons) ─────────
-
-@app.get("/admin/export-line-tags")
-def export_line_tags(secret: str = ""):
-    """Export an .xlsx with one row per product tagged LINE-* and one column
-    per LINE-* tag (X = product currently has that tag). Includes a helper
-    column flagging products in both Gamme Tradition AND Gamme Premium at
-    once, which is normally a mistake. Edit the X's in Excel and re-upload
-    via /admin/import-line-tags to apply the corrections in Odoo."""
-    admin_secret = os.getenv("ADMIN_SECRET", "")
-    if not admin_secret or secret != admin_secret:
-        return {"status": "error", "error": "Invalid secret"}
-    try:
-        import pandas as pd
-
-        tags = odoo_execute("product.tag", "search_read",
-            [[["name", "=ilike", "LINE-%"]]],
-            {"fields": ["id", "name"], "limit": 100}
-        )
-        if not tags:
-            return {"status": "error", "error": "No LINE-* tags found in Odoo."}
-        tags = sorted(tags, key=lambda t: t["name"])
-        tag_ids = [t["id"] for t in tags]
-        tag_id_to_col = {t["id"]: t["name"] for t in tags}
-
-        products = odoo_execute("product.product", "search_read",
-            [[["active", "=", True], ["product_tag_ids", "in", tag_ids]]],
-            {"fields": ["id", "default_code", "name", "product_tag_ids"], "limit": 5000,
-             "context": {"lang": "en_US"}}
-        )
-
-        rows = []
-        for p in products:
-            row = {
-                "product_id": p["id"],
-                "default_code": p.get("default_code") or "",
-                "name": p.get("name") or "",
-            }
-            ptags = set(p.get("product_tag_ids") or [])
-            for t in tags:
-                row[t["name"]] = "X" if t["id"] in ptags else ""
-            trad = "LINE-Gamme Tradition" in row and row.get("LINE-Gamme Tradition") == "X"
-            prem = "LINE-Gamme Premium" in row and row.get("LINE-Gamme Premium") == "X"
-            row["⚠️ Both Gammes"] = "OUI" if (trad and prem) else ""
-            rows.append(row)
-
-        df = pd.DataFrame(rows)
-        cols = ["product_id", "default_code", "name"] + [t["name"] for t in tags] + ["⚠️ Both Gammes"]
-        df = df[cols]
-
-        buf = io.BytesIO()
-        with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-            df.to_excel(writer, index=False, sheet_name="LINE tags")
-        buf.seek(0)
-        return StreamingResponse(buf,
-            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            headers={"Content-Disposition": "attachment; filename=line_product_tags.xlsx"})
-    except Exception as e:
-        return {"status": "error", "error": str(e)}
-
-
-@app.post("/admin/import-line-tags")
-async def import_line_tags(file: UploadFile = File(...), secret: str = ""):
-    """Re-upload the (edited) export from /admin/export-line-tags. For each
-    row, applies only the additions/removals needed on the LINE-* tag
-    columns present in the file — any tag NOT one of these columns is left
-    untouched on the product (e.g. non-LINE tags, if any)."""
-    admin_secret = os.getenv("ADMIN_SECRET", "")
-    if not admin_secret or secret != admin_secret:
-        return {"status": "error", "error": "Invalid secret"}
-    try:
-        import pandas as pd
-
-        content = await file.read()
-        df = pd.read_excel(io.BytesIO(content), dtype=str)
-        df = df.where(pd.notna(df), "")
-        df.columns = [str(c).strip() for c in df.columns]
-
-        if "product_id" not in df.columns:
-            return {"status": "error", "error": "Missing 'product_id' column — use the file from /admin/export-line-tags."}
-
-        tags = odoo_execute("product.tag", "search_read",
-            [[["name", "=ilike", "LINE-%"]]],
-            {"fields": ["id", "name"], "limit": 100}
-        )
-        name_to_tagid = {t["name"]: t["id"] for t in (tags or [])}
-        tag_cols = [c for c in df.columns if c in name_to_tagid]
-        if not tag_cols:
-            return {"status": "error", "error": "No LINE-* tag columns found in the file."}
-
-        pids = [int(v) for v in df["product_id"] if str(v).strip()]
-        current = odoo_execute("product.product", "read", [pids, ["product_tag_ids"]], {})
-        current_by_pid = {c["id"]: set(c.get("product_tag_ids") or []) for c in current}
-
-        updated, unchanged, errors = [], [], []
-        for _, row in df.iterrows():
-            pid_raw = str(row.get("product_id", "")).strip()
-            if not pid_raw:
-                continue
-            pid = int(float(pid_raw))
-            desired = set()
-            for col in tag_cols:
-                if str(row.get(col, "")).strip():
-                    desired.add(name_to_tagid[col])
-
-            cur = current_by_pid.get(pid, set())
-            # Only touch the tags covered by this export — leave any other
-            # (non-LINE) tags on the product exactly as they are.
-            covered = {name_to_tagid[c] for c in tag_cols}
-            to_add = desired - cur
-            to_remove = (cur & covered) - desired
-            if not to_add and not to_remove:
-                unchanged.append(pid)
-                continue
-            try:
-                ops = [(4, tid, 0) for tid in to_add] + [(3, tid, 0) for tid in to_remove]
-                odoo_execute("product.product", "write", [[pid], {"product_tag_ids": ops}])
-                updated.append({"id": pid, "name": row.get("name", ""),
-                                 "added": [c for c in tag_cols if name_to_tagid[c] in to_add],
-                                 "removed": [c for c in tag_cols if name_to_tagid[c] in to_remove]})
-            except Exception as e:
-                errors.append({"id": pid, "error": str(e)})
-
-        return {
-            "status": "ok",
-            "updated": len(updated), "unchanged": len(unchanged), "errors": len(errors),
-            "updated_list": updated[:50],
-            "errors_list": errors[:20],
-        }
-    except Exception as e:
-        return {"status": "error", "error": str(e)}
-
-
-
+# ─── Import commandes depuis WinDev (2 fichiers CSV/Excel) ────────────────────
 
 @app.post("/import-commandes-xlsx")
 async def import_commandes_xlsx(
@@ -2741,8 +2589,8 @@ async def import_commandes_xlsx(
                     m2 = re.match(r"(\d{4})[/\-](\d{2})[/\-](\d{2})", date_str)
                     if m2:
                         order_vals["date_order"] = f"{m2.group(1)}-{m2.group(2)}-{m2.group(3)} 00:00:00"
-            except Exception as e:
-                print(f"[find_partner] Erreur: {e}")
+            except Exception:
+                pass
 
         try:
             order_id = odoo_execute("sale.order", "create", [order_vals])
@@ -2799,8 +2647,8 @@ async def import_commandes_xlsx(
 
         try:
             odoo_execute("sale.order", "action_confirm", [[order_id]])
-        except Exception as e:
-            print(f"[find_partner] Erreur: {e}")
+        except Exception:
+            pass
 
         created.append({
             "windev": windev_num,
@@ -2994,8 +2842,8 @@ def sync_ecwid_orders(
                 from datetime import datetime
                 dt = datetime.utcfromtimestamp(order_date / 1000 if order_date > 1e10 else order_date)
                 order_vals["date_order"] = dt.strftime("%Y-%m-%d %H:%M:%S")
-            except Exception as e:
-                print(f"[find_product] Erreur: {e}")
+            except Exception:
+                pass
 
         try:
             order_id = odoo_execute("sale.order", "create", [order_vals])
@@ -3057,8 +2905,8 @@ def sync_ecwid_orders(
         # Confirmer la commande
         try:
             odoo_execute("sale.order", "action_confirm", [[order_id]])
-        except Exception as e:
-            print(f"[find_product] Erreur: {e}")
+        except Exception:
+            pass
 
         created.append({
             "ecwid": order_num,
@@ -3099,8 +2947,8 @@ def _parse_ecwid_date(order_date) -> str:
                     return dt.strftime("%Y-%m-%d %H:%M:%S")
                 except Exception:
                     continue
-    except Exception as e:
-        print(f"[_parse_ecwid_date] Erreur: {e}")
+    except Exception:
+        pass
     return ""
 
 
@@ -3153,24 +3001,6 @@ def _import_one_ecwid_order(order_num: str, eco: dict) -> dict:
         if subdistrict:
             vals_p["x_sub_district"] = subdistrict
         partner_id = odoo_execute("res.partner", "create", [vals_p])
-    else:
-        # Client déjà connu : aligner son adresse/téléphone sur CETTE commande.
-        # Avant ce correctif, l'adresse d'un client existant n'était jamais mise
-        # à jour ici, donc une nouvelle adresse de livraison indiquée sur Ecwid
-        # ne remontait jamais dans Odoo (voir aussi _poll_ecwid_orders).
-        update_vals = {}
-        if phone:
-            update_vals["phone"] = phone
-        if street:
-            update_vals["street"] = street
-        if city:
-            update_vals["city"] = city
-        if zipcode:
-            update_vals["zip"] = zipcode
-        if subdistrict:
-            update_vals["x_sub_district"] = subdistrict
-        if update_vals:
-            odoo_execute("res.partner", "write", [[partner_id], update_vals])
 
     # Numéro FD
     fd_number = odoo_execute("ir.sequence", "next_by_code", [[seq_code]])
@@ -3233,8 +3063,8 @@ def _import_one_ecwid_order(order_num: str, eco: dict) -> dict:
         try:
             odoo_execute("sale.order.line", "create", [line_vals])
             lines_created += 1
-        except Exception as e:
-            print(f"[_import_one_ecwid_order] Erreur: {e}")
+        except Exception:
+            pass
 
     for surcharge in (eco.get("customSurcharges") or []):
         amount = surcharge.get("total") or surcharge.get("value") or 0
@@ -3246,13 +3076,13 @@ def _import_one_ecwid_order(order_num: str, eco: dict) -> dict:
                     "product_uom_qty": 1, "price_unit": amount,
                 }])
                 lines_created += 1
-            except Exception as e:
-                print(f"[_import_one_ecwid_order] Erreur: {e}")
+            except Exception:
+                pass
 
     try:
         odoo_execute("sale.order", "action_confirm", [[order_id]])
-    except Exception as e:
-        print(f"[_import_one_ecwid_order] Erreur: {e}")
+    except Exception:
+        pass
 
     return {"status": "created", "fd": fd_number, "lines": lines_created}
 
@@ -3452,29 +3282,9 @@ async def webhook_stripe(request: Request):
                 return
             lines_vals = [(0, 0, {"product_id": i["pid"],
                 "product_uom_qty": i["qty"], "price_unit": i["price"]}) for i in cart]
-
-            base_shipping = float(meta.get("base_shipping_fee", 0) or 0)
-            frozen_fee    = float(meta.get("frozen_fee", 0) or 0)
-            delivery_temp = meta.get("delivery_temp", "chilled")
-            thai_phone    = meta.get("thai_contact_phone", "")
-
-            if base_shipping > 0:
-                lines_vals.append((0, 0, {"product_id": 1915, "name": "Transport",
-                    "product_uom_qty": 1, "price_unit": round(base_shipping, 2), "tax_ids": [(5, 0, 0)]}))
-            if frozen_fee > 0:
-                lines_vals.append((0, 0, {"product_id": 1917, "name": "Delivery Frozen supplement",
-                    "product_uom_qty": 1, "price_unit": round(frozen_fee, 2)}))
-
             try:
-                # BUGFIX: this used to reference an undefined `obj`, which raised
-                # a NameError on every retail payment and silently prevented any
-                # Odoo order from ever being created (caught by the except below).
-                intent_id = meta.get("stripe_intent_id", "") or data_obj.get("id", "")
-                note_lines = [f"LINE Retail Stripe — {intent_id or user_id}",
-                              f"Delivery: {'Frozen' if delivery_temp == 'frozen' else 'Chilled'}"]
-                if thai_phone:
-                    note_lines.append(f"Thai-speaking contact: {thai_phone}")
-                note = "\n".join(note_lines)
+                intent_id = meta.get("stripe_intent_id", "") or obj.get("id", "")
+                note = f"LINE Retail Stripe — {intent_id or user_id}"
                 # Anti-doublon: ne pas créer si cet intent existe déjà
                 existing = odoo_execute("sale.order", "search_read",
                     [[["note", "=", note]]],
@@ -3488,12 +3298,7 @@ async def webhook_stripe(request: Request):
                     odoo_execute("sale.order", "action_confirm", [[order_id]])
                     order_name = odoo_execute("sale.order", "read",
                         [[order_id]], {"fields": ["name"]})[0]["name"]
-                    # Suffix "L" = order placed via the LINE bot (mirrors B2B)
-                    if not order_name.endswith("L"):
-                        order_name = f"{order_name}L"
-                        odoo_execute("sale.order", "write", [[order_id], {"name": order_name}])
-            except Exception as e:
-                print(f"[_confirm_retail] Erreur: {e}")
+            except Exception:
                 order_name = "—"
             sess = _retail_sessions.get(user_id, {})
             _retail_sessions[user_id] = {k: v for k, v in sess.items()
@@ -3517,44 +3322,21 @@ async def webhook_stripe(request: Request):
         metadata.get("orderNumber") or
         data_obj.get("description") or ""
     )
-    print(f"[webhook_stripe] Ecwid branch — event={event_type} stripe_id={stripe_id} "
-          f"metadata={metadata} description={data_obj.get('description')!r} "
-          f"extracted_ecwid_ref={ecwid_ref!r}")
     if not ecwid_ref:
-        print(f"[webhook_stripe] Aucune référence de commande trouvée dans "
-              f"metadata/description — paiement ignoré, Odoo non mis à jour.")
         return {"status": "ignored", "reason": "no order ref", "stripe_id": stripe_id}
 
     # Use the Odoo-specific ref if stored (e.g. "ECWID-FDFHNY6")
     odoo_ref = metadata.get("ecwid_odoo_ref") or str(ecwid_ref)
     result = _mark_order_paid_odoo(odoo_ref, stripe_id)
-    # Fallback: if not found under the raw ref, retry with the "ECWID-" prefix
-    # Odoo actually stores (covers payments whose metadata didn't already
-    # include the properly-formatted ecwid_odoo_ref).
-    if not result.get("found") and not odoo_ref.upper().startswith("ECWID-"):
-        retry_ref = f"ECWID-{odoo_ref}"
-        print(f"[webhook_stripe] '{odoo_ref}' introuvable dans Odoo, "
-              f"nouvel essai avec '{retry_ref}'")
-        result = _mark_order_paid_odoo(retry_ref, stripe_id)
-        if result.get("found"):
-            odoo_ref = retry_ref
-    if not result.get("found"):
-        print(f"[webhook_stripe] ⚠️ Commande Odoo introuvable pour la référence "
-              f"'{odoo_ref}' (stripe_id={stripe_id}) — le statut payé n'a PAS été "
-              f"mis à jour dans Odoo.")
-    else:
-        print(f"[webhook_stripe] ✅ Commande Odoo '{odoo_ref}' marquée payée "
-              f"(stripe_id={stripe_id}): {result}")
     ecwid_result = {}
     try:
         ecwid_put(f"/orders/{ecwid_ref}", {"paymentStatus": "PAID"})
         ecwid_result = {"ecwid_updated": True}
     except Exception as e:
-        print(f"[webhook_stripe] Erreur mise à jour statut Ecwid: {e}")
         ecwid_result = {"ecwid_updated": False, "error": str(e)}
 
     return {"status": "ok", "source": "ecwid", "event": event_type,
-            "ecwid_ref": ecwid_ref, "odoo_ref": odoo_ref, "result": result, "ecwid": ecwid_result}
+            "ecwid_ref": ecwid_ref, "result": result, "ecwid": ecwid_result}
 
 
 # ─── Ecwid PromptPay payment page ────────────────────────────────────────────
@@ -3967,8 +3749,8 @@ def cancel_old_orders(secret: str = ""):
                         "message_type": "comment",
                         "subtype_xmlid": "mail.mt_note",
                     })
-                except Exception as e:
-                    print(f"[cancel_old_orders] Erreur: {e}")
+                except Exception:
+                    pass
         except Exception as e:
             errors.append({"order": ecwid_num, "step": "odoo", "error": str(e)})
 
@@ -4107,38 +3889,6 @@ def admin_sync_gammes(secret: str = ""):
     }
 
 
-@app.get("/debug-subcats")
-def debug_subcats(secret: str = "", tag: str = "LINE-Gamme Tradition"):
-    """Debug: show exactly what Odoo returns for the sub-family grouping,
-    before and after the exclude/relabel filtering.
-    /debug-subcats?secret=fd2026&tag=LINE-Gamme Tradition"""
-    admin_secret = os.getenv("ADMIN_SECRET", "")
-    if not admin_secret or secret != admin_secret:
-        return {"status": "error", "error": "Invalid secret"}
-    tag_rows = odoo_execute("product.tag", "search_read",
-        [[["name", "=", tag]]], {"fields": ["id", "name"], "limit": 1})
-    if not tag_rows:
-        return {"status": "error", "error": f"Tag '{tag}' not found"}
-    tag_id = tag_rows[0]["id"]
-    prods = odoo_execute("product.product", "search_read",
-        [[["active", "=", True], ["sale_ok", "=", True],
-          ["product_tag_ids", "in", [tag_id]]]],
-        {"fields": ["id", "name", "default_code", "categ_id"], "limit": 500})
-    raw = [{"id": p["id"], "sku": p.get("default_code"), "name": p["name"],
-            "categ_id": p["categ_id"][0] if p.get("categ_id") else None,
-            "categ_name": p["categ_id"][1] if p.get("categ_id") else None}
-           for p in (prods or [])]
-    computed_subcats = _line_get_subcategories_for_tag(tag_id)
-    return {
-        "status": "ok",
-        "tag_id": tag_id,
-        "tag_name": tag,
-        "total_products_with_tag": len(raw),
-        "raw_products": raw,
-        "computed_subcategories": computed_subcats,
-    }
-
-
 @app.get("/debug-reorder")
 def debug_reorder(secret: str = "", code: str = ""):
     """Debug reorder: show what the bot finds for a client. /debug-reorder?secret=fd2026&code=62101"""
@@ -4199,7 +3949,7 @@ def debug_reorder(secret: str = "", code: str = ""):
 # ─── Utilitaires import Ecwid ────────────────────────────────────────────────
 
 @app.get("/debug-ecwid-order/{order_num}")
-def debug_ecwid_order_by_number(order_num: str):
+def debug_ecwid_order(order_num: str):
     """Affiche la structure brute d'une commande Ecwid (pour debug)."""
     data = ecwid_get("/orders", {"orderNumber": order_num, "limit": 1})
     if not data or not data.get("items"):
@@ -4371,8 +4121,8 @@ def delete_ecwid_imports(confirm: str = ""):
                 odoo_execute("sale.order", "action_cancel", [[oid]])
             try:
                 odoo_execute("sale.order", "action_draft", [[oid]])
-            except Exception as e:
-                print(f"[delete_ecwid_imports] Erreur: {e}")
+            except Exception:
+                pass
             odoo_execute("sale.order", "unlink", [[oid]])
             deleted.append(name)
         except Exception as e:
@@ -4399,14 +4149,11 @@ def line_reply(reply_token: str, messages: list):
         "Content-Type": "application/json",
     }
     try:
-        resp = requests.post(f"{LINE_API}/message/reply",
+        requests.post(f"{LINE_API}/message/reply",
             json={"replyToken": reply_token, "messages": messages},
             headers=headers, timeout=10)
-        if resp.status_code != 200:
-            print(f"[line_reply] LINE API a refusé le message "
-                  f"(status {resp.status_code}): {resp.text[:500]}")
-    except Exception as e:
-        print(f"[line_reply] Erreur: {e}")
+    except Exception:
+        pass
 
 
 def line_text(text: str) -> dict:
@@ -4482,18 +4229,31 @@ def _dbd_verify(reg_number: str, company_name: str) -> tuple:
 
 
 def _line_quick_login(code: str, user_id: str) -> tuple:
-    """Quick login: last 5 digits of VAT/DBD number (accepts full number too). Returns (ok, partner_name)."""
-    digits = re.sub(r"\D", "", code.strip())
+    code_clean = code.strip().upper()
+    import re as _re
+    if _re.match(r"^\d{2}[A-Z]\d{2}$", code_clean):
+        partners = odoo_execute("res.partner", "search_read",
+            [[["x_studio_code_line", "=", code_clean], ["customer_rank", ">", 0]]],
+            {"fields": ["id", "name", "comment"], "limit": 1})
+        if partners:
+            p = partners[0]
+            comment = p.get("comment") or ""
+            marker = f"line:{user_id}"
+            if marker not in comment:
+                odoo_execute("res.partner", "write",
+                    [[p["id"]], {"comment": (comment + "\n" + marker).strip()}])
+            return True, p["name"]
+        return False, ""
+    digits = _re.sub(r"\D", "", code_clean)
     if len(digits) < 5:
         return False, ""
-    code = digits[-5:]  # always use last 5
+    code5 = digits[-5:]
     partners = odoo_execute("res.partner", "search_read",
         [[["vat", "!=", False], ["customer_rank", ">", 0]]],
-        {"fields": ["id", "name", "vat", "comment"], "limit": 2000}
-    )
+        {"fields": ["id", "name", "vat", "comment"], "limit": 2000})
     for p in (partners or []):
-        vat = re.sub(r"\D", "", p.get("vat") or "")
-        if vat.endswith(code):
+        vat = _re.sub(r"\D", "", p.get("vat") or "")
+        if vat.endswith(code5):
             comment = p.get("comment") or ""
             marker = f"line:{user_id}"
             if marker not in comment:
@@ -4554,12 +4314,15 @@ def _line_get_pro_categories(extra_tags: list | None = None) -> list:
     tag_by_name = {t["name"]: t["id"] for t in (sub_tags or [])}
 
     # Si le client a des tags privés → il voit SEULEMENT ses produits, pas les gammes publiques
-    result = []
     if extra_tags:
+        result = []
         for tid in extra_tags:
             t = next((t for t in (sub_tags or []) if t["id"] == tid), None)
             if t:
                 result.append((tid, t["name"][5:].strip()))
+        return result
+
+    result = []
     for name in PUBLIC_ORDER:
         tid = tag_by_name.get(name)
         if not tid:
@@ -4594,21 +4357,14 @@ def _line_get_pro_categories(extra_tags: list | None = None) -> list:
     return result
 
 
-def _line_build_cat_flex(cats: list, partner_name: str = "", show_reorder: bool = True) -> dict:
+def _line_build_cat_flex(cats: list) -> dict:
     """Build a Flex bubble showing category buttons."""
-    body_contents = []
-    if show_reorder:
-        body_contents.append({
-            "type": "button", "style": "primary", "height": "sm", "color": "#1A3A6B",
-            "action": {"type": "postback", "label": "🔄 Reorder last order", "data": "reorder"}
-        })
-        body_contents.append({"type": "separator", "margin": "sm"})
+    cat_buttons = []
     for cid, label in cats[:10]:
-        body_contents.append({
+        cat_buttons.append({
             "type": "button", "style": "secondary", "height": "sm",
             "action": {"type": "postback", "label": label[:40], "data": f"__cat_{cid}"}
         })
-    header_text = _truncate(partner_name, 40) if partner_name else "French Delicatessen PRO"
     return {
         "type": "flex", "altText": "Select a category",
         "contents": {
@@ -4616,40 +4372,37 @@ def _line_build_cat_flex(cats: list, partner_name: str = "", show_reorder: bool 
             "header": {
                 "type": "box", "layout": "vertical",
                 "backgroundColor": "#1A3A6B", "paddingAll": "14px",
-                "contents": [{"type": "text", "text": header_text,
-                              "weight": "bold", "color": "#FFFFFF", "size": "md",
-                              "wrap": True, "maxLines": 2}]
+                "contents": [{"type": "text", "text": "French Delicatessen PRO",
+                              "weight": "bold", "color": "#FFFFFF", "size": "md"}]
             },
             "body": {
                 "type": "box", "layout": "vertical",
                 "paddingAll": "10px", "spacing": "sm",
-                "contents": body_contents
+                "contents": cat_buttons
             }
         }
     }
 
 
 def _line_get_subcategories_for_tag(tag_id: int) -> list:
-    """Return [(categ_id, categ_name)] for Odoo categories that have products with this tag."""
-    EXCLUDE = {"all", "tous", "all products", "deliveries", "livraisons",
-               "matieres premieres", "matières premières", "expense", "expenses",
-               "default", "internal"}
-    # "PRO" is Odoo's generic catch-all B2B category — real products live there
-    # (confirmed: e.g. Boudin Noir), so it must stay visible, just relabeled
-    # to something presentable instead of the raw internal name.
-    RELABEL = {"pro": "Other products"}
-    prods = odoo_execute("product.product", "search_read",
-        [[["active", "=", True], ["sale_ok", "=", True],
-          ["product_tag_ids", "in", [tag_id]]]],
-        {"fields": ["categ_id"], "limit": 500})
-    seen = {}
-    for p in (prods or []):
-        cid, cname = p["categ_id"]
-        key = cname.lower()
-        if key in EXCLUDE:
-            continue
-        seen[cid] = RELABEL.get(key, cname)
-    return sorted(seen.items(), key=lambda x: x[1])
+    """Return [(subfam_tag_id, label)] — LINE-* sub-tags assigned to products that also have tag_id."""
+    PUBLIC_TAGS = {"LINE-Gamme Tradition", "LINE-Gamme Premium"}
+    # All LINE-* tags (potential sub-families)
+    all_tags = odoo_execute("product.tag", "search_read",
+        [[["name", "=ilike", "LINE-%"]]],
+        {"fields": ["id", "name"], "limit": 50})
+    subfam_tags = {t["id"]: t["name"][5:] for t in (all_tags or [])
+                   if t["name"] not in PUBLIC_TAGS and t["id"] != tag_id}
+
+    result = []
+    for sfid, label in subfam_tags.items():
+        count = odoo_execute("product.product", "search_count",
+            [[["active", "=", True], ["sale_ok", "=", True],
+              ["product_tag_ids", "in", [tag_id]],
+              ["product_tag_ids", "in", [sfid]]]])
+        if count:
+            result.append((sfid, label))
+    return sorted(result, key=lambda x: x[1])
 
 
 def _line_build_subcat_flex(tag_id: int, subcats: list, gamme_label: str) -> dict:
@@ -4684,22 +4437,15 @@ _ecwid_image_cache: dict = {}
 _ecwid_image_cache_ts: float = 0.0
 
 def _line_get_ecwid_images() -> dict:
-    """Return {sku_upper: image_url} for the WHOLE Ecwid catalog (paginated).
-    Cached for 1 hour on success. On failure, keeps serving the previous
-    (stale) cache instead of going empty, and retries again within ~60s
-    instead of being stuck without images for the full hour."""
+    """Return {sku_upper: image_url} from Ecwid. Cached for 1 hour."""
     import time
     global _ecwid_image_cache, _ecwid_image_cache_ts
-    now = time.time()
-    has_cache = bool(_ecwid_image_cache)
-    cache_age = now - _ecwid_image_cache_ts
-
-    if has_cache and cache_age < 3600:
+    if time.time() - _ecwid_image_cache_ts < 3600 and _ecwid_image_cache is not None:
         return _ecwid_image_cache
-
     img_map = {}
     try:
-        for item in ecwid_get_all_products():
+        data = ecwid_get("/products", {"limit": 100, "offset": 0}, timeout=3)
+        for item in data.get("items", []):
             img = item.get("imageUrl") or item.get("thumbnailUrl") or ""
             sku = str(item.get("sku") or "").strip().upper()
             if sku and img:
@@ -4709,39 +4455,16 @@ def _line_get_ecwid_images() -> dict:
                 if vsku and img:
                     img_map[vsku] = img
     except Exception:
-        img_map = {}
-
-    if img_map:
-        _ecwid_image_cache = img_map
-        _ecwid_image_cache_ts = now
-        return img_map
-
-    # Fetch failed or returned nothing usable this round.
-    if has_cache:
-        # Serve the stale cache but retry again in ~60s instead of an hour.
-        _ecwid_image_cache_ts = now - 3600 + 60
-        return _ecwid_image_cache
-    _ecwid_image_cache_ts = now - 3600 + 60
-    return {}
+        pass
+    _ecwid_image_cache = img_map
+    _ecwid_image_cache_ts = time.time()
+    return img_map
 
 
-async def _poll_ecwid_images():
-    """Keep the product-image cache warm in the background so LINE
-    requests never pay the full Ecwid fetch cost synchronously."""
-    while True:
-        try:
-            _line_get_ecwid_images()
-        except Exception as e:
-            print(f"[IMG] Erreur: {e}")
-        await asyncio.sleep(1800)  # refresh every 30 min, well under the 1h cache TTL
-
-
-def _line_get_client_price(product_id: int, list_price: float, pricelist) -> float:
-    """Get price for a product given partner's pricelist.
-    A fixed_price of exactly 0 is treated as "not actually configured"
-    (an incomplete pricelist row) rather than a genuine free price, and
-    falls back to the product's list_price — selling at 0฿ by accident
-    from an incomplete pricelist entry is a real business risk."""
+def _line_get_client_price(product_id: int, list_price: float, pricelist, historical_price=None) -> float:
+    """Get price for a product given partner's pricelist. historical_price overrides all."""
+    if historical_price is not None:
+        return float(historical_price)
     if not pricelist or pricelist is False:
         return list_price
     pricelist_id = pricelist[0] if isinstance(pricelist, list) else pricelist
@@ -4751,84 +4474,26 @@ def _line_get_client_price(product_id: int, list_price: float, pricelist) -> flo
           ["compute_price", "=", "fixed"]]],
         {"fields": ["fixed_price"], "limit": 1}
     )
-    if items and items[0]["fixed_price"]:
+    if items:
         return items[0]["fixed_price"]
     return list_price
 
 
-def _parse_qty_input(text: str, is_per_kg: bool):
-    """Parse a customer's quantity reply. Returns (qty, is_weight) or None.
-    On a kg-priced product, the client MUST be explicit — "3kg"/"1.5kg" for
-    a weight, or "3 units"/"3pcs" for a piece count — a bare number like "3"
-    is rejected as ambiguous (staff corrects the exact weight afterwards
-    either way, but the intent must be clear from the start).
-    On a normal (non-kg) product, a bare integer is unambiguous and works
-    as before — but "kg" is rejected there too, since the product isn't
-    sold by weight.
-    """
-    text = text.strip().lower()
-    m_kg = re.match(r"^(\d+(?:\.\d+)?)\s*kg$", text)
-    if m_kg:
-        if not is_per_kg:
-            return None  # "kg" doesn't apply to a product sold by the piece
-        val = float(m_kg.group(1))
-        return (val, True) if val > 0 else None
-    m_unit = re.match(r"^(\d+)\s*(units?|unit[ée]s?|pcs?|pieces?)$", text)
-    if m_unit:
-        val = int(m_unit.group(1))
-        return (val, False) if 1 <= val <= 9999 else None
-    if is_per_kg:
-        return None  # bare number on a kg product → ambiguous, force clarification
-    if re.match(r"^\d+$", text):
-        val = int(text)
-        if 1 <= val <= 9999:
-            return (val, False)
-    return None
-
-
-def _truncate(s: str, n: int) -> str:
-    """Truncate to at most n chars, adding an ellipsis when actually cut.
-    Never cuts a word in half if a space is reasonably close to the limit."""
-    s = (s or "").strip()
-    if len(s) <= n:
-        return s
-    cut = s[:n - 1]
-    sp = cut.rfind(" ")
-    if sp > n * 0.6:  # avoid chopping mid-word when a space is nearby
-        cut = cut[:sp]
-    return cut.rstrip() + "…"
-
-
-def _parse_product_variant(name: str):
-    """Parse a raw Odoo product name into (base, weight_gr:int|None, variant:str|None).
-    Handles 'Taste', 'Flavour' (UK) and 'Flavor' (US) labels."""
+def _shorten_product_name(name: str) -> str:
+    """Shorten Odoo product names for LINE carousel (max 40 chars)."""
     import re as _re
-    name = name or ""
-    m = _re.match(r"^(.+?)\s*\(weight:\s*(\d+)\s*gr\s*/\s*(?:Taste|Flavour|Flavor):\s*(.+?)\)\s*$", name, _re.I)
+    # "Chipolata (weight: 1000 gr / Taste: Herbs)" → "Chipolata 1kg · Herbs"
+    m = _re.match(r"^(.+?)\s*\(weight:\s*(\d+)\s*gr\s*/\s*Taste:\s*(.+?)\)\s*$", name, _re.I)
     if m:
-        return m.group(1).strip(), int(m.group(2)), m.group(3).strip()
+        base, weight, taste = m.group(1).strip(), m.group(2), m.group(3).strip()
+        kg = f"{int(weight)//1000}kg" if int(weight) >= 1000 else f"{weight}g"
+        return f"{base} {kg} · {taste}"[:40]
+    # "Chipolata (weight: 300 gr)" → "Chipolata 300g"
     m2 = _re.match(r"^(.+?)\s*\(weight:\s*(\d+)\s*gr\)\s*$", name, _re.I)
     if m2:
-        return m2.group(1).strip(), int(m2.group(2)), None
-    m3 = _re.match(r"^(.+?)\s*\((?:Taste|Flavour|Flavor):\s*(.+?)\)\s*$", name, _re.I)
-    if m3:
-        return m3.group(1).strip(), None, m3.group(2).strip()
-    return name, None, None
-
-
-def _shorten_product_name(name: str) -> str:
-    """Normalize Odoo product name variants into a compact display form.
-    Does NOT hard-truncate: callers should truncate to fit their own UI
-    element via _truncate(), since the safe length differs per bubble/field."""
-    base, weight, variant = _parse_product_variant(name)
-    if weight and variant:
-        kg = f"{weight//1000}kg" if weight >= 1000 else f"{weight}g"
-        return f"{base} {kg} · {variant}"
-    if weight:
-        return f"{base} {weight}g"
-    if variant:
-        return f"{base} · {variant}"
-    return base
+        base, weight = m2.group(1).strip(), m2.group(2)
+        return f"{base} {weight}g"[:40]
+    return name[:40]
 
 
 def _line_build_carousel(products: list, pricelist, page: int = 0,
@@ -4847,29 +4512,25 @@ def _line_build_carousel(products: list, pricelist, page: int = 0,
     for p in page_prods:
         sku   = str(p.get("default_code") or "").strip().upper()
         name  = _shorten_product_name(p.get("name") or "")
-        price = _line_get_client_price(p["id"], p.get("list_price", 0), pricelist)
-        uom   = p.get("uom_id")
-        uom_name = uom[1] if isinstance(uom, list) else ""
-        price_suffix = "/kg" if "kg" in uom_name.lower() else ""
-        img_url = _line_get_ecwid_images().get(sku, "")
-        img_box = {"type": "image", "url": img_url, "size": "xs", "aspectMode": "cover", "aspectRatio": "1:1", "flex": 2} if img_url else {"type": "filler", "flex": 2}
+        price = _line_get_client_price(p["id"], p.get("list_price", 0), pricelist, p.get("_historical_price"))
         rows.append({
-                "type": "box", "layout": "horizontal",
-                "paddingTop": "8px", "paddingBottom": "8px",
-                "paddingStart": "10px", "paddingEnd": "14px",
-                "spacing": "md",
-                "action": {"type": "postback", "label": _truncate(name, 40),
-                            "data": f"__view_{p['id']}_{sku}"},
-                "contents": [
-                    img_box,
-                    {"type": "box", "layout": "vertical", "flex": 7, "justifyContent": "center",
-                     "contents": [
-                         {"type": "text", "text": _truncate(name, 60), "size": "sm", "color": "#222222", "wrap": True, "maxLines": 2},
-                         {"type": "text", "text": f"{price:.0f}฿{price_suffix}", "size": "sm", "weight": "bold", "color": "#C8102E"}
-                     ]},
-                    {"type": "text", "text": ">", "flex": 1, "size": "xl", "color": "#1A3A6B", "align": "end"}
-                ]
-            })
+            "type": "box", "layout": "horizontal",
+            "paddingTop": "10px", "paddingBottom": "10px",
+            "paddingStart": "14px", "paddingEnd": "14px",
+            "action": {"type": "postback", "label": name[:40],
+                       "data": f"__view_{p['id']}_{sku}"},
+            "contents": [
+                {"type": "text", "text": name[:60], "flex": 6, "size": "sm",
+                 "color": "#222222", "wrap": True, "maxLines": 2},
+                {"type": "text", "text": f"{price:,.0f}฿", "flex": 3,
+                 "size": "sm", "weight": "bold", "color": "#C8102E", "align": "end"},
+                {"type": "text", "text": "›", "flex": 1, "size": "xl",
+                 "color": "#1A3A6B", "align": "end"}
+            ]
+        })
+        rows.append({"type": "separator"})
+    if rows and rows[-1].get("type") == "separator":
+        rows.pop()
 
     nav_buttons = []
     if page > 0:
@@ -4916,60 +4577,36 @@ def _line_build_carousel(products: list, pricelist, page: int = 0,
     return [{"type": "flex", "altText": header_text, "contents": bubble}]
 
 
-def _line_product_detail(p: dict, pricelist, back_page: int = 0, is_retail: bool = False) -> list:
-    """Detail bubble for a single product with qty buttons.
-    is_retail=True (Mister Cochon / B2C) adds photo, stock, and weight —
-    is_retail=False (French Delicatessen / B2B) keeps the original lean layout."""
+def _line_product_detail(p: dict, pricelist, back_page: int = 0) -> list:
+    """Detail bubble for a single product with qty buttons."""
     sku   = str(p.get("default_code") or "").strip().upper()
     name  = p.get("name") or sku
     short = _shorten_product_name(name)
-    price = _line_get_client_price(p["id"], p.get("list_price", 0), pricelist)
+    price = _line_get_client_price(p["id"], p.get("list_price", 0), pricelist, p.get("_historical_price"))
     desc  = str(p.get("description_sale") or "").strip()
     price_int = int(round(price))
     pid   = p["id"]
-    uom   = p.get("uom_id")
-    uom_name = uom[1] if isinstance(uom, list) else ""
-    is_per_kg = "kg" in uom_name.lower()
-    price_suffix = " / กก. (kg)" if is_per_kg else ""
 
-    body_contents = []
+    weight = float(p.get("weight") or 0)
+    uom_raw = p.get("uom_id")
+    uom_name = uom_raw[1] if isinstance(uom_raw, (list, tuple)) and len(uom_raw) > 1 else ""
 
-    if is_retail:
-        img_url = _line_get_ecwid_images().get(sku, "")
-        if img_url:
-            body_contents.append({"type": "image", "url": img_url, "size": "full",
-                                   "aspectMode": "cover", "aspectRatio": "4:3",
-                                   "margin": "none"})
-
-    body_contents += [
-        {"type": "text", "text": f"{price:,.0f} ฿{price_suffix}",
-         "weight": "bold", "size": "xxl", "color": "#C8102E", "margin": "md"},
+    body_contents = [
+        {"type": "text", "text": f"{price:,.0f} ฿",
+         "weight": "bold", "size": "xxl", "color": "#C8102E"},
         {"type": "text", "text": f"Ref: {sku}", "size": "xs",
          "color": "#888888", "margin": "xs"},
     ]
-    if is_per_kg:
-        body_contents.append({"type": "text",
-            "text": "⚖️ Price per kg — ordered by the piece, exact weight confirmed at packing.",
-            "size": "xs", "color": "#8B5A00", "wrap": True, "margin": "xs"})
-
-    if is_retail:
-        _, weight_gr, _variant = _parse_product_variant(name)
-        if weight_gr:
-            w_text = f"{weight_gr/1000:.2f}".rstrip("0").rstrip(".") + " kg" if weight_gr >= 1000 else f"{weight_gr} g"
-            body_contents.append({"type": "text", "text": f"⚖️ {w_text}", "size": "sm",
-                                   "color": "#444444", "margin": "xs"})
-        qty_available = p.get("qty_available", 0) or 0
-        if qty_available > 0:
-            stock_text = f"✅ มีสินค้า {int(qty_available)} ชิ้น / In stock"
-            stock_color = "#1E8E3E"
-        else:
-            stock_text = "❌ สินค้าหมด / Out of stock"
-            stock_color = "#C8102E"
-        body_contents.append({"type": "text", "text": stock_text, "size": "sm",
-                               "color": stock_color, "weight": "bold", "margin": "xs"})
-
+    info_parts = []
+    if weight > 0:
+        info_parts.append(f"Poids: {weight:g} kg")
+    if uom_name:
+        info_parts.append(f"Unité: {uom_name}")
+    if info_parts:
+        body_contents.append({"type": "text", "text": "  ·  ".join(info_parts),
+                               "size": "sm", "color": "#555555", "margin": "sm"})
     if desc:
-        body_contents.append({"type": "text", "text": desc[:120], "size": "sm",
+        body_contents.append({"type": "text", "text": desc[:160], "size": "sm",
                                "color": "#444444", "wrap": True, "margin": "sm"})
 
     def qty_btn(q):
@@ -4977,21 +4614,13 @@ def _line_product_detail(p: dict, pricelist, back_page: int = 0, is_retail: bool
                 "action": {"type": "postback", "label": f"×{q}",
                            "data": f"__aq_{pid}_{sku}_{price_int}_{q}"}}
 
-    footer_contents = [
-       {"type": "button", "style": "primary", "height": "sm", "color": "#1A3A6B",
-         "action": {"type": "postback", "label": "🛒 Add to cart",
-                    "data": f"__add_{pid}_{sku}"}},
-        {"type": "button", "style": "secondary", "height": "sm",
-         "action": {"type": "postback", "label": "← Back to list",
-                    "data": f"__page_{back_page}"}}
-    ]
     bubble = {
         "type": "bubble", "size": "mega",
         "header": {
             "type": "box", "layout": "vertical",
             "backgroundColor": "#1A3A6B", "paddingAll": "14px",
             "contents": [{"type": "text", "text": short, "weight": "bold",
-                          "color": "#FFFFFF", "size": "md", "wrap": True, "maxLines": 3}]
+                          "color": "#FFFFFF", "size": "md", "wrap": True, "maxLines": 2}]
         },
         "body": {
             "type": "box", "layout": "vertical",
@@ -5000,7 +4629,21 @@ def _line_product_detail(p: dict, pricelist, back_page: int = 0, is_retail: bool
         },
         "footer": {
             "type": "box", "layout": "vertical", "paddingAll": "10px", "spacing": "sm",
-            "contents": footer_contents
+            "contents": [
+                {"type": "text", "text": "Select quantity:", "size": "sm", "color": "#555555"},
+                {"type": "box", "layout": "horizontal", "spacing": "xs",
+                 "contents": [qty_btn(1), qty_btn(2), qty_btn(3)]},
+                {"type": "box", "layout": "horizontal", "spacing": "xs",
+                 "contents": [
+                     qty_btn(5), qty_btn(10),
+                     {"type": "button", "style": "secondary", "height": "sm", "flex": 1,
+                      "action": {"type": "postback", "label": "Other",
+                                 "data": f"__cq_{pid}_{sku}_{price_int}"}}
+                 ]},
+                {"type": "button", "style": "secondary", "height": "sm",
+                 "action": {"type": "postback", "label": "← Back to list",
+                            "data": f"__page_{back_page}"}}
+            ]
         }
     }
     return [{"type": "flex", "altText": short, "contents": bubble}]
@@ -5024,21 +4667,6 @@ def _line_create_order(partner: dict, items: list) -> str:
     fd_number = odoo_execute("ir.sequence", "next_by_code", [[SEQ_CODES["P"]]])
     if not fd_number:
         return "❌ Order creation failed (sequence error). Please contact us."
-    fd_number = f"{fd_number}L"  # suffix "L" = order placed via the LINE bot
-
-    # Batch-resolve each product's UoM so we can flag items priced per kg
-    # but that the client actually ordered by the piece — same signal the
-    # team already writes by hand ("client veut N pièces") for logistics
-    # to weigh and correct before invoicing.
-    known_pids = [item["product_id"] for item in items if item.get("product_id")]
-    uom_by_pid = {}
-    if known_pids:
-        try:
-            prods = odoo_execute("product.product", "read", [known_pids, ["uom_id"]], {})
-            for p in prods:
-                uom_by_pid[p["id"]] = p.get("uom_id")
-        except Exception as e:
-            print(f"[_line_create_order] Erreur lecture uom_id: {e}")
 
     order_vals = {
         "partner_id": partner["id"],
@@ -5051,7 +4679,7 @@ def _line_create_order(partner: dict, items: list) -> str:
 
     order_id = odoo_execute("sale.order", "create", [order_vals])
 
-    lines_ok, lines_nok, weight_flags = [], [], []
+    lines_ok, lines_nok = [], []
     for item in items:
         sku        = item["sku"]
         qty        = item["qty"]
@@ -5063,17 +4691,15 @@ def _line_create_order(partner: dict, items: list) -> str:
         if not product_id:
             hits = odoo_execute("product.product", "search_read",
                 [[["default_code", "=", sku], ["active", "=", True]]],
-                {"fields": ["id", "list_price", "uom_id"], "limit": 1, "context": {"lang": "en_US"}}
+                {"fields": ["id", "list_price"], "limit": 1, "context": {"lang": "en_US"}}
             )
             if not hits:
                 lines_nok.append(sku)
                 continue
             product_id = hits[0]["id"]
             price = hits[0]["list_price"]
-            uom_by_pid[product_id] = hits[0].get("uom_id")
 
         client_price = _line_get_client_price(product_id, price, pricelist)
-        is_weight = item.get("is_weight", False)
         line_vals = {
             "order_id":        order_id,
             "product_id":      product_id,
@@ -5083,88 +4709,47 @@ def _line_create_order(partner: dict, items: list) -> str:
         }
         try:
             odoo_execute("sale.order.line", "create", [line_vals])
-            lines_ok.append(f"{sku} x{qty:g}" + ("kg" if is_weight else ""))
-            product_uom = uom_by_pid.get(product_id)
-            uom_name = product_uom[1] if isinstance(product_uom, list) else ""
-            # Sausages/whole pieces can't be cut to hit an exact weight —
-            # logistics always picks whole pieces and weighs them, so this
-            # note applies regardless of whether the client gave a piece
-            # count or a target weight.
-            if "kg" in uom_name.lower():
-                if is_weight:
-                    weight_flags.append(
-                        f"⚖️ {name}: client wants ~{qty:g}kg (approx., in whole "
-                        f"pieces) — please weigh and confirm actual quantity before invoicing."
-                    )
-                else:
-                    weight_flags.append(
-                        f"⚖️ {name}: client wants {qty} pieces — please weigh and "
-                        f"confirm actual quantity before invoicing."
-                    )
+            lines_ok.append(f"{sku} x{qty}")
         except Exception:
             lines_nok.append(sku)
-
-    if weight_flags:
-        try:
-            odoo_execute("sale.order", "write", [[order_id], {
-                "note": order_vals["note"] + "\n\n" + "\n".join(weight_flags)
-            }])
-        except Exception as e:
-            print(f"[_line_create_order] Erreur ajout note poids: {e}")
 
     if lines_ok:
         try:
             odoo_execute("sale.order", "action_confirm", [[order_id]])
-        except Exception as e:
-            print(f"[_line_create_order] Erreur: {e}")
+        except Exception:
+            pass
 
     msg = [f"✅ Order *{fd_number}* confirmed!"]
     if lines_ok:
         msg.append("Items: " + ", ".join(lines_ok))
     if lines_nok:
         msg.append("⚠️ SKUs not found: " + ", ".join(lines_nok))
-    if weight_flags:
-        msg.append("⚖️ Some items are priced per kg — final weight and price "
-                    "will be confirmed by our team before invoicing.")
     msg.append("Our team will contact you to confirm delivery. Thank you!")
     return "\n".join(msg)
 
 
-def _line_cart_messages(cart: list, added_name: str = None, added_qty: int = None,
-                         allow_remove: bool = True) -> list:
+def _line_cart_messages(cart: list, added_name: str = None, added_qty: int = None) -> list:
     """Return LINE messages showing the cart as a clean Flex bubble."""
     total = sum(i["price"] * i["qty"] for i in cart)
     n = len(cart)
 
     header_text = f"Your Order  ({n} item{'s' if n > 1 else ''})"
     if added_name and added_qty:
-        header_text = f"Added: {_truncate(added_name, 28)} ×{added_qty}"
+        header_text = f"Added: {added_name[:28]} ×{added_qty}"
 
     body_rows = []
-    for idx, i in enumerate(cart):
-        short = _truncate(_shorten_product_name(i["name"]), 28)
+    for i in cart:
+        short = _shorten_product_name(i["name"])[:28]
         row_total = i["price"] * i["qty"]
-        qty_label = f"{i['qty']:g}kg" if i.get("is_weight") else f"×{i['qty']}"
-        label = f"{short} {qty_label}" + (" 🕐" if i.get("preorder") else "")
-        row_contents = [
-            {"type": "text", "text": label, "size": "sm",
-             "color": "#333333", "wrap": True, "flex": 4},
-            {"type": "text", "text": f"{row_total:,.0f} ฿", "size": "sm",
-             "color": "#333333", "align": "end", "flex": 2},
-        ]
-        if allow_remove:
-            row_contents.append({"type": "box", "layout": "vertical", "flex": 1, "alignItems": "flex-end",
-                 "action": {"type": "postback", "label": "Remove item", "data": f"__rmline_{idx}"},
-                 "contents": [{"type": "text", "text": "✕", "size": "sm",
-                               "color": "#C8102E", "weight": "bold", "align": "end"}]})
         body_rows.append({
-            "type": "box", "layout": "horizontal", "margin": "sm", "alignItems": "center",
-            "contents": row_contents
+            "type": "box", "layout": "horizontal", "margin": "sm",
+            "contents": [
+                {"type": "text", "text": f"{short} ×{i['qty']}", "size": "sm",
+                 "color": "#333333", "wrap": True, "flex": 4},
+                {"type": "text", "text": f"{row_total:,.0f} ฿", "size": "sm",
+                 "color": "#333333", "align": "end", "flex": 2}
+            ]
         })
-
-    if any(i.get("preorder") for i in cart):
-        body_rows.append({"type": "text", "text": "🕐 Pre-order — out of stock, longer delivery time",
-                           "size": "xs", "color": "#888888", "wrap": True, "margin": "sm"})
 
     body_rows += [
         {"type": "separator", "margin": "md"},
@@ -5246,14 +4831,7 @@ async def webhook_line(request: Request):
         user_id = event.get("source", {}).get("userId", "")
         text_low = text.lower()
 
-        try:
-            partner = _line_get_partner(user_id)
-        except Exception as e:
-            print(f"[webhook_line] Erreur Odoo lors de l'identification (user {user_id}): {e}")
-            line_reply(reply_token, [line_text(
-                "⚠️ Temporary connection issue, please try again in a moment."
-            )])
-            continue
+        partner = _line_get_partner(user_id)
 
         # ── Logout ────────────────────────────────────────────────────────
         if text_low in ("logout", "log out", "déconnexion", "ออกจากระบบ"):
@@ -5370,7 +4948,7 @@ async def webhook_line(request: Request):
                 cats = _line_get_pro_categories(_line_extra_tags_for_partner(partner))
                 welcome = line_text(f"✅ Welcome back, {name}!")
                 if cats:
-                    line_reply(reply_token, [welcome, _line_build_cat_flex(cats, partner_name=name)])
+                    line_reply(reply_token, [welcome, _line_build_cat_flex(cats)])
                 else:
                     line_reply(reply_token, [welcome, line_text("Type *menu* to browse our PRO catalog.")])
             else:
@@ -5411,7 +4989,7 @@ async def webhook_line(request: Request):
             if not prod and product_id:
                 rows = odoo_execute("product.product", "search_read",
                     [[["id", "=", product_id]]],
-                    {"fields": ["id", "name", "default_code", "list_price", "description_sale", "qty_available", "uom_id"],
+                    {"fields": ["id", "name", "default_code", "list_price", "description_sale", "weight", "uom_id"],
                      "limit": 1, "context": {"lang": "en_US"}})
                 prod = rows[0] if rows else None
             if not prod:
@@ -5443,26 +5021,21 @@ async def webhook_line(request: Request):
                 product_id = product_id or prod["id"]
                 price = _line_get_client_price(prod["id"], prod.get("list_price", 0), pricelist)
                 name  = prod.get("name", sku)
-                uom = prod.get("uom_id")
-                is_per_kg = isinstance(uom, list) and "kg" in (uom[1] or "").lower()
             else:
                 price = 0.0
                 name  = sku
-                is_per_kg = False
 
             short     = _shorten_product_name(name)
             price_int = int(round(price))
-            sess = _line_sessions.get(user_id, {})
-            _line_sessions[user_id] = {**sess,
-                "pending_sku": sku, "pending_price": float(price_int),
-                "pending_pid": product_id, "pending_name": name,
-                "pending_is_per_kg": is_per_kg}
-            qty_prompt = ("⚖️ Price per kg. Please type your quantity with "
-                          "*kg* or *units* at the end, e.g. \"1.5kg\" or "
-                          "\"3 units\" (exact weight confirmed at packing):"
-                          if is_per_kg else "How many units?")
-            line_reply(reply_token, [line_text(
-                f"*{short}*\nUnit price: {price:.0f} ฿{' /kg' if is_per_kg else ''}\n\n{qty_prompt}"
+            # Embed product_id + sku + price in every button — zero Odoo calls at qty/checkout
+            line_reply(reply_token, [line_quick_reply(
+                f"*{short}*\n"
+                f"Unit price: {price:.0f} ฿\n\n"
+                f"Select quantity:",
+                [(f"× {q}", f"__aq_{product_id}_{sku}_{price_int}_{q}")
+                 for q in [1, 2, 3, 5, 10]]
+                + [("Other qty", f"__cq_{product_id}_{sku}_{price_int}"),
+                   ("Cancel", "cancel")]
             )])
             continue
 
@@ -5486,32 +5059,26 @@ async def webhook_line(request: Request):
 
         # ── Free-text qty for custom quantity ──────────────────────────────
         sess = _line_sessions.get(user_id, {})
-        if sess.get("pending_sku"):
-            parsed = _parse_qty_input(text, sess.get("pending_is_per_kg", False))
-        else:
-            parsed = None
-        if parsed:
-            qty, is_weight = parsed
+        if sess.get("pending_sku") and re.match(r"^\d+$", text) and 1 <= int(text) <= 9999:
             sku        = sess["pending_sku"]
             price      = sess["pending_price"]
             product_id = sess.get("pending_pid", 0)
             name       = sess.get("pending_name", sku)
+            qty        = int(text)
             cart = list(sess.get("cart", []))
             for item in cart:
-                if item["sku"] == sku and item.get("is_weight", False) == is_weight:
+                if item["sku"] == sku:
                     item["qty"] += qty
                     break
             else:
-                cart.append({"sku": sku, "name": name, "price": price,
-                              "product_id": product_id, "qty": qty, "is_weight": is_weight})
+                cart.append({"sku": sku, "name": name,
+                              "price": price, "product_id": product_id, "qty": qty})
             _line_sessions[user_id] = {**sess, "cart": cart,
-                                        "pending_sku": None, "pending_price": None,
-                                        "pending_is_per_kg": None}
+                                        "pending_sku": None, "pending_price": None}
             short = _shorten_product_name(name)
             total = sum(i["price"] * i["qty"] for i in cart)
-            qty_label = f"{qty:g}kg" if is_weight else f"×{qty}"
             confirm_msg = line_text(
-                f"✅ {short} {qty_label} added\n"
+                f"✅ {short} ×{qty} added\n"
                 f"Cart: {len(cart)} item{'s' if len(cart)>1 else ''} — {total:,.0f} ฿"
             )
             prods = sess.get("category_products", [])
@@ -5520,17 +5087,6 @@ async def webhook_line(request: Request):
             if prods:
                 msgs += _line_build_carousel(prods, pricelist, cur_page)
             line_reply(reply_token, msgs[:5])
-            continue
-        elif sess.get("pending_sku") and sess.get("pending_is_per_kg"):
-            line_reply(reply_token, [line_text(
-                "⚖️ Please be specific: type your quantity with *kg* or "
-                "*units* at the end, e.g. \"1.5kg\" or \"3 units\"."
-            )])
-            continue
-        elif sess.get("pending_sku"):
-            line_reply(reply_token, [line_text(
-                "Please enter a valid quantity — a whole number, e.g. \"3\"."
-            )])
             continue
 
         # ── Qty button: __aq_{product_id}_{sku}_{price}_{qty} ────────────
@@ -5556,13 +5112,12 @@ async def webhook_line(request: Request):
                 product_id = prod["id"]
             cart = list(sess.get("cart", []))
             for item in cart:
-                if item["sku"] == sku and not item.get("is_weight", False):
+                if item["sku"] == sku:
                     item["qty"] += qty
                     break
             else:
                 cart.append({"sku": sku, "name": name,
-                              "price": price, "product_id": product_id, "qty": qty,
-                              "is_weight": False})
+                              "price": price, "product_id": product_id, "qty": qty})
             _line_sessions[user_id] = {**sess, "cart": cart}
             short = _shorten_product_name(name)
             total = sum(i["price"] * i["qty"] for i in cart)
@@ -5580,7 +5135,7 @@ async def webhook_line(request: Request):
             continue
 
         # ── Cart display ───────────────────────────────────────────────────
-        if text_low in ("cart", "panier", "my cart", "ตะกร้าสินค้า", "ตะกร้า"):
+        if text_low in ("cart", "panier", "my cart"):
             cart = _line_sessions.get(user_id, {}).get("cart", [])
             if not cart:
                 line_reply(reply_token, [line_quick_reply(
@@ -5589,26 +5144,6 @@ async def webhook_line(request: Request):
                 )])
             else:
                 line_reply(reply_token, _line_cart_messages(cart))
-            continue
-
-        # ── Remove a single line from the cart: __rmline_{index} ────────────
-        if text.startswith("__rmline_"):
-            idx_str = text[len("__rmline_"):]
-            sess = _line_sessions.get(user_id, {})
-            cart = list(sess.get("cart", []))
-            if idx_str.isdigit() and 0 <= int(idx_str) < len(cart):
-                removed = cart.pop(int(idx_str))
-                _line_sessions[user_id] = {**sess, "cart": cart}
-                short = _shorten_product_name(removed.get("name", ""))
-                if cart:
-                    line_reply(reply_token, [line_text(f"🗑️ Removed: {short}")] + _line_cart_messages(cart))
-                else:
-                    line_reply(reply_token, [line_quick_reply(
-                        f"🗑️ Removed: {short}\nYour cart is now empty.",
-                        [("Browse catalog", "menu")]
-                    )])
-            else:
-                line_reply(reply_token, [line_text("This item is no longer in your cart.")])
             continue
 
         # ── Checkout ───────────────────────────────────────────────────────
@@ -5645,10 +5180,10 @@ async def webhook_line(request: Request):
             categ_id = int(parts[1])
             domain = [["active", "=", True], ["sale_ok", "=", True],
                        ["product_tag_ids", "in", [tag_id]],
-                       ["categ_id", "=", categ_id]]
+                       ["product_tag_ids", "in", [categ_id]]]
             prods = odoo_execute("product.product", "search_read",
                 [domain],
-                {"fields": ["id", "name", "default_code", "list_price", "description_sale", "qty_available", "uom_id"], "limit": 200,
+                {"fields": ["id", "name", "default_code", "list_price", "description_sale", "weight", "uom_id"], "limit": 200,
                  "context": {"lang": "en_US"}})
             if not prods:
                 line_reply(reply_token, [line_text("No products in this category.")])
@@ -5684,7 +5219,7 @@ async def webhook_line(request: Request):
                     domain.append(["product_tag_ids", "in", [line_tag_id]])
             prods = odoo_execute("product.product", "search_read",
                 [domain],
-                {"fields": ["id", "name", "default_code", "list_price", "description_sale", "qty_available", "uom_id"], "limit": 200,
+                {"fields": ["id", "name", "default_code", "list_price", "description_sale", "weight", "uom_id"], "limit": 200,
                  "context": {"lang": "en_US"}}
             )
             if not prods:
@@ -5696,7 +5231,7 @@ async def webhook_line(request: Request):
             continue
 
         # ── Menu / catalogue ───────────────────────────────────────────────
-        if text_low in ("menu", "catalog", "catalogue", "products", "shop", "แคตตาล็อกสินค้า"):
+        if text_low in ("menu", "catalog", "catalogue", "products", "shop"):
             cats = _line_get_pro_categories(_line_extra_tags_for_partner(partner))
             if not cats:
                 line_reply(reply_token, [line_text("No PRO products available yet.")])
@@ -5715,17 +5250,17 @@ async def webhook_line(request: Request):
                         domain.append(["product_tag_ids", "in", [line_tag_id]])
                 prods = odoo_execute("product.product", "search_read",
                     [domain],
-                    {"fields": ["id", "name", "default_code", "list_price", "description_sale", "qty_available", "uom_id"], "limit": 200,
+                    {"fields": ["id", "name", "default_code", "list_price", "description_sale", "weight", "uom_id"], "limit": 200,
                      "context": {"lang": "en_US"}}
                 )
                 _line_sessions[user_id] = {"category_products": prods, "page": 0}
                 line_reply(reply_token, _line_build_carousel(prods, pricelist, 0))
                 continue
             # Flex bubble with category buttons — all visible on one screen
-            line_reply(reply_token, [_line_build_cat_flex(cats, partner_name=partner.get("name", ""))])
+            line_reply(reply_token, [_line_build_cat_flex(cats)])
 
         # ── My orders ─────────────────────────────────────────────────────
-        elif text_low in ("orders", "my orders", "history", "ประวัติคำสั่งซื้อ"):
+        elif text_low in ("orders", "my orders", "history"):
             orders = odoo_execute("sale.order", "search_read",
                 [[["partner_id", "=", partner["id"]]]],
                 {"fields": ["name", "date_order", "amount_total", "state"],
@@ -5746,7 +5281,7 @@ async def webhook_line(request: Request):
                 )])
 
         # ── Reorder: show previously ordered products as carousel ──────────
-        elif text_low in ("reorder", "recommander", "last order", "สั่งซ้ำ"):
+        elif text_low in ("reorder", "recommander", "last order"):
             # Collect unique products from last 5 confirmed orders
             past_orders = odoo_execute("sale.order", "search_read",
                 [[["partner_id", "child_of", partner["id"]], ["state", "in", ["sale", "done"]]]],
@@ -5761,22 +5296,21 @@ async def webhook_line(request: Request):
                 oid_list = [o["id"] for o in past_orders]
                 all_lines = odoo_execute("sale.order.line", "search_read",
                     [[["order_id", "in", oid_list]]],
-                    {"fields": ["product_id", "product_uom_qty"], "limit": 200}
+                    {"fields": ["product_id", "product_uom_qty", "price_unit"], "limit": 200}
                 )
-                # Deduplicate products, keep max qty ordered, exclude the
-                # Transport / Frozen-supplement lines (product_id 1915/1917)
-                # so shipping fees never show up as a "usual product".
-                seen, prod_ids = {}, []
+                # Deduplicate products, keep max qty and most recent price
+                seen, prod_ids, price_history = {}, [], {}
                 for ln in all_lines:
                     if not ln.get("product_id"):
                         continue
                     pid = ln["product_id"][0]
-                    if pid in (1915, 1917):
-                        continue
                     qty = int(ln.get("product_uom_qty", 1))
+                    pu = float(ln.get("price_unit") or 0)
                     if pid not in seen:
                         seen[pid] = qty
                         prod_ids.append(pid)
+                        if pu > 0:
+                            price_history[pid] = pu
                     else:
                         seen[pid] = max(seen[pid], qty)
 
@@ -5789,12 +5323,10 @@ async def webhook_line(request: Request):
                     domain = [["id", "in", prod_ids],
                               ["name", "not ilike", "frozen"],
                               ["name", "not ilike", "livraison"],
-                              ["name", "not ilike", "delivery"],
-                              ["name", "not ilike", "transport"],
-                              ["name", "not ilike", "supplement"]]
+                              ["name", "not ilike", "delivery"]]
                     prods = odoo_execute("product.product", "search_read",
                         [domain],
-                        {"fields": ["id", "name", "default_code", "list_price", "description_sale", "qty_available", "uom_id"],
+                        {"fields": ["id", "name", "default_code", "list_price", "description_sale", "weight", "uom_id"],
                          "limit": 100, "context": {"lang": "en_US", "active_test": False}}
                     )
                     if not prods:
@@ -5803,6 +5335,9 @@ async def webhook_line(request: Request):
                             [("Browse catalog", "menu")]
                         )])
                     else:
+                        for p in prods:
+                            if p["id"] in price_history:
+                                p["_historical_price"] = price_history[p["id"]]
                         sess = _line_sessions.get(user_id, {})
                         _line_sessions[user_id] = {**sess, "category_products": prods, "page": 0}
                         line_reply(reply_token,
@@ -5827,8 +5362,8 @@ async def webhook_line(request: Request):
                         json={"to": admin_id, "messages": [{"type": "text",
                             "text": f"📩 Contact request\nClient: {client_name}\nLINE ID: {user_id}\n\nReply directly in OA Manager."}]},
                         timeout=5)
-                except Exception as e:
-                    print(f"[webhook_line] Erreur: {e}")
+                except Exception:
+                    pass
 
         # ── My LINE ID (admin helper) ──────────────────────────────────────
         elif text == "!myid":
@@ -5856,42 +5391,6 @@ async def webhook_line(request: Request):
                 "📞 Support: @jfbuc"
             )])
 
-        # ── Free-text order: "SKU x2" or "SKU1 x2, SKU2 x3" ────────────────
-        elif _line_parse_order(text):
-            parsed = _line_parse_order(text)
-            sess = _line_sessions.get(user_id, {})
-            cart = list(sess.get("cart", []))
-            added, not_found = [], []
-            for sku, qty in parsed:
-                hits = odoo_execute("product.product", "search_read",
-                    [[["default_code", "=ilike", sku], ["active", "=", True]]],
-                    {"fields": ["id", "name", "default_code", "list_price"],
-                     "limit": 1, "context": {"lang": "en_US"}}
-                )
-                if not hits:
-                    not_found.append(sku)
-                    continue
-                prod = hits[0]
-                price = _line_get_client_price(prod["id"], prod.get("list_price", 0), pricelist)
-                for item in cart:
-                    if item["sku"] == sku and not item.get("is_weight", False):
-                        item["qty"] += qty
-                        break
-                else:
-                    cart.append({"sku": sku, "name": prod["name"],
-                                  "price": price, "product_id": prod["id"], "qty": qty,
-                                  "is_weight": False})
-                added.append(f"{_shorten_product_name(prod['name'])} ×{qty}")
-            _line_sessions[user_id] = {**sess, "cart": cart}
-            lines = []
-            if added:
-                total = sum(i["price"] * i["qty"] for i in cart)
-                lines.append("✅ Added:\n" + "\n".join(added))
-                lines.append(f"\nCart: {len(cart)} item{'s' if len(cart)>1 else ''} — {total:,.0f} ฿")
-            if not_found:
-                lines.append("❌ Not found: " + ", ".join(not_found))
-            line_reply(reply_token, [line_text("\n".join(lines))])
-        
         # ── SKU lookup: type a SKU to open product detail ─────────────────
         else:
             sess = _line_sessions.get(user_id, {})
@@ -5901,7 +5400,7 @@ async def webhook_line(request: Request):
                 raw_sku = sku_match.group(1).upper()
                 prods_found = odoo_execute("product.product", "search_read",
                     [[["default_code", "=ilike", raw_sku]]],
-                    {"fields": ["id", "name", "default_code", "list_price", "description_sale", "qty_available", "uom_id"],
+                    {"fields": ["id", "name", "default_code", "list_price", "description_sale", "weight", "uom_id"],
                      "limit": 1, "context": {"lang": "en_US", "active_test": False}}
                 )
                 if prods_found:
@@ -5943,38 +5442,25 @@ _retail_sessions: dict = {}
 
 
 def retail_reply(reply_token: str, messages: list):
-    try:
-        resp = requests.post("https://api.line.me/v2/bot/message/reply",
-            headers={"Authorization": f"Bearer {LINE_RETAIL_TOKEN}",
-                     "Content-Type": "application/json"},
-            json={"replyToken": reply_token, "messages": messages[:5]},
-            timeout=10)
-        if resp.status_code != 200:
-            print(f"[retail_reply] LINE API a refusé le message "
-                  f"(status {resp.status_code}): {resp.text[:500]}")
-    except Exception as e:
-        print(f"[retail_reply] Erreur: {e}")
+    requests.post("https://api.line.me/v2/bot/message/reply",
+        headers={"Authorization": f"Bearer {LINE_RETAIL_TOKEN}",
+                 "Content-Type": "application/json"},
+        json={"replyToken": reply_token, "messages": messages[:5]},
+        timeout=10)
 
 
 def retail_push(user_id: str, messages: list):
-    try:
-        resp = requests.post("https://api.line.me/v2/bot/message/push",
-            headers={"Authorization": f"Bearer {LINE_RETAIL_TOKEN}",
-                     "Content-Type": "application/json"},
-            json={"to": user_id, "messages": messages[:5]},
-            timeout=10)
-        if resp.status_code != 200:
-            print(f"[retail_push] LINE API a refusé le message "
-                  f"(status {resp.status_code}): {resp.text[:500]}")
-    except Exception as e:
-        print(f"[retail_push] Erreur: {e}")
+    requests.post("https://api.line.me/v2/bot/message/push",
+        headers={"Authorization": f"Bearer {LINE_RETAIL_TOKEN}",
+                 "Content-Type": "application/json"},
+        json={"to": user_id, "messages": messages[:5]},
+        timeout=10)
 
 
 def _retail_get_partner(user_id: str) -> dict | None:
     results = odoo_execute("res.partner", "search_read",
         [[["comment", "like", f"line_retail:{user_id}"]]],
-        {"fields": ["id", "name", "email", "property_product_pricelist",
-                    "street", "city", "zip"], "limit": 1}
+        {"fields": ["id", "name", "email", "property_product_pricelist"], "limit": 1}
     )
     return results[0] if results else None
 
@@ -6034,114 +5520,13 @@ def _retail_build_cat_flex(cats: list) -> dict:
     }
 
 
-_ecwid_shipping_cache: list = []
-_ecwid_shipping_cache_ts: float = 0.0
-
-def _get_ecwid_shipping_options() -> list:
-    """Return the store's configured Ecwid shipping options (zones + rates),
-    as set up in the Ecwid admin panel. Cached for 1 hour; on failure, keeps
-    serving the previous (stale) list instead of going empty."""
-    import time
-    global _ecwid_shipping_cache, _ecwid_shipping_cache_ts
-    now = time.time()
-    has_cache = bool(_ecwid_shipping_cache)
-    if has_cache and now - _ecwid_shipping_cache_ts < 3600:
-        return _ecwid_shipping_cache
-    try:
-        data = ecwid_get("/profile/shippingOptions", timeout=10)
-        options = data if isinstance(data, list) else (data or {}).get("items", [])
-    except Exception:
-        options = None
-    if options:
-        _ecwid_shipping_cache = options
-        _ecwid_shipping_cache_ts = now
-        return options
-    if has_cache:
-        _ecwid_shipping_cache_ts = now - 3600 + 60
-        return _ecwid_shipping_cache
-    _ecwid_shipping_cache_ts = now - 3600 + 60
-    return []
-
-
-def _postcode_matches_zone(zip_code: str, templates: list) -> bool:
-    """Match a zip code against Ecwid postcode zone templates.
-    Supports exact codes, trailing-* prefixes (e.g. '10*' for Bangkok),
-    and numeric ranges ('10000-10300')."""
-    if not templates:
-        return True  # zone has no postcode restriction → matches everywhere
-    zip_code = (zip_code or "").strip()
-    if not zip_code:
-        return False
-    for tpl in templates:
-        tpl = str(tpl).strip()
-        if not tpl:
-            continue
-        if "-" in tpl and tpl.replace("-", "").isdigit():
-            lo, hi = tpl.split("-", 1)
-            if lo.isdigit() and hi.isdigit() and lo <= zip_code <= hi:
-                return True
-        elif tpl.endswith("*"):
-            if zip_code.startswith(tpl[:-1]):
-                return True
-        elif tpl == zip_code:
-            return True
-    return False
-
-
-def _get_shipping_fee(zip_code: str, subtotal: float) -> tuple:
-    """Return (fee, option_title) for a delivery address, based on the
-    shipping zones/rates configured in Ecwid (Store settings → Shipping →
-    Zones). Returns (0.0, "") if nothing is configured or no zone matches —
-    callers should treat that as 'no shipping fee applied'."""
-    options = _get_ecwid_shipping_options()
-    candidates = [o for o in options
-                  if o.get("enabled") and o.get("fulfilmentType") in ("shipping", "delivery")]
-    # A zone with explicit postcodes wins over a catch-all zone (no postcodes = anywhere).
-    specific, catch_all = [], []
-    for o in candidates:
-        templates = ((o.get("destinationZone") or {}).get("postCodes") or [])
-        if templates:
-            if _postcode_matches_zone(zip_code, templates):
-                specific.append(o)
-        else:
-            catch_all.append(o)
-    match = specific[0] if specific else (catch_all[0] if catch_all else None)
-    if not match:
-        return 0.0, ""
-
-    calc = match.get("ratesCalculationType")
-    title = match.get("title", "")
-    if calc == "flat":
-        fr = match.get("flatRate") or {}
-        rate, rate_type = fr.get("rate", 0) or 0, fr.get("rateType", "ABSOLUTE")
-        fee = subtotal * rate / 100 if rate_type == "PERCENT" else rate
-        return float(fee), title
-    if calc == "table":
-        rt = match.get("ratesTable") or {}
-        based_on = rt.get("tableBasedOn", "subtotal")
-        if based_on in ("subtotal", "discountedSubtotal"):
-            for row in rt.get("rates", []):
-                cond = row.get("conditions", {}) or {}
-                lo = cond.get("subtotalFrom", cond.get("discountedSubtotalFrom", 0)) or 0
-                hi = cond.get("subtotalTo", cond.get("discountedSubtotalTo"))
-                if subtotal >= lo and (hi is None or subtotal <= hi):
-                    r = row.get("rate", {}) or {}
-                    return float(r.get("perOrder", 0) or 0), title
-        return 0.0, title
-    # carrier-calculated / app-based rates need live carrier data we don't have here.
-    return 0.0, title
-
-
 def _retail_checkout_messages(cart: list, partner: dict) -> list:
     """Generate checkout message with PromptPay info and QR code."""
     total = sum(i["qty"] * i["price"] for i in cart)
     lines = []
     for i in cart:
-        tag = " 🕐(Pre-order)" if i.get("preorder") else ""
-        lines.append(f"• {i['name'][:30]} ×{i['qty']} = {i['qty']*i['price']:,.0f}฿{tag}")
+        lines.append(f"• {i['name'][:30]} ×{i['qty']} = {i['qty']*i['price']:,.0f}฿")
     order_text = "\n".join(lines)
-    if any(i.get("preorder") for i in cart):
-        order_text += "\n\n🕐 มีสินค้าพรีออเดอร์ อาจใช้เวลาจัดส่งนานกว่าปกติ\nIncludes pre-order item(s) — may take longer to deliver."
     # PromptPay QR code with amount via promptpay.io
     qr_url = f"https://promptpay.io/{PROMPTPAY_NUMBER}/{int(total)}.png"
     return [
@@ -6212,15 +5597,7 @@ async def webhook_line_retail(request: Request):
             continue
 
         text_low = text.lower().strip()
-        try:
-            partner = _retail_get_partner(user_id)
-        except Exception as e:
-            print(f"[webhook_line_retail] Erreur Odoo lors de l'identification (user {user_id}): {e}")
-            retail_reply(reply_token, [line_text(
-                "⚠️ Temporary connection issue, please try again in a moment.\n"
-                "เกิดปัญหาการเชื่อมต่อชั่วคราว กรุณาลองใหม่อีกครั้ง"
-            )])
-            continue
+        partner = _retail_get_partner(user_id)
 
         # ── Not authenticated ──────────────────────────────────────────────
         if not partner:
@@ -6249,127 +5626,6 @@ async def webhook_line_retail(request: Request):
                     )])
                 continue
 
-            # ── Registration: email not found → offer to sign up ──────────
-            if sess.get("state") == "awaiting_register_choice":
-                if text_low in ("ใช่", "yes", "สมัคร", "register", "ลงทะเบียน", "✅"):
-                    _retail_sessions[user_id] = {"state": "awaiting_reg_name",
-                                                  "reg_email": sess.get("reg_email", "")}
-                    retail_reply(reply_token, [line_text(
-                        "📝 ลงทะเบียนสมาชิกใหม่ / New registration\n\n"
-                        "กรุณากรอกชื่อ-นามสกุลของคุณ\nPlease enter your full name:"
-                    )])
-                else:
-                    _retail_sessions.pop(user_id, None)
-                    retail_reply(reply_token, [line_text(
-                        "กรุณากรอกอีเมลของคุณอีกครั้ง\nPlease enter your email again."
-                    )])
-                continue
-
-            # Registration step 2: waiting for full name
-            if sess.get("state") == "awaiting_reg_name":
-                name = text.strip()
-                if len(name) < 2:
-                    retail_reply(reply_token, [line_text(
-                        "กรุณากรอกชื่อ-นามสกุลที่ถูกต้อง\nPlease enter a valid full name:"
-                    )])
-                    continue
-                _retail_sessions[user_id] = {"state": "awaiting_reg_phone",
-                                              "reg_name": name,
-                                              "reg_email": sess.get("reg_email", "")}
-                retail_reply(reply_token, [line_text(
-                    f"ชื่อ: *{name}*\n\n"
-                    "กรุณากรอกเบอร์โทรศัพท์ของคุณ\nNow please enter your phone number:"
-                )])
-                continue
-
-            # Registration step 3: waiting for phone → then ask for address
-            if sess.get("state") == "awaiting_reg_phone":
-                phone = re.sub(r"[^\d+]", "", text.strip())
-                if len(re.sub(r"\D", "", phone)) < 8:
-                    retail_reply(reply_token, [line_text(
-                        "เบอร์โทรศัพท์ไม่ถูกต้อง กรุณากรอกใหม่\n"
-                        "Invalid phone number, please try again:"
-                    )])
-                    continue
-                _retail_sessions[user_id] = {"state": "awaiting_reg_address",
-                                              "reg_name": sess.get("reg_name", ""),
-                                              "reg_email": sess.get("reg_email", ""),
-                                              "reg_phone": phone}
-                retail_reply(reply_token, [line_text(
-                    f"เบอร์โทร: *{phone}*\n\n"
-                    "กรุณากรอกที่อยู่จัดส่งแบบเต็ม (บ้านเลขที่ ถนน ตำบล/แขวง อำเภอ/เขต จังหวัด รหัสไปรษณีย์):\n"
-                    "Please enter your full delivery address "
-                    "(house number, street, sub-district, district, province, postal code):"
-                )])
-                continue
-
-            # Registration step 4: waiting for address → create the account
-            if sess.get("state") == "awaiting_reg_address":
-                address = text.strip()
-                if len(address) < 10:
-                    retail_reply(reply_token, [line_text(
-                        "กรุณากรอกที่อยู่ให้ครบถ้วนมากขึ้น\n"
-                        "Please enter a more complete address:"
-                    )])
-                    continue
-
-                name  = sess.get("reg_name", "").strip()
-                email = sess.get("reg_email", "").strip()
-                phone = sess.get("reg_phone", "").strip()
-                _retail_sessions.pop(user_id, None)
-
-                zip_match = re.search(r"\b(\d{5})\b", address)
-                zip_code = zip_match.group(1) if zip_match else ""
-
-                display = _line_get_display_name(user_id)
-                marker  = f"line_retail:{user_id}"
-
-                # Guard: someone may have registered with this email in the
-                # gap since the failed lookup — link to that account instead
-                # of creating a duplicate.
-                existing = None
-                if email:
-                    existing = odoo_execute("res.partner", "search_read",
-                        [[["email", "=ilike", email], ["customer_rank", ">", 0]]],
-                        {"fields": ["id", "name", "comment"], "limit": 1}
-                    )
-                    existing = existing[0] if existing else None
-
-                if existing:
-                    comment = existing.get("comment") or ""
-                    if marker not in comment:
-                        odoo_execute("res.partner", "write",
-                            [[existing["id"]], {"comment": (comment + "\n" + marker).strip(),
-                                                 "street": address, "zip": zip_code}])
-                    pname = existing["name"]
-                else:
-                    odoo_execute("res.partner", "create", [{
-                        "name": name or display or "Mister Cochon Customer",
-                        "email": email,
-                        "phone": phone,
-                        "street": address,
-                        "zip": zip_code,
-                        "customer_rank": 1,
-                        "is_company": False,
-                        "country_id": 216,  # Thailand
-                        "comment": (
-                            f"{marker}\n"
-                            f"Registered via LINE bot — {display}"
-                        ),
-                    }])
-                    pname = name
-
-                partner = _retail_get_partner(user_id)
-                cats = _retail_get_categories()
-                retail_reply(reply_token, [
-                    line_text(
-                        f"✅ ยินดีต้อนรับ คุณ{pname}!\nWelcome, {pname}!\n\n"
-                        "บัญชีของคุณถูกสร้างแล้ว\nYour account has been created."
-                    ),
-                    _retail_build_cat_flex(cats) if cats else line_text("พิมพ์ เมนู เพื่อดูสินค้า")
-                ])
-                continue
-
             p = _retail_email_login(text)
             if p:
                 _retail_sessions[user_id] = {
@@ -6381,39 +5637,6 @@ async def webhook_line_retail(request: Request):
                     f"✅ พบบัญชี:\n*{p['name']}*\n\nถูกต้องไหม? Is this you?\n\n"
                     "ใช่ / Yes   |   ไม่ใช่ / No"
                 )])
-            elif re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", text.strip()):
-                # Looks like an email but no match in Odoo → offer registration
-                _retail_sessions[user_id] = {"state": "awaiting_register_choice",
-                                              "reg_email": text.strip()}
-                retail_reply(reply_token, [{
-                    "type": "flex",
-                    "altText": "Email not found — Would you like to register?",
-                    "contents": {
-                        "type": "bubble", "size": "mega",
-                        "header": {
-                            "type": "box", "layout": "vertical",
-                            "backgroundColor": "#8B0000", "paddingAll": "14px",
-                            "contents": [{"type": "text", "text": "❌ ไม่พบอีเมลนี้ / Email not found",
-                                          "weight": "bold", "color": "#FFFFFF", "size": "md", "wrap": True}]
-                        },
-                        "body": {
-                            "type": "box", "layout": "vertical", "paddingAll": "14px",
-                            "contents": [
-                                {"type": "text", "wrap": True, "size": "sm", "color": "#444444",
-                                 "text": "ต้องการสมัครสมาชิกใหม่หรือไม่?\nWould you like to register as a new customer?"}
-                            ]
-                        },
-                        "footer": {
-                            "type": "box", "layout": "vertical", "paddingAll": "10px", "spacing": "sm",
-                            "contents": [
-                                {"type": "button", "style": "primary", "height": "md", "color": "#1A3A6B",
-                                 "action": {"type": "postback", "label": "✅ สมัคร / Register", "data": "ใช่"}},
-                                {"type": "button", "style": "secondary", "height": "md",
-                                 "action": {"type": "postback", "label": "🔄 ลองอีกครั้ง / Try again", "data": "ไม่ใช่"}}
-                            ]
-                        }
-                    }
-                }])
             else:
                 retail_reply(reply_token, [line_text(
                     "🐷 *Mister Cochon* — French Delicatessen\n\n"
@@ -6445,7 +5668,7 @@ async def webhook_line_retail(request: Request):
                       ["categ_id", "=", cat_id]]
             prods = odoo_execute("product.product", "search_read",
                 [domain],
-                {"fields": ["id", "name", "default_code", "list_price", "description_sale", "qty_available", "uom_id"],
+                {"fields": ["id", "name", "default_code", "list_price", "description_sale", "weight", "uom_id"],
                  "limit": 200, "context": {"lang": "en_US"}}
             )
             _retail_sessions[user_id] = {**sess, "category_products": prods, "page": 0}
@@ -6462,12 +5685,12 @@ async def webhook_line_retail(request: Request):
             if not prod:
                 found = odoo_execute("product.product", "search_read",
                     [[["id", "=", product_id]]],
-                    {"fields": ["id", "name", "default_code", "list_price", "description_sale", "qty_available", "uom_id"],
+                    {"fields": ["id", "name", "default_code", "list_price", "description_sale", "weight", "uom_id"],
                      "limit": 1, "context": {"lang": "en_US"}}
                 )
                 prod = found[0] if found else None
             if prod:
-                retail_reply(reply_token, _line_product_detail(prod, pricelist, sess.get("page", 0), is_retail=True))
+                retail_reply(reply_token, _line_product_detail(prod, pricelist, sess.get("page", 0)))
             continue
 
         # ── Postback: page navigation ──────────────────────────────────────
@@ -6476,53 +5699,6 @@ async def webhook_line_retail(request: Request):
             prods = sess.get("category_products", [])
             _retail_sessions[user_id] = {**sess, "page": page}
             retail_reply(reply_token, _line_build_carousel(prods, pricelist, page))
-            continue
-
-        # ── Postback: add to cart — button from shared product detail footer ──
-        # data format: __add_{product_id}_{sku}  (same format as B2B)
-        if text.startswith("__add_"):
-            raw = text[6:]
-            first, _, rest = raw.partition("_")
-            if first.isdigit() and rest:
-                product_id = int(first)
-                sku = rest.upper()
-            else:
-                product_id = 0
-                sku = raw.upper()
-
-            prods = sess.get("category_products", [])
-            prod = next((p for p in prods if p.get("id") == product_id
-                         or str(p.get("default_code") or "").upper() == sku), None)
-            if not prod and product_id:
-                found = odoo_execute("product.product", "search_read",
-                    [[["id", "=", product_id]]],
-                    {"fields": ["id", "name", "default_code", "list_price", "qty_available"],
-                     "limit": 1, "context": {"lang": "en_US"}}
-                )
-                prod = found[0] if found else None
-
-            if prod:
-                product_id = product_id or prod["id"]
-                price = _line_get_client_price(prod["id"], prod.get("list_price", 0), pricelist)
-                name  = prod.get("name", sku)
-                is_preorder = (prod.get("qty_available", 0) or 0) <= 0
-            else:
-                price = 0.0
-                name  = sku
-                is_preorder = False
-
-            short = _truncate(_shorten_product_name(name), 40)
-            _retail_sessions[user_id] = {**sess, "state": "awaiting_qty",
-                "pending_pid": product_id, "pending_sku": sku,
-                "pending_price": int(round(price)), "pending_preorder": is_preorder}
-            prompt = f"*{short}*\nUnit price: {price:.0f} ฿\n\nกรุณากรอกจำนวน:\nEnter quantity:"
-            if is_preorder:
-                prompt = (f"*{short}*\nUnit price: {price:.0f} ฿\n\n"
-                           "🕐 สินค้าหมด — คุณสามารถสั่งพรีออเดอร์ได้\n"
-                           "Out of stock — you can still place a pre-order,\n"
-                           "delivery time may be longer than usual.\n\n"
-                           "กรุณากรอกจำนวน:\nEnter quantity:")
-            retail_reply(reply_token, [line_text(prompt)])
             continue
 
         # ── Postback: add to cart (fixed qty) ─────────────────────────────
@@ -6534,7 +5710,7 @@ async def webhook_line_retail(request: Request):
                 prods = sess.get("category_products", [])
                 prod = next((p for p in prods if p.get("id") == pid), None)
                 name = prod["name"] if prod else sku
-                short = _truncate(_shorten_product_name(name), 25)
+                short = name[:25]
                 existing = next((i for i in cart if i["pid"] == pid), None)
                 if existing:
                     existing["qty"] += qty
@@ -6542,13 +5718,10 @@ async def webhook_line_retail(request: Request):
                     cart.append({"pid": pid, "sku": sku, "name": name, "qty": qty, "price": price})
                 total = sum(i["qty"] * i["price"] for i in cart)
                 _retail_sessions[user_id] = {**sess, "cart": cart}
-                confirm_msg = line_quick_reply(
-                    f"✅ {short} ×{qty} เพิ่มแล้ว\nตะกร้า: {len(cart)} รายการ — {total:,.0f}฿",
-                    [("🛍️ ซื้อต่อ / Continue shopping", f"__page_{sess.get('page', 0)}"),
-                     ("🛒 ตะกร้า / Cart", "cart"),
-                     ("💳 ชำระเงิน / Checkout", "checkout")]
-                )
-                retail_reply(reply_token, [confirm_msg])
+                cur_page = sess.get("page", 0)
+                confirm_msg = line_text(f"✅ {short} ×{qty} เพิ่มแล้ว\nตะกร้า: {len(cart)} รายการ — {total:,.0f}฿")
+                msgs = [confirm_msg] + _line_build_carousel(prods, pricelist, cur_page)
+                retail_reply(reply_token, msgs[:5])
             continue
 
         # ── Postback: custom qty prompt ────────────────────────────────────
@@ -6568,96 +5741,20 @@ async def webhook_line_retail(request: Request):
             pid = sess.get("pending_pid")
             sku = sess.get("pending_sku", "")
             price = _line_get_client_price(pid, float(sess.get("pending_price", 0)), pricelist)
-            is_preorder = bool(sess.get("pending_preorder", False))
             prods = sess.get("category_products", [])
             prod = next((p for p in prods if p.get("id") == pid), None)
             name = prod["name"] if prod else sku
             existing = next((i for i in cart if i["pid"] == pid), None)
             if existing:
                 existing["qty"] += qty
-                existing["preorder"] = existing.get("preorder", False) or is_preorder
             else:
-                cart.append({"pid": pid, "sku": sku, "name": name, "qty": qty,
-                              "price": price, "preorder": is_preorder})
+                cart.append({"pid": pid, "sku": sku, "name": name, "qty": qty, "price": price})
             total = sum(i["qty"] * i["price"] for i in cart)
             _retail_sessions[user_id] = {**{k: v for k, v in sess.items()
-                                            if k not in ("state", "pending_pid", "pending_sku",
-                                                          "pending_price", "pending_preorder")},
+                                            if k not in ("state", "pending_pid", "pending_sku", "pending_price")},
                                           "cart": cart}
-            short = _truncate(_shorten_product_name(name), 25)
-            preorder_note = "\n🕐 พรีออเดอร์ — Pre-order (out of stock)" if is_preorder else ""
-            retail_reply(reply_token, [line_quick_reply(
-                f"✅ {short} ×{qty} เพิ่มแล้ว{preorder_note}\nตะกร้า: {len(cart)} รายการ — {total:,.0f}฿",
-                [("🛍️ ซื้อต่อ / Continue shopping", f"__page_{sess.get('page', 0)}"),
-                 ("🛒 ตะกร้า / Cart", "cart"),
-                 ("💳 ชำระเงิน / Checkout", "checkout")]
-            )])
-            continue
-
-        # ── Delivery type: chilled or frozen? (asked before showing totals) ──
-        if sess.get("state") == "awaiting_delivery_temp" and text_low in ("chilled", "frozen", "แช่เย็น", "แช่แข็ง"):
-            delivery_temp = "frozen" if text_low in ("frozen", "แช่แข็ง") else "chilled"
-            _retail_sessions[user_id] = {**sess, "state": "awaiting_thai_phone",
-                                          "checkout_delivery_temp": delivery_temp}
             retail_reply(reply_token, [line_text(
-                "📞 กรุณากรอกเบอร์โทรของผู้ที่พูดภาษาไทยได้ สำหรับติดต่อจัดส่ง\n"
-                "Please enter the phone number of someone who speaks Thai, "
-                "for the delivery contact:"
-            )])
-            continue
-
-        # ── Thai-speaking delivery contact phone → then show totals ─────────
-        if sess.get("state") == "awaiting_thai_phone":
-            thai_phone = re.sub(r"[^\d+]", "", text.strip())
-            if len(re.sub(r"\D", "", thai_phone)) < 8:
-                retail_reply(reply_token, [line_text(
-                    "เบอร์โทรศัพท์ไม่ถูกต้อง กรุณากรอกใหม่\n"
-                    "Invalid phone number, please try again:"
-                )])
-                continue
-
-            delivery_temp = sess.get("checkout_delivery_temp", "chilled")
-            frozen_fee = 50.0 if delivery_temp == "frozen" else 0.0
-            subtotal = sum(i["qty"] * i["price"] for i in cart)
-            zip_code = (partner.get("zip") or "").strip()
-            base_shipping, ship_title = _get_shipping_fee(zip_code, subtotal)
-            shipping_fee = base_shipping + frozen_fee
-            grand_total = subtotal + shipping_fee
-            _retail_sessions[user_id] = {**{k: v for k, v in sess.items() if k != "state"},
-                                          "checkout_shipping_fee": shipping_fee,
-                                          "checkout_base_shipping": base_shipping,
-                                          "checkout_frozen_fee": frozen_fee,
-                                          "checkout_shipping_title": ship_title,
-                                          "checkout_delivery_temp": delivery_temp,
-                                          "checkout_thai_phone": thai_phone}
-
-            preorder_note = ""
-            if any(i.get("preorder") for i in cart):
-                preorder_note = ("\n\n🕐 มีสินค้าพรีออเดอร์ในตะกร้า อาจใช้เวลาจัดส่งนานกว่าปกติ\n"
-                                  "Includes pre-order item(s) — may take longer to deliver.")
-
-            if not zip_code:
-                ship_line = ("\n⚠️ ไม่พบที่อยู่จัดส่งในโปรไฟล์ — ยังไม่รวมค่าส่ง\n"
-                              "No delivery address on file — shipping not included yet.")
-            else:
-                parts = []
-                if base_shipping > 0:
-                    label = f" ({ship_title})" if ship_title else ""
-                    parts.append(f"Shipping{label}: {base_shipping:,.0f}฿")
-                else:
-                    parts.append("Shipping: Free")
-                if frozen_fee:
-                    parts.append(f"Frozen surcharge: {frozen_fee:,.0f}฿")
-                ship_line = "\n" + " + ".join(parts)
-
-            temp_label = "🧊 Frozen (แช่แข็ง)" if delivery_temp == "frozen" else "❄️ Chilled (แช่เย็น)"
-            retail_reply(reply_token, [line_quick_reply(
-                f"การจัดส่ง / Delivery: {temp_label}\n"
-                f"เบอร์ติดต่อจัดส่ง / Delivery contact: {thai_phone}\n"
-                f"สินค้า / Subtotal: {subtotal:,.0f}฿{ship_line}\n"
-                f"รวมทั้งหมด / Total: {grand_total:,.0f}฿\n\nเลือกวิธีชำระเงิน / Choose payment:{preorder_note}",
-                [("📱 PromptPay", "__pay_promptpay"),
-                 ("💳 บัตรเครดิต", "__pay_card")]
+                f"✅ {name[:25]} ×{qty} เพิ่มแล้ว\nตะกร้า: {len(cart)} รายการ — {total:,.0f}฿"
             )])
             continue
 
@@ -6676,39 +5773,43 @@ async def webhook_line_retail(request: Request):
             else:
                 retail_reply(reply_token, _line_cart_messages(cart))
 
-        # ── Remove a single line from the cart: __rmline_{index} ────────────
-        elif text.startswith("__rmline_"):
-            idx_str = text[len("__rmline_"):]
-            cart_live = list(sess.get("cart", []))
-            if idx_str.isdigit() and 0 <= int(idx_str) < len(cart_live):
-                removed = cart_live.pop(int(idx_str))
-                _retail_sessions[user_id] = {**sess, "cart": cart_live}
-                short = _shorten_product_name(removed.get("name", ""))
-                if cart_live:
-                    retail_reply(reply_token,
-                        [line_text(f"🗑️ ลบแล้ว / Removed: {short}")] + _line_cart_messages(cart_live))
-                else:
-                    retail_reply(reply_token, [line_quick_reply(
-                        f"🗑️ ลบแล้ว / Removed: {short}\nตะกร้าสินค้าว่างเปล่า / Your cart is now empty.",
-                        [("🛍️ เมนู / Browse catalog", "menu")]
-                    )])
-            else:
-                retail_reply(reply_token, [line_text(
-                    "ไม่พบสินค้านี้ในตะกร้าแล้ว\nThis item is no longer in your cart."
-                )])
-
-        # ── Checkout: choose delivery type first ─────────────────────────────
+        # ── Checkout: choose payment method ────────────────────────────────
         elif text_low in ("checkout", "ชำระเงิน", "สั่งซื้อ", "order"):
             if not cart:
                 retail_reply(reply_token, [line_text("ตะกร้าสินค้าว่างเปล่า\nYour cart is empty.")])
             else:
-                _retail_sessions[user_id] = {**sess, "state": "awaiting_delivery_temp"}
-                retail_reply(reply_token, [line_quick_reply(
-                    "🚚 เลือกรูปแบบการจัดส่ง\nChoose delivery type:\n\n"
-                    "❄️ Chilled — ไม่มีค่าใช้จ่ายเพิ่ม / no extra charge\n"
-                    "🧊 Frozen — +50฿",
-                    [("❄️ Chilled", "chilled"), ("🧊 Frozen (+50฿)", "frozen")]
-                )])
+                total = sum(i["qty"] * i["price"] for i in cart)
+                pay_choice = {
+                    "type": "bubble", "size": "mega",
+                    "header": {
+                        "type": "box", "layout": "vertical",
+                        "backgroundColor": "#1A3A6B", "paddingAll": "14px",
+                        "contents": [{"type": "text", "text": "เลือกวิธีชำระเงิน / Payment",
+                                      "weight": "bold", "color": "#FFFFFF", "size": "md"}]
+                    },
+                    "body": {
+                        "type": "box", "layout": "vertical", "paddingAll": "14px",
+                        "contents": [
+                            {"type": "text", "text": f"Total : {total:,.0f} ฿",
+                             "weight": "bold", "size": "xxl", "color": "#C8102E", "align": "center"},
+                        ]
+                    },
+                    "footer": {
+                        "type": "box", "layout": "vertical", "paddingAll": "12px",
+                        "spacing": "md",
+                        "contents": [
+                            {"type": "button", "style": "primary", "height": "md",
+                             "color": "#007AFF",
+                             "action": {"type": "postback", "label": "📱 PromptPay QR",
+                                        "data": "__pay_promptpay"}},
+                            {"type": "button", "style": "primary", "height": "md",
+                             "color": "#1A3A6B",
+                             "action": {"type": "postback", "label": "💳 Carte de crédit / CB",
+                                        "data": "__pay_card"}},
+                        ]
+                    }
+                }
+                retail_reply(reply_token, [{"type": "flex", "altText": f"Paiement {total:,.0f}฿", "contents": pay_choice}])
 
         # ── Pay via PromptPay (Stripe) ─────────────────────────────────────
         elif text == "__pay_promptpay":
@@ -6717,20 +5818,13 @@ async def webhook_line_retail(request: Request):
             elif not STRIPE_SECRET_KEY:
                 retail_reply(reply_token, [line_text("❌ Stripe not configured.")])
             else:
-                subtotal = sum(i["qty"] * i["price"] for i in cart)
-                shipping_fee = float(sess.get("checkout_shipping_fee", 0) or 0)
-                total = subtotal + shipping_fee
+                total = sum(i["qty"] * i["price"] for i in cart)
                 try:
                     intent = _stripe.PaymentIntent.create(
                         amount=int(total * 100),
                         currency="thb",
                         payment_method_types=["promptpay"],
                         metadata={"line_user_id": user_id, "partner_id": str(partner["id"]),
-                                  "shipping_fee": str(shipping_fee),
-                                  "delivery_temp": sess.get("checkout_delivery_temp", "chilled"),
-                                  "thai_contact_phone": sess.get("checkout_thai_phone", ""),
-                                  "base_shipping_fee": str(sess.get("checkout_base_shipping", 0) or 0),
-                                  "frozen_fee": str(sess.get("checkout_frozen_fee", 0) or 0),
                                   "cart": json.dumps([{"pid": i["pid"], "name": i["name"],
                                       "qty": i["qty"], "price": i["price"]} for i in cart])},
                     )
@@ -6743,9 +5837,8 @@ async def webhook_line_retail(request: Request):
                         return_url=f"{RENDER_URL}/payment-success?user={user_id}",
                     )
                     qr_url = intent["next_action"]["promptpay_display_qr_code"]["image_url_png"]
-                    _retail_sessions[user_id] = {**{k: v for k, v in sess.items()
-                                                     if k not in ("checkout_shipping_fee", "checkout_shipping_title", "checkout_delivery_temp", "checkout_thai_phone", "checkout_base_shipping", "checkout_frozen_fee")},
-                        "stripe_cart": cart, "stripe_intent_id": intent["id"], "cart": []}
+                    _retail_sessions[user_id] = {**sess, "stripe_cart": cart,
+                        "stripe_intent_id": intent["id"], "cart": []}
                     retail_reply(reply_token, [
                         line_text(f"📱 สแกน QR PromptPay เพื่อชำระ {total:,.0f}฿\n"
                                   f"Scan to pay {total:,.0f}฿ via PromptPay"),
@@ -6761,8 +5854,7 @@ async def webhook_line_retail(request: Request):
             elif not STRIPE_SECRET_KEY:
                 retail_reply(reply_token, [line_text("❌ Stripe not configured.")])
             else:
-                shipping_fee = float(sess.get("checkout_shipping_fee", 0) or 0)
-                ship_title = sess.get("checkout_shipping_title", "")
+                total = sum(i["qty"] * i["price"] for i in cart)
                 line_items = []
                 for item in cart:
                     price = _line_get_client_price(item["pid"], float(item["price"]), pricelist)
@@ -6772,15 +5864,6 @@ async def webhook_line_retail(request: Request):
                             "product_data": {"name": item["name"][:80]}},
                         "quantity": item["qty"],
                     })
-                if shipping_fee > 0:
-                    line_items.append({
-                        "price_data": {"currency": "thb",
-                            "unit_amount": int(shipping_fee * 100),
-                            "product_data": {"name": f"Shipping ({ship_title})" if ship_title else "Shipping"}},
-                        "quantity": 1,
-                    })
-                subtotal = sum(i["qty"] * i["price"] for i in cart)
-                total = subtotal + shipping_fee
                 try:
                     session = _stripe.checkout.Session.create(
                         payment_method_types=["card"],
@@ -6788,16 +5871,10 @@ async def webhook_line_retail(request: Request):
                         mode="payment",
                         success_url=f"{RENDER_URL}/payment-success?user={user_id}",
                         cancel_url=f"{RENDER_URL}/payment-cancel?user={user_id}",
-                        metadata={"line_user_id": user_id, "partner_id": str(partner["id"]),
-                                  "shipping_fee": str(shipping_fee),
-                                  "delivery_temp": sess.get("checkout_delivery_temp", "chilled"),
-                                  "thai_contact_phone": sess.get("checkout_thai_phone", ""),
-                                  "base_shipping_fee": str(sess.get("checkout_base_shipping", 0) or 0),
-                                  "frozen_fee": str(sess.get("checkout_frozen_fee", 0) or 0)},
+                        metadata={"line_user_id": user_id, "partner_id": str(partner["id"])},
                     )
-                    _retail_sessions[user_id] = {**{k: v for k, v in sess.items()
-                                                     if k not in ("checkout_shipping_fee", "checkout_shipping_title", "checkout_delivery_temp", "checkout_thai_phone", "checkout_base_shipping", "checkout_frozen_fee")},
-                        "stripe_cart": cart, "stripe_session_id": session.id}
+                    _retail_sessions[user_id] = {**sess, "stripe_cart": cart,
+                        "stripe_session_id": session.id}
                     pay_bubble = {
                         "type": "bubble", "size": "mega",
                         "header": {
@@ -6827,6 +5904,7 @@ async def webhook_line_retail(request: Request):
                     retail_reply(reply_token, [{"type": "flex", "altText": f"Paiement carte {total:,.0f}฿", "contents": pay_bubble}])
                 except Exception as e:
                     retail_reply(reply_token, [line_text(f"❌ Stripe error: {str(e)[:100]}")])
+
         # ── Clear cart ─────────────────────────────────────────────────────
         elif text_low in ("cancel", "ยกเลิก", "clear", "ล้างตะกร้า"):
             _retail_sessions[user_id] = {**sess, "cart": []}
@@ -6878,7 +5956,7 @@ async def payment_cancel():
 # ─── PromptPay Stripe — Page de paiement Ecwid ───────────────────────────────
 
 @app.get("/pay/{order_number}")
-async def pay_ecwid_promptpay_by_order_number(order_number: str):
+async def pay_ecwid_promptpay(order_number: str):
     """Page de paiement PromptPay Stripe pour commande Ecwid."""
     if not STRIPE_SECRET_KEY:
         return HTMLResponse("<h2 style='font-family:sans-serif;padding:40px;color:red'>Stripe non configuré</h2>", status_code=500)
@@ -6897,10 +5975,6 @@ async def pay_ecwid_promptpay_by_order_number(order_number: str):
     amount = int(total * 100)
     customer_name = (eco.get("billingPerson") or {}).get("name", "")
     payment_status = eco.get("paymentStatus", "")
-    # Build Odoo reference the same way /pay/promptpay does — Ecwid stores
-    # vendorOrderNumber as "ECWID-XXXXX" in Odoo's client_order_ref/name.
-    vendor_num = eco.get("vendorOrderNumber") or eco.get("referenceTransactionId") or ""
-    odoo_ref = f"ECWID-{vendor_num}" if vendor_num else str(eco.get("id", order_number))
 
     if payment_status == "PAID":
         return HTMLResponse(f"""<!DOCTYPE html><html><head><meta charset=UTF-8>
@@ -6919,7 +5993,7 @@ async def pay_ecwid_promptpay_by_order_number(order_number: str):
             amount=amount,
             currency="thb",
             payment_method_types=["promptpay"],
-            metadata={"ecwid_order_id": order_number, "ecwid_odoo_ref": odoo_ref},
+            metadata={"ecwid_order_id": order_number},
             description=f"Commande Ecwid #{order_number}",
         )
         confirmed = _stripe.PaymentIntent.confirm(
@@ -7047,3 +6121,4 @@ async def check_stripe_intent(intent_id: str):
         )
     except Exception as e:
         return JSONResponse({"paid": False, "error": str(e)}, headers={"Access-Control-Allow-Origin": "*"})
+
