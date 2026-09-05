@@ -64,7 +64,7 @@ async def _poll_ecwid_orders():
 
             # 200 dernières commandes Ecwid (uniquement les commandes payées)
             r = requests.get(f"{ecwid_base}/orders", headers=headers,
-                params={"limit": 200, "sortBy": "CREATED_DATE_DESC", "paymentStatus": "PAID"})
+                params={"limit": 200, "sortBy": "CREATED_DATE_DESC"})
             orders = r.json().get("items", []) if r.ok else []
 
             for eco in orders:
@@ -213,6 +213,18 @@ async def _poll_ecwid_orders():
                 existing_refs.add(ref_alt)
                 existing_refs.add(ecwid_id)
                 existing_refs.add(order_num)
+                # Enregistrer paiement si commande payee dans Ecwid
+                if eco.get("paymentStatus") == "PAID":
+                    try:
+                        inv_ids = odoo_execute("account.move", "search", [[["invoice_origin", "=", ref], ["state", "=", "posted"]]])
+                        if not inv_ids:
+                            odoo_execute("sale.order", "action_invoice_create", [[new_id]])
+                            inv_ids = odoo_execute("account.move", "search", [[["invoice_origin", "=", ref]]])
+                        if inv_ids:
+                            odoo_execute("account.move", "action_post", [[inv_ids[0]]])
+                            odoo_execute("account.payment", "create", [{"payment_type": "inbound", "partner_type": "customer", "move_id": inv_ids[0], "amount": float(eco.get("total") or 0)}])
+                    except Exception as ep:
+                        print(f"[POLL] Paiement non enregistre: {ep}")
                 print(f"[POLL] ✓ Nouvelle commande importée : {ref}")
 
         except Exception as e:
