@@ -65,7 +65,8 @@ async def _poll_ecwid_orders():
             # 200 dernières commandes Ecwid (uniquement les commandes payées)
             r = requests.get(f"{ecwid_base}/orders", headers=headers,
                 params={"limit": 200, "sortBy": "CREATED_DATE_DESC"})
-            orders = r.json().get("items", []) if r.ok else []
+            orders = r.json().get("items", []) if r.ok else []            
+            print(f"[POLL] {len(orders)} commandes Ecwid trouvees")
 
             for eco in orders:
                 # Ignorer les commandes Ecwid à 0 (paniers vides, tests, abandons)
