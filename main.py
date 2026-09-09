@@ -207,9 +207,9 @@ async def _poll_ecwid_orders():
                     so_vals["note"] = eco_note
                 new_id = odoo_execute("sale.order", "create", [so_vals])
                 try:
-                odoo_execute("sale.order", "action_confirm", [[new_id]])
+                    odoo_execute("sale.order", "action_confirm", [[new_id]])
                 except Exception:
-                pass
+                    pass
                 # Ajouter immédiatement à existing_refs pour éviter les doublons
                 # si deux instances tournent simultanément (ex: redeployment Render)
                 existing_refs.add(ref)
