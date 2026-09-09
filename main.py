@@ -216,18 +216,7 @@ async def _poll_ecwid_orders():
                 existing_refs.add(ref_alt)
                 existing_refs.add(ecwid_id)
                 existing_refs.add(order_num)
-                # Enregistrer paiement si commande payee dans Ecwid
-                if eco.get("paymentStatus") == "PAID":
-                    try:
-                        inv_ids = odoo_execute("account.move", "search", [[["invoice_origin", "=", ref], ["state", "=", "posted"]]])
-                        if not inv_ids:
-                            odoo_execute("sale.order", "action_invoice_create", [[new_id]])
-                            inv_ids = odoo_execute("account.move", "search", [[["invoice_origin", "=", ref]]])
-                        if inv_ids:
-                            odoo_execute("account.move", "action_post", [[inv_ids[0]]])
-                            odoo_execute("account.payment", "create", [{"payment_type": "inbound", "partner_type": "customer", "move_id": inv_ids[0], "amount": float(eco.get("total") or 0)}])
-                    except Exception as ep:
-                        print(f"[POLL] Paiement non enregistre: {ep}")
+                # Paiement gere via webhook Stripe
                 print(f"[POLL] ✓ Nouvelle commande importée : {ref}")
 
         except Exception as e:
