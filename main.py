@@ -33,7 +33,7 @@ def _get_ecwid_subdistrict(eco: dict) -> str:
 
 async def _poll_ecwid_orders():
     """Tâche de fond : vérifie les nouvelles commandes Ecwid toutes les 2 min."""
-    await asyncio.sleep(30)
+    await asyncio.sleep(999999)
     while True:
         try:
             from datetime import datetime as _dt
