@@ -3248,10 +3248,23 @@ def _mark_order_paid_odoo(ecwid_order_ref: str, stripe_payment_id: str):
                     {"context": ctx})
                 if isinstance(wizard_id, list):
                     wizard_id = wizard_id[0]
-                odoo_execute("account.payment.register", "action_create_payments",
+                result = odoo_execute("account.payment.register", "action_create_payments",
                     [[wizard_id]],
                     {"context": ctx})
                 log.append(f"payment registered via wizard {wizard_id}")
+                # Confirmer le paiement si encore en brouillon
+                try:
+                    pay_ids = odoo_execute("account.payment", "search",
+                        [[["ref", "ilike", stripe_payment_id[:20] if stripe_payment_id else ""], ["state", "=", "draft"]]])
+                    if not pay_ids:
+                        pay_ids = odoo_execute("account.payment", "search",
+                            [[["partner_id", "=", order["partner_id"][0] if isinstance(order["partner_id"], list) else order["partner_id"]], ["state", "=", "draft"], ["amount", "=", order["amount_total"]]]],
+                        )
+                    if pay_ids:
+                        odoo_execute("account.payment", "action_post", [pay_ids])
+                        log.append(f"payment confirmed: {pay_ids}")
+                except Exception as ep:
+                    log.append(f"payment confirm error: {ep}")
         except Exception as e:
             log.append(f"payment error: {e}")
     else:
