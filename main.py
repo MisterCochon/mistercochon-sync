@@ -3150,10 +3150,17 @@ async def webhook_ecwid(request: Request):
 def _mark_order_paid_odoo(ecwid_order_ref: str, stripe_payment_id: str):
     """Cherche la commande Odoo par ref Ecwid et enregistre le paiement."""
     log = []
+    print(f"[STRIPE] Recherche commande pour ref: {ecwid_order_ref}")
+    # Chercher par ref exacte, par ECWID-ref, ou par ref contenue dans client_order_ref
     orders = odoo_execute("sale.order", "search_read",
-        [["|", ["client_order_ref", "=", ecwid_order_ref], ["name", "=", ecwid_order_ref]]],
+        [["|", "|", "|",
+          ["client_order_ref", "=", ecwid_order_ref],
+          ["client_order_ref", "=", f"ECWID-{ecwid_order_ref}"],
+          ["client_order_ref", "ilike", ecwid_order_ref],
+          ["name", "=", ecwid_order_ref]]],
         {"fields": ["id", "name", "amount_total", "invoice_ids", "partner_id", "state"], "limit": 1}
     )
+    print(f"[STRIPE] Commande trouvee: {orders[0]['name'] if orders else 'AUCUNE'}")
     if not orders:
         return {"found": False, "ref": ecwid_order_ref}
 
