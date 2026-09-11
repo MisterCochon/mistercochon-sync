@@ -33,7 +33,7 @@ def _get_ecwid_subdistrict(eco: dict) -> str:
 
 async def _poll_ecwid_orders():
     """Tâche de fond : vérifie les nouvelles commandes Ecwid toutes les 2 min."""
-    await asyncio.sleep(999999)
+    await asyncio.sleep(30)
     while True:
         try:
             from datetime import datetime as _dt
@@ -65,8 +65,7 @@ async def _poll_ecwid_orders():
             # 200 dernières commandes Ecwid (uniquement les commandes payées)
             r = requests.get(f"{ecwid_base}/orders", headers=headers,
                 params={"limit": 200, "sortBy": "CREATED_DATE_DESC"})
-            orders = r.json().get("items", []) if r.ok else []            
-            print(f"[POLL] {len(orders)} commandes Ecwid trouvees")
+            orders = r.json().get("items", []) if r.ok else []
 
             for eco in orders:
                 # Ignorer les commandes Ecwid à 0 (paniers vides, tests, abandons)
@@ -82,6 +81,15 @@ async def _poll_ecwid_orders():
 
                 ecwid_id  = str(eco.get("id") or eco.get("orderNumber", ""))
                 order_num = str(eco.get("orderNumber") or eco.get("id", ""))
+                # Ignorer les commandes de frais de livraison (ref se terminant par S)
+                if order_num.endswith("S") or ecwid_id.endswith("S"):
+                    continue
+                # Ignorer les commandes de frais de livraison (ref se terminant par S)
+                if order_num.endswith("S") or ecwid_id.endswith("S"):
+                    continue
+                # Ignorer les commandes de frais de livraison (ref se terminant par S)
+                if order_num.endswith("S") or ecwid_id.endswith("S"):
+                    continue
                 ref      = f"ECWID-{ecwid_id}"
                 ref_alt  = f"ECWID-{order_num}"
                 # Détecte toutes les formes : ECWID-xxx, ou le raw id (FD orders)
@@ -210,7 +218,7 @@ async def _poll_ecwid_orders():
                 try:
                     odoo_execute("sale.order", "action_confirm", [[new_id]])
                 except Exception:
-                    pass
+                    pass  # Already confirmed
                 # Ajouter immédiatement à existing_refs pour éviter les doublons
                 # si deux instances tournent simultanément (ex: redeployment Render)
                 existing_refs.add(ref)
@@ -3111,18 +3119,30 @@ async def webhook_ecwid(request: Request):
 
     if event_type not in ("order.created", "order.updated"):
         return {"status": "ignored", "event": event_type}
+    # Webhook desactive - import gere par polling
+    return {"status": "ignored", "reason": "polling only"}
 
     if not entity_id:
         return {"status": "ignored", "reason": "pas d'entityId"}
 
-    # Récupérer la commande depuis Ecwid
+    # Récupérer la commande depuis Ecwid (par ID numérique)
     ecwid_data = ecwid_get("/orders", {"orderNumber": entity_id, "limit": 1})
     if not ecwid_data or not ecwid_data.get("items"):
-        return {"status": "error", "reason": f"Commande {entity_id} non trouvée dans Ecwid"}
-
-    eco = ecwid_data["items"][0]
-    result = _import_one_ecwid_order(entity_id, eco)
-    return {"status": "ok", "order": entity_id, "result": result}
+        # Essayer par ID direct
+        ecwid_data = ecwid_get(f"/orders/{entity_id}")
+        if not ecwid_data:
+            return {"status": "error", "reason": f"Commande {entity_id} non trouvée dans Ecwid"}
+        eco = ecwid_data if isinstance(ecwid_data, dict) and "id" in ecwid_data else None
+        if not eco:
+            return {"status": "error", "reason": f"Format invalide pour {entity_id}"}
+    else:
+        eco = ecwid_data["items"][0]
+    
+    order_num = str(eco.get("orderNumber") or eco.get("vendorOrderNumber") or entity_id)
+    print(f"[WEBHOOK] Import commande {order_num} items={len(eco.get('items', []))}")
+    result = _import_one_ecwid_order(order_num, eco)
+    print(f"[WEBHOOK] Resultat: {result}")
+    return {"status": "ok", "order": order_num, "result": result}
 
 
 # ─── Webhook Stripe → Odoo (paiement carte) ──────────────────────────────────
@@ -3355,7 +3375,8 @@ async def pay_ecwid_promptpay(request: Request, order_id: str = "", confirmed: s
 
     # No order_id → step 1: confirm order placed, step 2: phone lookup
     if not order_id:
-        # Step 1: confirmation page
+        if True:  # Skip to phone form directly
+            confirmed = "yes"
         if not confirmed:
             return _HR("""<!DOCTYPE html>
 <html lang="th">
