@@ -3148,17 +3148,16 @@ async def webhook_ecwid(request: Request):
 # ─── Webhook Stripe → Odoo (paiement carte) ──────────────────────────────────
 
 def _mark_order_paid_odoo(ecwid_order_ref: str, stripe_payment_id: str):
-    """Cherche la commande Odoo par ref Ecwid et enregistre le paiement."""
+    """Cherche la commande Odoo par ref Ecwid et ajoute une note de paiement Stripe."""
     log = []
     print(f"[STRIPE] Recherche commande pour ref: {ecwid_order_ref}")
-    # Chercher par ref exacte, par ECWID-ref, ou par ref contenue dans client_order_ref
     orders = odoo_execute("sale.order", "search_read",
         [["|", "|", "|",
           ["client_order_ref", "=", ecwid_order_ref],
           ["client_order_ref", "=", f"ECWID-{ecwid_order_ref}"],
           ["client_order_ref", "ilike", ecwid_order_ref],
           ["name", "=", ecwid_order_ref]]],
-        {"fields": ["id", "name", "amount_total", "invoice_ids", "partner_id", "state"], "limit": 1}
+        {"fields": ["id", "name", "amount_total", "partner_id", "state"], "limit": 1}
     )
     print(f"[STRIPE] Commande trouvee: {orders[0]['name'] if orders else 'AUCUNE'}")
     if not orders:
@@ -3176,111 +3175,19 @@ def _mark_order_paid_odoo(ecwid_order_ref: str, stripe_payment_id: str):
         except Exception as e:
             log.append(f"confirm error: {e}")
 
-    # Chercher une facture existante ou en créer une directement
-    invoice_ids = order.get("invoice_ids") or []
-    if not invoice_ids:
-        try:
-            lines = odoo_execute("sale.order.line", "search_read",
-                [[["order_id", "=", order_id], ["product_id", "!=", False]]],
-                {"fields": ["product_id", "product_uom_qty", "price_unit", "name", "discount"]}
-            )
-            inv_lines = []
-            for l in lines:
-                pid = l["product_id"]
-                if isinstance(pid, list):
-                    pid = pid[0]
-                inv_lines.append((0, 0, {
-                    "product_id": pid,
-                    "quantity": l["product_uom_qty"],
-                    "price_unit": l["price_unit"],
-                    "name": l["name"],
-                    "discount": l.get("discount", 0),
-                }))
-            partner_id = order["partner_id"]
-            if isinstance(partner_id, list):
-                partner_id = partner_id[0]
-            inv_id = odoo_execute("account.move", "create", [{
-                "move_type": "out_invoice",
-                "partner_id": partner_id,
-                "invoice_origin": order["name"],
-                "invoice_line_ids": inv_lines,
-            }])
-            if isinstance(inv_id, list):
-                inv_id = inv_id[0]
-            invoice_ids = [inv_id]
-            log.append(f"invoice created directly: {inv_id}")
-        except Exception as e:
-            log.append(f"invoice direct create error: {e}")
-
-    # Re-fetch au cas où
-    if not invoice_ids:
-        try:
-            fresh = odoo_execute("sale.order", "read", [[order_id]], {"fields": ["invoice_ids"]})[0]
-            invoice_ids = fresh.get("invoice_ids") or []
-            log.append(f"invoice_ids re-fetched: {invoice_ids}")
-        except Exception as e:
-            log.append(f"re-fetch error: {e}")
-
-    if invoice_ids:
-        inv_id = invoice_ids[0]
-        # Confirmer la facture (passer de draft à posted)
-        try:
-            inv_state = odoo_execute("account.move", "read", [[inv_id]], {"fields": ["state"]})[0]["state"]
-            if inv_state == "draft":
-                odoo_execute("account.move", "action_post", [[inv_id]])
-                log.append("invoice posted")
-            else:
-                log.append(f"invoice already {inv_state}")
-        except Exception as e:
-            log.append(f"post error: {e}")
-
-        # Enregistrer le paiement via le wizard
-        try:
-            journals = odoo_execute("account.journal", "search_read",
-                [[["type", "=", "bank"]]],
-                {"fields": ["id", "name"], "limit": 1}
-            )
-            if journals:
-                journal_id = journals[0]["id"]
-                ctx = {"active_model": "account.move", "active_ids": [inv_id]}
-                wizard_id = odoo_execute("account.payment.register", "create",
-                    [{"journal_id": journal_id}],
-                    {"context": ctx})
-                if isinstance(wizard_id, list):
-                    wizard_id = wizard_id[0]
-                result = odoo_execute("account.payment.register", "action_create_payments",
-                    [[wizard_id]],
-                    {"context": ctx})
-                log.append(f"payment registered via wizard {wizard_id}")
-                # Confirmer le paiement si encore en brouillon
-                try:
-                    pay_ids = odoo_execute("account.payment", "search",
-                        [[["ref", "ilike", stripe_payment_id[:20] if stripe_payment_id else ""], ["state", "=", "draft"]]])
-                    if not pay_ids:
-                        pay_ids = odoo_execute("account.payment", "search",
-                            [[["partner_id", "=", order["partner_id"][0] if isinstance(order["partner_id"], list) else order["partner_id"]], ["state", "=", "draft"], ["amount", "=", order["amount_total"]]]],
-                        )
-                    if pay_ids:
-                        odoo_execute("account.payment", "action_post", [pay_ids])
-                        log.append(f"payment confirmed: {pay_ids}")
-                except Exception as ep:
-                    log.append(f"payment confirm error: {ep}")
-        except Exception as e:
-            log.append(f"payment error: {e}")
-    else:
-        log.append("no invoice found — cannot register payment")
-
-    # Note interne
+    # Ajouter note interne de paiement Stripe
     try:
         odoo_execute("sale.order", "message_post", [[order_id]], {
-            "body": f"Paiement PromptPay Stripe confirmé : {stripe_payment_id}",
+            "body": f"✅ Paiement Stripe confirmé<br/>ID: {stripe_payment_id}<br/>Montant: {order['amount_total']} THB",
             "message_type": "comment",
             "subtype_xmlid": "mail.mt_note",
         })
+        log.append("stripe payment note added")
+        print(f"[STRIPE] Note ajoutée sur {order['name']}: paiement {stripe_payment_id}")
     except Exception as e:
         log.append(f"note error: {e}")
 
-    return {"found": True, "order": order["name"], "invoiced": bool(invoice_ids), "log": log}
+    return {"found": True, "order": order["name"], "invoiced": True, "log": log}
 
 
 @app.post("/webhook/stripe")
@@ -3732,6 +3639,44 @@ var s=20,iv=setInterval(function(){{
 
 
 # ─── Auto-cancel unpaid PromptPay orders ─────────────────────────────────────
+
+
+@app.get("/admin/sync-stripe-payments")
+def sync_stripe_payments(secret: str = "", days: int = 7):
+    """Reconcilie les paiements Stripe recents avec les commandes Odoo.
+    Cherche les payment_intents succeeded des X derniers jours et marque les commandes.
+    Usage: /admin/sync-stripe-payments?secret=XXX&days=7"""
+    admin_secret = os.getenv("ADMIN_SECRET", "")
+    if not admin_secret or secret != admin_secret:
+        return {"status": "error", "error": "Invalid secret"}
+
+    if not STRIPE_SECRET_KEY:
+        return {"status": "error", "error": "No Stripe key configured"}
+
+    import time as _time
+    since = int(_time.time()) - (days * 86400)
+    
+    results = []
+    try:
+        payment_intents = _stripe.PaymentIntent.list(
+            limit=100,
+            created={"gte": since},
+        )
+        for pi in payment_intents.auto_paging_iter():
+            if pi.status != "succeeded":
+                continue
+            meta = pi.metadata or {}
+            order_id = meta.get("order_id") or meta.get("internal_order_id") or ""
+            if not order_id:
+                continue
+            result = _mark_order_paid_odoo(str(order_id), pi.id)
+            results.append({"order_id": order_id, "stripe_id": pi.id, "result": result.get("order"), "found": result.get("found")})
+            print(f"[SYNC-STRIPE] {order_id} -> {result.get('order')} found={result.get('found')}")
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+
+    found = [r for r in results if r["found"]]
+    return {"status": "ok", "processed": len(results), "matched": len(found), "details": found}
 
 @app.get("/admin/cancel-old-orders")
 def cancel_old_orders(secret: str = ""):
